@@ -1,6 +1,6 @@
 # Emb2Heights Baselines
 
-Baseline models for the **Emb2Heights** competition. Predicts 4-channel output per pixel from GFM embeddings:
+Baseline models for the **ESA Embed2Heights** competition. Predicts 4-channel output per pixel from pre-computed Geospatial Foundation Model (GFM) embeddings:
 `[% Building, % Vegetation, % Water, Height (m)]`.
 
 ## Data Layout
@@ -9,28 +9,34 @@ Baseline models for the **Emb2Heights** competition. Predicts 4-channel output p
 esa/
 ├── data/
 │   ├── train/                          # 2,024 labeled patches (256x256 @ 10m)
-│   │   ├── alphaearth_emb/             # 64ch pixel-level
-│   │   ├── tessera_emb/                # 128ch pixel-level
-│   │   ├── terramind_s2_emb/           # 768ch patch-level (16x16)
-│   │   ├── thor_s2_emb/                # 768ch patch-level (16x16)
+│   │   ├── alphaearth_emb/             # 64ch pixel-aligned
+│   │   ├── tessera_emb/                # 128ch pixel-aligned
+│   │   ├── terramind_s1_emb/           # 768ch ViT tokens (16x16)
+│   │   ├── terramind_s2_emb/           # 768ch ViT tokens (16x16)
+│   │   ├── thor_s1_emb/                # 768ch ViT tokens (16x16)
+│   │   ├── thor_s2_emb/                # 768ch ViT tokens (16x16)
 │   │   └── labels/                     # 4ch ground truth
-│   └── test/                           # 946 unlabeled patches (competition submission)
+│   └── test/                           # 946 unlabeled patches
 │       ├── alphaearth_test_emb/
 │       ├── tessera_test_emb/
 │       ├── terramind_test_s2_emb/
 │       └── thor_test_s2_emb/
 └── emb2heights-baselines/              # this repo
     ├── core/
-    │   ├── dataset.py
-    │   ├── model.py
-    │   └── losses.py
-    ├── train.py
-    ├── predict.py
-    ├── evaluate.py
-    ├── generate_split.py
-    ├── run_all_baselines.py
-    ├── splits/                         # generated train/val split files
-    └── runs/                           # experiment outputs
+    │   ├── dataset.py                  # PixelEmbeddingDataset, LatentTokenDataset
+    │   ├── model.py                    # LightUNet, EfficientDecoder256
+    │   └── losses.py                   # ImprovedCompositeLoss
+    ├── tools/
+    │   ├── generate_split.py           # create reproducible train/val splits
+    │   └── download_data.py            # download dataset from EOTDL
+    ├── train.py                        # single-baseline training
+    ├── predict.py                      # inference (val or test)
+    ├── evaluate.py                     # compute 5 leaderboard metrics
+    ├── run_all_baselines.py            # batch train/predict all 4 baselines
+    ├── splits/                         # saved train/val split JSONs
+    ├── runs/                           # experiment checkpoints & outputs
+    ├── submission/                     # competition submission files
+    └── logs/                           # evaluation reports
 ```
 
 ## Setup
@@ -42,16 +48,24 @@ conda activate emb2heights
 
 ## Quick Start
 
-### 1. Generate train/val split
+### 1. Download data
 
-Split labeled data into independent train and validation sets (default 80/20):
+Requires EOTDL authentication (`eotdl auth login`):
 
 ```bash
-python generate_split.py
+python tools/download_data.py --path ../data
+```
+
+### 2. Generate train/val split
+
+Split labeled data into reproducible train and validation sets (default 80/20, seed=42):
+
+```bash
+python tools/generate_split.py
 # Creates splits/train.json, splits/val.json, splits/split.json
 ```
 
-### 2. Train all baselines
+### 3. Train all baselines
 
 ```bash
 python run_all_baselines.py --skip-predict
@@ -69,7 +83,7 @@ python train.py \
     --epochs 30
 ```
 
-### 3. Evaluate on validation set
+### 4. Evaluate on validation set
 
 ```bash
 # Predict on training data (val split)
@@ -79,7 +93,7 @@ python run_all_baselines.py --skip-train
 python evaluate.py --val-only
 ```
 
-### 4. Generate competition submission
+### 5. Generate competition submission
 
 Predict on the test set (no labels required):
 
@@ -105,25 +119,52 @@ Predictions are saved as `pred_<core_id>.npy` files with shape `(4, 256, 256)`:
 
 ## Model Architectures
 
-| `--model-type` | Architecture | Used for |
-|---|---|---|
-| `lightunet` | U-Net with skip connections | Pixel-level embeddings (AlphaEarth, Tessera) |
-| `decoder_residual` | Progressive upsampling decoder | Patch-level embeddings (TerraMind, THOR) |
-| `auto` | Auto-select by input channels | Default |
+| `--model-type` | Architecture | Input Type | Used for |
+|---|---|---|---|
+| `lightunet` | LightUNet (encoder-decoder with skip connections) | Pixel-aligned (256x256) | AlphaEarth, Tessera |
+| `decoder_residual` | EfficientDecoder256 (progressive upsampling) | ViT tokens (16x16) | TerraMind, THOR |
+| `auto` | Auto-select based on input spatial size | Any | Default |
 
 ## Loss Function
 
 `ImprovedCompositeLoss` with 4 weighted terms:
-- **MAE** (w=1.0): foreground/background split regression
+- **MAE** (w=1.0): pixel-level regression with foreground/background split
 - **SSIM** (w=0.5): structural similarity on land-cover channels
-- **Gradient** (w=0.5): edge sharpness on land-cover channels
-- **Tversky** (w=2.0): asymmetric loss (alpha=0.3, beta=0.7) + height boosting on building pixels
+- **Gradient** (w=0.5): edge sharpness penalty on land-cover channels
+- **Tversky** (w=2.0): asymmetric segmentation loss (alpha=0.3, beta=0.7) + 2x height boosting on building pixels
+
+## Training Configuration
+
+| Parameter | Value |
+|---|---|
+| Optimizer | AdamW (lr=2e-4, weight_decay=1e-4) |
+| LR Scheduler | ReduceLROnPlateau (factor=0.5, patience=2) |
+| Gradient Clipping | max_norm=1.0 |
+| Batch Size | 32 |
+| Epochs | 30 |
+| Train/Val Split | 80/20 (seed=42) |
 
 ## Evaluation Metrics
 
 5 leaderboard metrics with weights:
-- mIoU Buildings (25%)
-- mIoU Trees (15%)
-- mIoU Water (15%)
-- RMSE Building Height (25%)
-- RMSE Vegetation Height (20%)
+
+| Metric | Weight | Task |
+|---|---|---|
+| mIoU Buildings | 25% | Segmentation |
+| mIoU Trees | 15% | Segmentation |
+| mIoU Water | 15% | Segmentation |
+| RMSE Building Height | 25% | Height regression |
+| RMSE Vegetation Height | 20% | Height regression |
+
+Composite score: `sum(mIoU_i * w_i) + sum((1 - RMSE_i / 30) * w_i)` — higher is better.
+
+## Baseline Results (Validation, 405 samples)
+
+| # | Baseline | mIoU_bld | mIoU_tree | mIoU_wat | RMSE_bH | RMSE_vH | Score |
+|---|---|---|---|---|---|---|---|
+| 1 | **AlphaEarth** | 0.598 | 0.724 | 0.680 | 4.83m | 4.33m | **0.741** |
+| 2 | TerraMind S2 | 0.531 | 0.478 | 0.545 | 5.83m | 6.95m | 0.641 |
+| 3 | THOR S2 | 0.517 | 0.365 | 0.462 | 5.99m | 7.65m | 0.602 |
+| 4 | Tessera | 0.507 | 0.206 | 0.553 | 7.21m | 11.93m | 0.551 |
+
+See [logs/BASELINE_REPORT.md](logs/BASELINE_REPORT.md) for detailed analysis.
