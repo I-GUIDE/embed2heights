@@ -6,13 +6,14 @@ import matplotlib.pyplot as plt
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
+import rasterio
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 
 # --- IMPORT FROM CORE MODULES ---
 from core.model import build_model
-from core.dataset import PixelEmbeddingDataset, LatentTokenDataset, find_file_pairs, HEIGHT_NORM_CONSTANT
+from core.dataset import PixelEmbeddingDataset, LatentTokenDataset, find_file_pairs, save_split, load_split, HEIGHT_NORM_CONSTANT
 from core.losses import ImprovedCompositeLoss
 
 # --- 1. EXPERIMENT TRACKING ---
@@ -28,10 +29,9 @@ LOSS_CURVE_PATH = os.path.join(EXP_DIR, "loss_curve.png")
 CONFIG_LOG_PATH = os.path.join(EXP_DIR, "training_params.txt")
 
 # --- 2. CONFIGURATION ---
-# TRAIN_EMBEDDINGS_DIR = "../../emb2heights/data/gee_emb_aligned_v2/"
-
-TRAIN_EMBEDDINGS_DIR = "../../emb2heights/data/gee_emb_aligned_v2"
-TRAIN_TARGETS_DIR = "../../emb2heights/data/patches_labels_10m/"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TRAIN_EMBEDDINGS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "data", "train", "alphaearth_emb"))
+TRAIN_TARGETS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "data", "train", "labels"))
 
 BATCH_SIZE = 32
 PATCH_SIZE = 256
@@ -89,6 +89,8 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
     parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--split-file", type=str, default=None,
+                        help="Path to a JSON file defining train/val split. If not found, a new split is created and saved.")
     return parser.parse_args()
 
 
@@ -134,7 +136,7 @@ def visualize_results(model, dataset, num_samples=3):
 def main():
     global BASE_DIR, EXPERIMENT_NAME, EXP_DIR, VIZ_OUTPUT_DIR
     global BEST_MODEL_PATH, LAST_MODEL_PATH, LOSS_CURVE_PATH, CONFIG_LOG_PATH
-    global TRAIN_EMBEDDINGS_DIR, TRAIN_TARGETS_DIR, TEST_TARGETS_DIR
+    global TRAIN_EMBEDDINGS_DIR, TRAIN_TARGETS_DIR
     global MODEL_TYPE, EPOCHS, BATCH_SIZE, PATCH_SIZE
 
     args = parse_args()
@@ -149,7 +151,7 @@ def main():
 
     EXP_DIR = os.path.join(BASE_DIR, EXPERIMENT_NAME)
     VIZ_OUTPUT_DIR = os.path.join(EXP_DIR, "visualizations")
-    BEST_MODEL_PATH = os.path.join(EXP_DIR, "model_best_e1.pth")
+    BEST_MODEL_PATH = os.path.join(EXP_DIR, "model_best.pth")
     LAST_MODEL_PATH = os.path.join(EXP_DIR, "model_last.pth")
     LOSS_CURVE_PATH = os.path.join(EXP_DIR, "loss_curve.png")
     CONFIG_LOG_PATH = os.path.join(EXP_DIR, "training_params.txt")
@@ -165,24 +167,39 @@ def main():
             f"train_targets_dir='{TRAIN_TARGETS_DIR}'. "
             "Check filename conventions and directory paths."
         )
-    train_pairs, val_pairs = train_test_split(
-        all_train_pairs, test_size=VAL_SPLIT, random_state=RANDOM_SEED
-    )
 
-        # In train.py:
-    if MODEL_TYPE == "lightunet":
+    split_file = args.split_file
+    if split_file and os.path.exists(split_file):
+        train_pairs, val_pairs = load_split(split_file, all_train_pairs)
+    else:
+        train_pairs, val_pairs = train_test_split(
+            all_train_pairs, test_size=VAL_SPLIT, random_state=RANDOM_SEED
+        )
+        if split_file:
+            save_split(split_file, train_pairs, val_pairs)
+
+    # Peek at the first embedding to determine channels and spatial dims
+    sample_emb_path = train_pairs[0][0]
+    with rasterio.open(sample_emb_path) as src:
+        n_channels = src.count
+
+    # Resolve dataset type: pixel-level (256x256) vs patch-level (16x16)
+    if MODEL_TYPE == "auto":
+        use_pixel_dataset = (n_channels < 512)  # AlphaEarth=64, Tessera=128 vs TerraMind/THOR=768
+    else:
+        use_pixel_dataset = (MODEL_TYPE == "lightunet")
+
+    if use_pixel_dataset:
         train_ds = PixelEmbeddingDataset(train_pairs, patch_size=PATCH_SIZE, is_train=True)
         val_ds = PixelEmbeddingDataset(val_pairs, patch_size=PATCH_SIZE, is_train=False)
     else:
-        # For the decoders (TerraMind/Thor)
         train_ds = LatentTokenDataset(train_pairs, patch_size=PATCH_SIZE, scale_factor=16, is_train=True)
         val_ds = LatentTokenDataset(val_pairs, patch_size=PATCH_SIZE, scale_factor=16, is_train=False)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
 
-    sample_img, _ = train_ds[0]
-    n_channels, n_classes = sample_img.shape[0], 4
+    n_classes = 4
 
     print("--- 2. Model Init ---")
     model, selected_model = build_model(MODEL_TYPE, n_channels, n_classes)

@@ -331,6 +331,17 @@ class EfficientDecoder256Fast(nn.Module):
         return self.head(x)
 
 
+def infer_model_type(n_channels):
+    """
+    Pick a sensible default architecture from input channel count.
+
+    High-channel embeddings (e.g. 768-dim ViT tokens from TerraMind/THOR) live
+    on a coarse 16x16 grid and need the upsampling decoder. Lower-channel,
+    pixel-aligned embeddings (AlphaEarth 64, Tessera 128) use LightUNet.
+    """
+    return "decoder_residual" if n_channels >= 512 else "lightunet"
+
+
 def build_model(model_type, n_channels, n_classes):
     selected = model_type.lower()
 

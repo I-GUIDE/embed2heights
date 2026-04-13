@@ -6,14 +6,16 @@ from tqdm.auto import tqdm
 
 # --- IMPORT FROM CORE MODULES ---
 from core.model import build_model
-from core.dataset import PixelEmbeddingDataset, LatentTokenDataset, find_file_pairs, _normalize_core_id, \
-    HEIGHT_NORM_CONSTANT
+from core.dataset import (
+    PixelEmbeddingDataset, LatentTokenDataset,
+    find_file_pairs, find_embedding_files, _normalize_core_id,
+    HEIGHT_NORM_CONSTANT,
+)
 
 # --- DEFAULTS ---
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 EXPERIMENT_NAME = "terramind_decoder_run01"
-BASE_DIR = "./runs"
-TEST_EMBEDDINGS_DIR = ""
-TEST_TARGETS_DIR = ""
+BASE_DIR = os.path.join(SCRIPT_DIR, "runs")
 MODEL_TYPE = "decoder_residual"
 PATCH_SIZE = 256
 MAX_SAMPLES = 0
@@ -40,8 +42,9 @@ def parse_args():
                         help="Path to the .pth checkpoint. Defaults to <base-dir>/<experiment-name>/model_best.pth.")
     parser.add_argument("--test-embeddings-dir", type=str, required=True,
                         help="Directory containing embedding .tif files.")
-    parser.add_argument("--test-targets-dir", type=str, required=True,
-                        help="Directory containing label .tif files (used only for file pairing).")
+    parser.add_argument("--test-targets-dir", type=str, default=None,
+                        help="Directory containing label .tif files. Optional — when omitted, "
+                             "runs label-free inference (for competition test set).")
     parser.add_argument("--predictions-dir", type=str, default=None,
                         help="Output directory for .npy predictions. Defaults to <base-dir>/<experiment-name>/predictions.")
     parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
@@ -59,11 +62,21 @@ def main():
 
     os.makedirs(predictions_dir, exist_ok=True)
 
-    # --- Load data pairs ---
-    print(f"Loading file pairs from embeddings: {args.test_embeddings_dir}")
-    pairs = find_file_pairs(args.test_embeddings_dir, args.test_targets_dir)
-    if not pairs:
-        raise RuntimeError("No matching file pairs found. Check --test-embeddings-dir and --test-targets-dir.")
+    # --- Load data ---
+    if args.test_targets_dir:
+        # Paired mode: match embeddings to labels
+        print(f"Loading file pairs from embeddings: {args.test_embeddings_dir}")
+        pairs = find_file_pairs(args.test_embeddings_dir, args.test_targets_dir)
+        if not pairs:
+            raise RuntimeError("No matching file pairs found. Check --test-embeddings-dir and --test-targets-dir.")
+    else:
+        # Label-free mode: list embedding files only (competition test set)
+        print(f"Loading embeddings (label-free): {args.test_embeddings_dir}")
+        emb_files = find_embedding_files(args.test_embeddings_dir)
+        if not emb_files:
+            raise RuntimeError(f"No .tif files found in {args.test_embeddings_dir}")
+        pairs = emb_files  # list of strings, dataset classes handle this
+
     if args.max_samples > 0:
         pairs = pairs[:args.max_samples]
 
@@ -82,7 +95,7 @@ def main():
     print(f"Loaded model: {selected_model} from {model_path} (input channels={sample_img.shape[0]})")
 
     # --- Run inference ---
-    print(f"Running inference on {len(pairs)} samples...")
+    print(f"Running inference on {len(test_ds)} samples...")
     with torch.no_grad():
         for i in tqdm(range(len(test_ds)), desc="Predicting"):
             img_tensor, _ = test_ds[i]
@@ -94,7 +107,7 @@ def main():
             # Denormalize height channel: model output [0,1] -> physical meters
             pred_np[3] = pred_np[3] * HEIGHT_NORM_CONSTANT
 
-            emb_path, _ = test_ds.file_pairs[i]
+            emb_path = test_ds.file_pairs[i][0]
             core_id = _normalize_core_id(emb_path)
 
             save_path = os.path.join(predictions_dir, f"pred_{core_id}.npy")

@@ -1,6 +1,7 @@
 import os
 import glob
 import re
+import json
 import numpy as np
 import rasterio
 import torch
@@ -12,24 +13,29 @@ def _normalize_core_id(filename):
     """
     Extracts the pure core ID by stripping all known prefixes,
     embedding suffixes, and year suffixes.
+
+    Handles both train and test naming conventions:
+      Train: gee_emb_0000_BE.tif, tessera_emb_0000_BE.tif, s2_0000_BE_2023_embeddings.tif
+      Test:  emb_3001_BE_2023_quantized.tif, 3001_BE_2023_merged.tif, s2_3001_BE_2023_embedding.tif
     """
     base = os.path.splitext(os.path.basename(filename))[0]
 
-    # 1. Strip label prefix
+    # 1. Strip label / prediction prefixes
     if base.startswith("label_"):
         base = base[len("label_"):]
+    if base.startswith("pred_"):
+        base = base[len("pred_"):]
 
-    # 2. Strip embedding prefixes
-    for prefix in ("gee_emb_", "tessera_emb_", "s2_", "s1_"):
+    # 2. Strip embedding prefixes (order matters: longer prefixes first)
+    for prefix in ("gee_emb_", "tessera_emb_", "emb_", "s2_", "s1_"):
         if base.startswith(prefix):
             base = base[len(prefix):]
             break
 
-    # 3. Strip trailing embedding suffixes (if any)
-    if base.endswith("_embedding"):
-        base = base[:-len("_embedding")]
-    if base.endswith("_embeddings"):
-        base = base[:-len("_embeddings")]
+    # 3. Strip trailing embedding/test suffixes
+    for suffix in ("_embedding", "_embeddings", "_quantized", "_merged"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
 
     # 4. Strip trailing year suffixes (e.g., '_2021', '_2023')
     base = re.sub(r'_\d{4}$', '', base)
@@ -63,15 +69,65 @@ def find_file_pairs(emb_dir, tar_dir):
 
     return pairs
 
+
+def find_embedding_files(emb_dir):
+    """
+    List all embedding .tif files without requiring labels.
+    Used for competition test-set prediction where no ground truth exists.
+    Returns list of embedding file paths.
+    """
+    emb_files = sorted(glob.glob(os.path.join(emb_dir, "**", "*.tif"), recursive=True))
+    return emb_files
+
+
+def save_split(split_path, train_pairs, val_pairs):
+    """Save train/val split to a JSON file using normalized core IDs."""
+    data = {
+        "train": [_normalize_core_id(e) for e, _ in train_pairs],
+        "val": [_normalize_core_id(e) for e, _ in val_pairs],
+    }
+    with open(split_path, "w") as f:
+        json.dump(data, f, indent=2)
+    print(f"Split saved to {split_path} (train={len(data['train'])}, val={len(data['val'])})")
+
+
+def load_split(split_path, all_pairs):
+    """Load a saved split and reconstruct file pair lists."""
+    with open(split_path) as f:
+        data = json.load(f)
+
+    train_ids = set(data["train"])
+    val_ids = set(data["val"])
+
+    train_pairs, val_pairs = [], []
+    for pair in all_pairs:
+        core_id = _normalize_core_id(pair[0])
+        if core_id in train_ids:
+            train_pairs.append(pair)
+        elif core_id in val_ids:
+            val_pairs.append(pair)
+
+    print(f"Split loaded from {split_path} (train={len(train_pairs)}, val={len(val_pairs)})")
+    return train_pairs, val_pairs
+
+
 # ---------------------------------------------------------
 # DATASET 1: Pixel-Based (Alpha Earth, Tessera)
 # 1:1 Spatial Resolution (e.g., 256x256 -> 256x256)
 # ---------------------------------------------------------
 class PixelEmbeddingDataset(Dataset):
+    """
+    For pixel-level embeddings (AlphaEarth 64ch, Tessera 128ch).
+    file_pairs: list of (emb_path, label_path) tuples, OR list of emb_path strings (label-free mode).
+    """
     def __init__(self, file_pairs, patch_size=128, is_train=True):
-        self.file_pairs = file_pairs
         self.patch_size = patch_size
         self.is_train = is_train
+        # Support both paired and label-free inputs
+        if file_pairs and isinstance(file_pairs[0], str):
+            self.file_pairs = [(p, None) for p in file_pairs]
+        else:
+            self.file_pairs = file_pairs
 
     def __len__(self):
         return len(self.file_pairs)
@@ -81,11 +137,15 @@ class PixelEmbeddingDataset(Dataset):
 
         with rasterio.open(emb_path) as src:
             image = src.read().astype(np.float32)
-        with rasterio.open(tar_path) as src:
-            target = src.read().astype(np.float32)
+        image = np.nan_to_num(image)
 
-        image, target = np.nan_to_num(image), np.nan_to_num(target)
-        target[3, :, :] = np.clip(target[3, :, :] / HEIGHT_NORM_CONSTANT, 0.0, 1.5)
+        if tar_path is not None:
+            with rasterio.open(tar_path) as src:
+                target = src.read().astype(np.float32)
+            target = np.nan_to_num(target)
+            target[3, :, :] = np.clip(target[3, :, :] / HEIGHT_NORM_CONSTANT, 0.0, 1.5)
+        else:
+            target = np.zeros((4, image.shape[1], image.shape[2]), dtype=np.float32)
 
         # 1:1 Padding
         c, h, w = image.shape
@@ -114,11 +174,19 @@ class PixelEmbeddingDataset(Dataset):
 # Upscaled Spatial Resolution (e.g., 16x16 -> 256x256)
 # ---------------------------------------------------------
 class LatentTokenDataset(Dataset):
+    """
+    For patch-level embeddings (TerraMind 768ch@16x16, THOR 768ch@16x16).
+    file_pairs: list of (emb_path, label_path) tuples, OR list of emb_path strings (label-free mode).
+    """
     def __init__(self, file_pairs, patch_size=256, scale_factor=16, is_train=True):
-        self.file_pairs = file_pairs
         self.patch_size = patch_size
         self.scale_factor = scale_factor
         self.is_train = is_train
+        # Support both paired and label-free inputs
+        if file_pairs and isinstance(file_pairs[0], str):
+            self.file_pairs = [(p, None) for p in file_pairs]
+        else:
+            self.file_pairs = file_pairs
 
     def __len__(self):
         return len(self.file_pairs)
@@ -128,13 +196,17 @@ class LatentTokenDataset(Dataset):
 
         with rasterio.open(emb_path) as src:
             image = src.read().astype(np.float32)
-        with rasterio.open(tar_path) as src:
-            target = src.read().astype(np.float32)
-
-        image, target = np.nan_to_num(image), np.nan_to_num(target)
-        target[3, :, :] = np.clip(target[3, :, :] / HEIGHT_NORM_CONSTANT, 0.0, 1.5)
+        image = np.nan_to_num(image)
 
         emb_patch_size = self.patch_size // self.scale_factor
+
+        if tar_path is not None:
+            with rasterio.open(tar_path) as src:
+                target = src.read().astype(np.float32)
+            target = np.nan_to_num(target)
+            target[3, :, :] = np.clip(target[3, :, :] / HEIGHT_NORM_CONSTANT, 0.0, 1.5)
+        else:
+            target = np.zeros((4, self.patch_size, self.patch_size), dtype=np.float32)
 
         # Pad Embedding to its specific small size
         c, h_emb, w_emb = image.shape
