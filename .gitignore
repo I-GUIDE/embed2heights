@@ -1,0 +1,32 @@
+# Data (downloaded via eotdl, large GeoTIFF files)
+data/
+
+# Experiment outputs (checkpoints, loss curves, predictions)
+runs/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
