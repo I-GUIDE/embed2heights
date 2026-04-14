@@ -3,6 +3,7 @@ data/
 
 # Experiment outputs (checkpoints, loss curves, predictions)
 runs/
+run_all_baselines.sbatch
 
 # Python
 __pycache__/
@@ -30,3 +31,7 @@ build/
 # OS
 .DS_Store
 Thumbs.db
+
+
+# logs
+logs/ISSUE_*

@@ -87,7 +87,7 @@ def main():
         test_ds = LatentTokenDataset(pairs, patch_size=args.patch_size, scale_factor=16, is_train=False)
 
     # --- Load model ---
-    sample_img, _ = test_ds[0]
+    sample_img, _, _ = test_ds[0]
     model, selected_model = build_model(args.model_type, n_channels=sample_img.shape[0], n_classes=4)
     model = model.to(DEVICE)
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
@@ -98,7 +98,7 @@ def main():
     print(f"Running inference on {len(test_ds)} samples...")
     with torch.no_grad():
         for i in tqdm(range(len(test_ds)), desc="Predicting"):
-            img_tensor, _ = test_ds[i]
+            img_tensor, _, _ = test_ds[i]
             img_batch = img_tensor.unsqueeze(0).to(DEVICE)
 
             output_batch = model(img_batch)

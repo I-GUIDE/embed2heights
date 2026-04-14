@@ -34,9 +34,14 @@ DEFAULT_LABELS_DIR = os.path.join(DEFAULT_DATA_DIR, "labels")
 # Mapping from experiment name to embedding subdir under data/train/
 EXP_TO_EMB = {
     "alphaearth_baseline": "alphaearth_emb",
+    "alphaearth_nodata_mask": "alphaearth_emb",
+    "alphaearth_nodata_mask_2": "alphaearth_emb",
+    
     "tessera_baseline": "tessera_emb",
     "terramind_s2_baseline": "terramind_s2_emb",
     "thor_s2_baseline": "thor_s2_emb",
+    "terramind_s1_baseline": "terramind_s1_emb",
+    "thor_s1_baseline": "thor_s1_emb",
 }
 
 # train.py split parameters (must match exactly to reproduce the same split)

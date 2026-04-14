@@ -141,14 +141,35 @@ class ImprovedCompositeLoss(nn.Module):
         # Height is now normalized, so we weight all 4 channels equally in base MAE
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
 
-    def forward(self, preds, targets):
+    def forward(self, preds, targets, valid_mask=None):
+        """
+        Args:
+            preds:      (B, 4, H, W) model predictions
+            targets:    (B, 4, H, W) ground truth
+            valid_mask: (B, 2, H, W) float mask. Channel 0 = global validity (for land cover),
+                        Channel 1 = height validity (global + nDSM hole exclusion).
+                        If None, all pixels are valid.
+        """
         device = preds.device
         mae_weights = self.mae_weights.to(device)
 
-        # --- 1. Base MAE (Foreground / Background Split) ---
+        # Default: all pixels valid (backward compatible)
+        if valid_mask is None:
+            valid_mask = torch.ones(preds.shape[0], 2, preds.shape[2], preds.shape[3],
+                                    device=device)
+
+        global_mask = valid_mask[:, 0:1, :, :]   # (B, 1, H, W) — land cover validity
+        height_mask = valid_mask[:, 1:2, :, :]   # (B, 1, H, W) — height validity (stricter)
+
+        # Per-channel mask: global for bands 0-2, height-specific for band 3
+        ch_mask = torch.cat([global_mask.expand(-1, 3, -1, -1), height_mask], dim=1)  # (B, 4, H, W)
+        global_1ch = global_mask.squeeze(1)       # (B, H, W)
+        height_1ch = height_mask.squeeze(1)       # (B, H, W)
+
+        # --- 1. Base MAE (Foreground / Background Split) with nodata masking ---
         abs_err = torch.abs(preds - targets)
-        fg_mask = (targets > 0).float()
-        bg_mask = 1.0 - fg_mask
+        fg_mask = (targets > 0).float() * ch_mask
+        bg_mask = (1.0 - (targets > 0).float()) * ch_mask
 
         fg_sum = torch.sum(fg_mask, dim=(0, 2, 3)) + 1e-6
         bg_sum = torch.sum(bg_mask, dim=(0, 2, 3)) + 1e-6
@@ -160,28 +181,31 @@ class ImprovedCompositeLoss(nn.Module):
         loss_mae = torch.sum(mae_per_channel * mae_weights)
 
         # --- 2. Structural & Gradient Loss on Land Cover Only ---
-        lc_pred = preds[:, :3, :, :]
-        lc_target = targets[:, :3, :, :]
+        # Zero out predictions at nodata pixels so they match targets (no spurious loss)
+        lc_mask = global_mask.expand(-1, 3, -1, -1)       # (B, 3, H, W)
+        lc_pred = preds[:, :3, :, :] * lc_mask
+        lc_target = targets[:, :3, :, :] * lc_mask
 
         loss_ssim = self.ssim(lc_pred, lc_target)
         loss_grad = self.gdl(lc_pred, lc_target)
 
-        # --- 3. Multi-Class Tversky Loss ---
-        # Apply Tversky to all three land cover channels to balance recall
-        t_build = self.tversky(torch.relu(preds[:, 0, :, :]), targets[:, 0, :, :])
-        t_veg = self.tversky(torch.relu(preds[:, 1, :, :]), targets[:, 1, :, :])
-        t_water = self.tversky(torch.relu(preds[:, 2, :, :]), targets[:, 2, :, :])
+        # --- 3. Multi-Class Tversky Loss with nodata masking (global mask for land cover) ---
+        t_build = self.tversky(torch.relu(preds[:, 0, :, :]) * global_1ch,
+                               targets[:, 0, :, :] * global_1ch)
+        t_veg = self.tversky(torch.relu(preds[:, 1, :, :]) * global_1ch,
+                             targets[:, 1, :, :] * global_1ch)
+        t_water = self.tversky(torch.relu(preds[:, 2, :, :]) * global_1ch,
+                               targets[:, 2, :, :] * global_1ch)
 
-        # Average the Tversky losses so no single class dominates the optimization
         loss_tversky = (t_build + t_veg + t_water) / 3.0
 
-        # --- 4. NEW: Height-Aware Building Masking ---
-        # Apply a 5x penalty to height errors specifically where building ground truth > 10%
-        build_presence_mask = (targets[:, 0, :, :] > 0.1).float()
-        height_err = torch.abs(preds[:, 3, :, :] - targets[:, 3, :, :])
+        # --- 4. Height-Aware Building Masking with nDSM-specific mask ---
+        # Use height_mask: excludes both global nodata AND nDSM holes
+        build_presence_mask = (targets[:, 0, :, :] > 0.1).float() * height_1ch
+        height_err = torch.abs(preds[:, 3, :, :] - targets[:, 3, :, :]) * height_1ch
 
-        # Base height error + boosted error on buildings
-        loss_height_boost = torch.mean(height_err * (1.0 + 5.0 * build_presence_mask))
+        height_valid_count = torch.sum(height_1ch) + 1e-6
+        loss_height_boost = torch.sum(height_err * (1.0 + 5.0 * build_presence_mask)) / height_valid_count
 
         # --- Combine Total Loss ---
         total_loss = (self.w_mae * loss_mae) + \
@@ -190,5 +214,4 @@ class ImprovedCompositeLoss(nn.Module):
                      (self.w_structure * loss_tversky) + \
                      (self.w_structure * loss_height_boost)
 
-        # Return tuple matching your training loop signature
         return total_loss, loss_mae, loss_ssim, loss_grad, loss_tversky
