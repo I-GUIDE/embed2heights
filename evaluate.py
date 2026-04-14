@@ -141,7 +141,7 @@ def get_val_core_ids(emb_dir, labels_dir, split_file=None):
 
 def evaluate_experiment(pred_dir, labels_dir, threshold=0.5, val_only_ids=None):
     """Compute the 5 metrics for one experiment."""
-    pred_files = sorted(glob.glob(os.path.join(pred_dir, "pred_*.npy")))
+    pred_files = sorted(glob.glob(os.path.join(pred_dir, "*.npy")))
     if not pred_files:
         return None
 

@@ -8,7 +8,8 @@ from tqdm.auto import tqdm
 from core.model import build_model
 from core.dataset import (
     PixelEmbeddingDataset, LatentTokenDataset,
-    find_file_pairs, find_embedding_files, _normalize_core_id,
+    find_file_pairs, find_embedding_files,
+    _normalize_core_id, _submission_id,
     HEIGHT_NORM_CONSTANT,
 )
 
@@ -108,9 +109,12 @@ def main():
             pred_np[3] = pred_np[3] * HEIGHT_NORM_CONSTANT
 
             emb_path = test_ds.file_pairs[i][0]
-            core_id = _normalize_core_id(emb_path)
+            # Submission format: '<id>_<region>_<year>.npy' (no 'pred_' prefix,
+            # year preserved). In paired mode (validation) year may be absent —
+            # that is fine, the id simply degrades to the core id.
+            sub_id = _submission_id(emb_path) if not args.test_targets_dir else _normalize_core_id(emb_path)
 
-            save_path = os.path.join(predictions_dir, f"pred_{core_id}.npy")
+            save_path = os.path.join(predictions_dir, f"{sub_id}.npy")
             np.save(save_path, pred_np)
 
     print(f"Predictions saved to: {predictions_dir}")

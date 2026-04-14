@@ -43,6 +43,30 @@ def _normalize_core_id(filename):
     return base
 
 
+def _submission_id(filename):
+    """
+    Extracts the submission file id from a test embedding filename,
+    preserving the year suffix required by the leaderboard.
+
+    Example: 'emb_3001_BE_2023_quantized.tif' -> '3001_BE_2023'
+    """
+    base = os.path.splitext(os.path.basename(filename))[0]
+
+    # Strip known prefixes (same set as _normalize_core_id, minus pred_/label_)
+    for prefix in ("gee_emb_", "tessera_emb_", "emb_", "s2_", "s1_"):
+        if base.startswith(prefix):
+            base = base[len(prefix):]
+            break
+
+    # Strip trailing embedding/test suffixes
+    for suffix in ("_embedding", "_embeddings", "_quantized", "_merged"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+
+    # Keep the '_YYYY' year suffix — required by submission format.
+    return base
+
+
 def find_file_pairs(emb_dir, tar_dir):
     """
     Fast and robust O(N) file matching using a hash map and regex normalization.
