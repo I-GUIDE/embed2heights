@@ -18,16 +18,34 @@ class TverskyLoss(nn.Module):
         self.beta = beta
         self.smooth = smooth
 
-    def forward(self, preds, targets):
-        # Flatten: [Batch, H, W] -> [Batch, N]
+    def forward(self, preds, targets, valid_mask=None):
+        """
+        Args:
+            preds, targets: (B, H, W) or (B, N)
+            valid_mask: optional bool/float mask, same shape as preds.
+                        Only valid pixels contribute to TP/FP/FN (no dilution
+                        from nodata zeros).
+        """
         batch_size = preds.size(0)
-        p = preds.view(batch_size, -1)
-        t = targets.view(batch_size, -1)
+        p = preds.reshape(batch_size, -1)
+        t = targets.reshape(batch_size, -1)
 
-        # True Positives, False Positives, False Negatives
+        if valid_mask is not None:
+            m = valid_mask.reshape(batch_size, -1).bool()
+            # Compute per-sample on valid pixels only; pad invalid with 0 so
+            # they contribute nothing to sums (and mask-zero denominators too).
+            p = torch.where(m, p, torch.zeros_like(p))
+            t = torch.where(m, t, torch.zeros_like(t))
+            # (1 - p) and (1 - t) terms must also be zeroed on invalid pixels
+            one_minus_p = torch.where(m, 1.0 - p, torch.zeros_like(p))
+            one_minus_t = torch.where(m, 1.0 - t, torch.zeros_like(t))
+        else:
+            one_minus_p = 1.0 - p
+            one_minus_t = 1.0 - t
+
         TP = torch.sum(p * t, dim=1)
-        FP = torch.sum(p * (1 - t), dim=1)
-        FN = torch.sum((1 - p) * t, dim=1)
+        FP = torch.sum(p * one_minus_t, dim=1)
+        FN = torch.sum(one_minus_p * t, dim=1)
 
         tversky = (TP + self.smooth) / (TP + self.alpha * FP + self.beta * FN + self.smooth)
 
@@ -190,12 +208,15 @@ class ImprovedCompositeLoss(nn.Module):
         loss_grad = self.gdl(lc_pred, lc_target)
 
         # --- 3. Multi-Class Tversky Loss with nodata masking (global mask for land cover) ---
-        t_build = self.tversky(torch.relu(preds[:, 0, :, :]) * global_1ch,
-                               targets[:, 0, :, :] * global_1ch)
-        t_veg = self.tversky(torch.relu(preds[:, 1, :, :]) * global_1ch,
-                             targets[:, 1, :, :] * global_1ch)
-        t_water = self.tversky(torch.relu(preds[:, 2, :, :]) * global_1ch,
-                               targets[:, 2, :, :] * global_1ch)
+        # Pass the mask explicitly so invalid pixels are excluded from TP/FP/FN
+        # (no dilution from zero-filled nodata regions).
+        gm_bool = global_1ch.bool()
+        t_build = self.tversky(torch.relu(preds[:, 0, :, :]),
+                               targets[:, 0, :, :], valid_mask=gm_bool)
+        t_veg = self.tversky(torch.relu(preds[:, 1, :, :]),
+                             targets[:, 1, :, :], valid_mask=gm_bool)
+        t_water = self.tversky(torch.relu(preds[:, 2, :, :]),
+                               targets[:, 2, :, :], valid_mask=gm_bool)
 
         loss_tversky = (t_build + t_veg + t_water) / 3.0
 
