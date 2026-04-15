@@ -41,7 +41,12 @@ WEIGHT_DECAY = 1e-4  # L2 Regularization
 VAL_SPLIT = 0.2
 LAMBDAS = [1.0, 0.5, 0.5, 2.0]  # [MAE, SSIM, Gradient, Structure/Tversky]
 RANDOM_SEED = 42
-MODEL_TYPE = "auto"  # one of: auto, lightunet, decoder_residual
+MODEL_TYPE = "auto"  # one of: auto, lightunet, decoder_residual, embedding_refiner, hrnet_w18, hrnet_w32
+PIXEL_MODEL_TYPES = ("lightunet", "embedding_refiner", "hrnet_w18", "hrnet_w32")
+USE_AMP = True
+GRAD_ACCUM_STEPS = 1
+NUM_WORKERS = 2
+AUX_WEIGHT = 0.25
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -69,7 +74,11 @@ def save_experiment_config():
         f.write(f"LEARNING_RATE: {LEARNING_RATE}\n")
         f.write(f"WEIGHT_DECAY: {WEIGHT_DECAY}\n")
         f.write(f"LOSS LAMBDAS: {LAMBDAS}\n")
+        f.write(f"AUX_WEIGHT: {AUX_WEIGHT}\n")
         f.write(f"MODEL_TYPE: {MODEL_TYPE}\n")
+        f.write(f"USE_AMP: {USE_AMP}\n")
+        f.write(f"GRAD_ACCUM_STEPS: {GRAD_ACCUM_STEPS}\n")
+        f.write(f"NUM_WORKERS: {NUM_WORKERS}\n")
         f.write(f"TRAIN_EMBEDDINGS_DIR: {TRAIN_EMBEDDINGS_DIR}\n")
         f.write(f"TRAIN_TARGETS_DIR: {TRAIN_TARGETS_DIR}\n")
         f.write(f"VAL_SPLIT: {VAL_SPLIT}\n")
@@ -81,7 +90,9 @@ def save_experiment_config():
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train emb2heights baseline models")
-    parser.add_argument("--model-type", type=str, default=MODEL_TYPE, choices=["auto", "lightunet", "decoder_residual"])
+    parser.add_argument("--model-type", type=str, default=MODEL_TYPE,
+                        choices=["auto", "lightunet", "decoder_residual", "embedding_refiner",
+                                 "hrnet_w18", "hrnet_w32"])
     parser.add_argument("--output-dir", type=str, default=BASE_DIR)
     parser.add_argument("--train-embeddings-dir", type=str, default=TRAIN_EMBEDDINGS_DIR)
     parser.add_argument("--train-targets-dir", type=str, default=TRAIN_TARGETS_DIR)
@@ -89,6 +100,15 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
     parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
     parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--lr", type=float, default=LEARNING_RATE)
+    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=USE_AMP,
+                        help="Use CUDA automatic mixed precision when available.")
+    parser.add_argument("--grad-accum-steps", type=int, default=GRAD_ACCUM_STEPS,
+                        help="Accumulate gradients over N mini-batches before optimizer step.")
+    parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
+    parser.add_argument("--aux-weight", type=float, default=AUX_WEIGHT,
+                        help="Weight for auxiliary multi-head supervision.")
     parser.add_argument("--split-file", type=str, default=None,
                         help="Path to a JSON file defining train/val split. If not found, a new split is created and saved.")
     return parser.parse_args()
@@ -133,11 +153,18 @@ def visualize_results(model, dataset, num_samples=3):
             plt.close()
 
 
+def forward_for_training(model, imgs):
+    if getattr(model, "supports_aux_outputs", False):
+        return model(imgs, return_aux=True)
+    return model(imgs)
+
+
 def main():
     global BASE_DIR, EXPERIMENT_NAME, EXP_DIR, VIZ_OUTPUT_DIR
     global BEST_MODEL_PATH, LAST_MODEL_PATH, LOSS_CURVE_PATH, CONFIG_LOG_PATH
     global TRAIN_EMBEDDINGS_DIR, TRAIN_TARGETS_DIR
-    global MODEL_TYPE, EPOCHS, BATCH_SIZE, PATCH_SIZE
+    global MODEL_TYPE, EPOCHS, BATCH_SIZE, PATCH_SIZE, USE_AMP
+    global LEARNING_RATE, WEIGHT_DECAY, GRAD_ACCUM_STEPS, NUM_WORKERS, AUX_WEIGHT
 
     args = parse_args()
     MODEL_TYPE = args.model_type
@@ -148,6 +175,12 @@ def main():
     BATCH_SIZE = args.batch_size
     PATCH_SIZE = args.patch_size
     EPOCHS = args.epochs
+    LEARNING_RATE = args.lr
+    WEIGHT_DECAY = args.weight_decay
+    USE_AMP = args.amp and DEVICE.type == "cuda"
+    GRAD_ACCUM_STEPS = max(1, args.grad_accum_steps)
+    NUM_WORKERS = max(0, args.num_workers)
+    AUX_WEIGHT = args.aux_weight
 
     EXP_DIR = os.path.join(BASE_DIR, EXPERIMENT_NAME)
     VIZ_OUTPUT_DIR = os.path.join(EXP_DIR, "visualizations")
@@ -187,7 +220,8 @@ def main():
     if MODEL_TYPE == "auto":
         use_pixel_dataset = (n_channels < 512)  # AlphaEarth=64, Tessera=128 vs TerraMind/THOR=768
     else:
-        use_pixel_dataset = (MODEL_TYPE == "lightunet")
+        # Pixel models consume 256x256 embeddings; decoder_residual consumes 16x16 ViT tokens.
+        use_pixel_dataset = MODEL_TYPE in PIXEL_MODEL_TYPES
 
     if use_pixel_dataset:
         train_ds = PixelEmbeddingDataset(train_pairs, patch_size=PATCH_SIZE, is_train=True)
@@ -196,8 +230,8 @@ def main():
         train_ds = LatentTokenDataset(train_pairs, patch_size=PATCH_SIZE, scale_factor=16, is_train=True)
         val_ds = LatentTokenDataset(val_pairs, patch_size=PATCH_SIZE, scale_factor=16, is_train=False)
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
     n_classes = 4
 
@@ -208,10 +242,11 @@ def main():
 
     # NEW: AdamW with Weight Decay
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
 
     # NEW: Aggressive Scheduler
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
-    criterion = ImprovedCompositeLoss(lambdas=LAMBDAS).to(DEVICE)
+    criterion = ImprovedCompositeLoss(lambdas=LAMBDAS, aux_weight=AUX_WEIGHT).to(DEVICE)
 
     print(f"Starting training on {DEVICE}...")
 
@@ -223,20 +258,28 @@ def main():
         model.train()
         running_loss = 0.0
         train_samples_seen = 0
+        optimizer.zero_grad(set_to_none=True)
 
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS} [train]", leave=False)
-        for imgs, targets, masks in train_pbar:
+        for step, (imgs, targets, masks) in enumerate(train_pbar, start=1):
             imgs, targets, masks = imgs.to(DEVICE), targets.to(DEVICE), masks.to(DEVICE)
-            optimizer.zero_grad()
-            outputs = model(imgs)
 
-            loss, _, _, _, _ = criterion(outputs, targets, masks)
-            loss.backward()
+            with torch.amp.autocast("cuda", enabled=USE_AMP):
+                outputs = forward_for_training(model, imgs)
+                loss, _, _, _, _ = criterion(outputs, targets, masks)
+                scaled_loss = loss / GRAD_ACCUM_STEPS
 
-            # NEW: Gradient Clipping
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            scaler.scale(scaled_loss).backward()
 
-            optimizer.step()
+            should_step = step % GRAD_ACCUM_STEPS == 0 or step == len(train_loader)
+            if should_step:
+                # NEW: Gradient Clipping
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
             running_loss += loss.item() * imgs.size(0)
             train_samples_seen += imgs.size(0)
             train_avg = running_loss / max(1, train_samples_seen)
@@ -255,9 +298,10 @@ def main():
             val_pbar = tqdm(val_loader, desc=f"Epoch {epoch + 1}/{EPOCHS} [val]", leave=False)
             for imgs, targets, masks in val_pbar:
                 imgs, targets, masks = imgs.to(DEVICE), targets.to(DEVICE), masks.to(DEVICE)
-                outputs = model(imgs)
 
-                loss, l_mae, l_ssim, l_grad, l_tversky = criterion(outputs, targets, masks)
+                with torch.amp.autocast("cuda", enabled=USE_AMP):
+                    outputs = forward_for_training(model, imgs)
+                    loss, l_mae, l_ssim, l_grad, l_tversky = criterion(outputs, targets, masks)
                 val_running_loss += loss.item() * imgs.size(0)
 
                 bs = imgs.size(0)

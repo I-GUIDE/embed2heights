@@ -177,7 +177,7 @@ class PixelEmbeddingDataset(Dataset):
             # Pack into (2, H, W): channel 0 = global, channel 1 = height-specific
             valid_mask = np.stack([global_valid, height_valid], axis=0).astype(np.float32)
             target = raw_target
-            target[3, :, :] = np.clip(target[3, :, :] / HEIGHT_NORM_CONSTANT, 0.0, 1.5)
+            target[3, :, :] = np.maximum(target[3, :, :], 0.0) / HEIGHT_NORM_CONSTANT
         else:
             target = np.zeros((4, image.shape[1], image.shape[2]), dtype=np.float32)
             valid_mask = np.ones((2, image.shape[1], image.shape[2]), dtype=np.float32)
@@ -247,7 +247,7 @@ class LatentTokenDataset(Dataset):
             height_valid = global_valid & ~ndsm_hole
             valid_mask = np.stack([global_valid, height_valid], axis=0).astype(np.float32)
             target = raw_target
-            target[3, :, :] = np.clip(target[3, :, :] / HEIGHT_NORM_CONSTANT, 0.0, 1.5)
+            target[3, :, :] = np.maximum(target[3, :, :], 0.0) / HEIGHT_NORM_CONSTANT
         else:
             target = np.zeros((4, self.patch_size, self.patch_size), dtype=np.float32)
             valid_mask = np.ones((2, self.patch_size, self.patch_size), dtype=np.float32)

@@ -141,7 +141,8 @@ class ImprovedCompositeLoss(nn.Module):
     4. Structure-Boosted Height MAE.
     """
 
-    def __init__(self, lambdas=[1.0, 0.5, 0.5, 2.0], bg_weight=0.05):
+    def __init__(self, lambdas=[1.0, 0.5, 0.5, 2.0], bg_weight=0.05,
+                 aux_weight=0.25):
         super().__init__()
         self.ssim = SSIMLoss(window_size=11)
         self.gdl = GradientDifferenceLoss()
@@ -155,6 +156,7 @@ class ImprovedCompositeLoss(nn.Module):
         self.w_structure = lambdas[3]  # Represents both Tversky and Building-Height weights
 
         self.bg_weight = bg_weight
+        self.aux_weight = aux_weight
 
         # Height is now normalized, so we weight all 4 channels equally in base MAE
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
@@ -162,12 +164,17 @@ class ImprovedCompositeLoss(nn.Module):
     def forward(self, preds, targets, valid_mask=None):
         """
         Args:
-            preds:      (B, 4, H, W) model predictions
+            preds:      (B, 4, H, W) model predictions, or a dict with
+                        preds["out"] plus optional auxiliary heads
             targets:    (B, 4, H, W) ground truth
             valid_mask: (B, 2, H, W) float mask. Channel 0 = global validity (for land cover),
                         Channel 1 = height validity (global + nDSM hole exclusion).
                         If None, all pixels are valid.
         """
+        aux_outputs = preds if isinstance(preds, dict) else None
+        if aux_outputs is not None:
+            preds = aux_outputs["out"]
+
         device = preds.device
         mae_weights = self.mae_weights.to(device)
 
@@ -234,5 +241,32 @@ class ImprovedCompositeLoss(nn.Module):
                      (self.w_grad * loss_grad) + \
                      (self.w_structure * loss_tversky) + \
                      (self.w_structure * loss_height_boost)
+
+        # --- 5. Optional auxiliary supervision for multi-head models ---
+        if aux_outputs is not None and "presence_logits" in aux_outputs:
+            presence_target = (targets[:, :3, :, :] > 0.5).float()
+            presence_loss = F.binary_cross_entropy_with_logits(
+                aux_outputs["presence_logits"], presence_target, reduction="none"
+            )
+            presence_loss = torch.sum(presence_loss * lc_mask) / (torch.sum(lc_mask) + 1e-6)
+
+            target_height = targets[:, 3:4, :, :]
+            bld_height_mask = (targets[:, 0:1, :, :] > 0.5).float() * height_mask
+            veg_height_mask = (targets[:, 1:2, :, :] > 0.5).float() * height_mask
+
+            def masked_l1(pred, target, mask):
+                return torch.sum(torch.abs(pred - target) * mask) / (torch.sum(mask) + 1e-6)
+
+            aux_height_loss = 0.0
+            if "height_building" in aux_outputs:
+                aux_height_loss = aux_height_loss + masked_l1(
+                    aux_outputs["height_building"], target_height, bld_height_mask
+                )
+            if "height_vegetation" in aux_outputs:
+                aux_height_loss = aux_height_loss + masked_l1(
+                    aux_outputs["height_vegetation"], target_height, veg_height_mask
+                )
+
+            total_loss = total_loss + self.aux_weight * (presence_loss + aux_height_loss)
 
         return total_loss, loss_mae, loss_ssim, loss_grad, loss_tversky

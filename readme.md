@@ -122,8 +122,19 @@ Predictions are saved as `pred_<core_id>.npy` files with shape `(4, 256, 256)`:
 | `--model-type` | Architecture | Input Type | Used for |
 |---|---|---|---|
 | `lightunet` | LightUNet (encoder-decoder with skip connections) | Pixel-aligned (256x256) | AlphaEarth, Tessera |
+| `embedding_refiner` | Full-resolution ConvNeXt/ASPP refiner with multi-head prediction | Pixel-aligned (256x256) | AlphaEarth, Tessera |
+| `hrnet_w18` | HRNet-style high-resolution backbone, width 18, with multi-head prediction | Pixel-aligned (256x256) | AlphaEarth, Tessera |
+| `hrnet_w32` | HRNet-style high-resolution backbone, width 32, with multi-head prediction | Pixel-aligned (256x256) | AlphaEarth, Tessera |
 | `decoder_residual` | EfficientDecoder256 (progressive upsampling) | ViT tokens (16x16) | TerraMind, THOR |
 | `auto` | Auto-select based on input spatial size | Any | Default |
+
+AlphaEarth single-modality backbone comparison:
+
+```bash
+python train.py --model-type embedding_refiner --experiment-name alphaearth_refiner --split-file splits/split.json --batch-size 8 --grad-accum-steps 4 --lr 1e-4 --aux-weight 0.05 --num-workers 0
+python train.py --model-type hrnet_w18 --experiment-name alphaearth_hrnet_w18 --split-file splits/split.json --batch-size 4 --grad-accum-steps 4 --lr 1e-4 --aux-weight 0.05 --num-workers 0
+python train.py --model-type hrnet_w32 --experiment-name alphaearth_hrnet_w32 --split-file splits/split.json --batch-size 2 --grad-accum-steps 8 --lr 5e-5 --aux-weight 0.05 --num-workers 0
+```
 
 ## Loss Function
 
@@ -132,6 +143,7 @@ Predictions are saved as `pred_<core_id>.npy` files with shape `(4, 256, 256)`:
 - **SSIM** (w=0.5): structural similarity on land-cover channels
 - **Gradient** (w=0.5): edge sharpness penalty on land-cover channels
 - **Tversky** (w=2.0): asymmetric segmentation loss (alpha=0.3, beta=0.7) + 2x height boosting on building pixels
+- **Auxiliary multi-head loss**: for compatible models, lightly supervises class-presence logits and building/vegetation height heads before they are fused into the final 4-channel prediction
 
 ## Training Configuration
 

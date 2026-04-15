@@ -2,6 +2,7 @@ import os
 import argparse
 import numpy as np
 import torch
+import rasterio
 from tqdm.auto import tqdm
 
 # --- IMPORT FROM CORE MODULES ---
@@ -20,6 +21,7 @@ BASE_DIR = os.path.join(SCRIPT_DIR, "runs")
 MODEL_TYPE = "decoder_residual"
 PATCH_SIZE = 256
 MAX_SAMPLES = 0
+PIXEL_MODEL_TYPES = ("lightunet", "embedding_refiner", "hrnet_w18", "hrnet_w32")
 
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -37,7 +39,8 @@ def parse_args():
     parser.add_argument("--base-dir", type=str, default=BASE_DIR,
                         help="Root directory containing experiment subfolders.")
     parser.add_argument("--model-type", type=str, default=MODEL_TYPE,
-                        choices=["auto", "lightunet", "decoder", "decoder_residual"],
+                        choices=["auto", "lightunet", "decoder", "decoder_residual",
+                                 "embedding_refiner", "hrnet_w18", "hrnet_w32"],
                         help="Model architecture used during training.")
     parser.add_argument("--model-path", type=str, default=None,
                         help="Path to the .pth checkpoint. Defaults to <base-dir>/<experiment-name>/model_best.pth.")
@@ -81,8 +84,17 @@ def main():
     if args.max_samples > 0:
         pairs = pairs[:args.max_samples]
 
-    is_lightunet = args.model_type.lower() == "lightunet"
-    if is_lightunet:
+    sample_emb_path = pairs[0][0] if isinstance(pairs[0], tuple) else pairs[0]
+    with rasterio.open(sample_emb_path) as src:
+        n_channels = src.count
+
+    model_type = args.model_type.lower()
+    if model_type == "auto":
+        use_pixel_dataset = n_channels < 512
+    else:
+        use_pixel_dataset = model_type in PIXEL_MODEL_TYPES
+
+    if use_pixel_dataset:
         test_ds = PixelEmbeddingDataset(pairs, patch_size=args.patch_size, is_train=False)
     else:
         test_ds = LatentTokenDataset(pairs, patch_size=args.patch_size, scale_factor=16, is_train=False)
@@ -105,7 +117,7 @@ def main():
             output_batch = model(img_batch)
             pred_np = output_batch.squeeze().cpu().numpy().astype(np.float32)
 
-            # Denormalize height channel: model output [0,1] -> physical meters
+            # Denormalize height channel: model output is height / HEIGHT_NORM_CONSTANT.
             pred_np[3] = pred_np[3] * HEIGHT_NORM_CONSTANT
 
             emb_path = test_ds.file_pairs[i][0]
