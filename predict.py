@@ -8,7 +8,8 @@ from tqdm.auto import tqdm
 from core.model import build_model
 from core.dataset import (
     PixelEmbeddingDataset, LatentTokenDataset,
-    find_file_pairs, find_embedding_files, _normalize_core_id,
+    find_file_pairs, find_embedding_files,
+    _submission_id,
     HEIGHT_NORM_CONSTANT,
 )
 
@@ -87,7 +88,7 @@ def main():
         test_ds = LatentTokenDataset(pairs, patch_size=args.patch_size, scale_factor=16, is_train=False)
 
     # --- Load model ---
-    sample_img, _ = test_ds[0]
+    sample_img, _, _ = test_ds[0]
     model, selected_model = build_model(args.model_type, n_channels=sample_img.shape[0], n_classes=4)
     model = model.to(DEVICE)
     model.load_state_dict(torch.load(model_path, map_location=DEVICE))
@@ -98,7 +99,7 @@ def main():
     print(f"Running inference on {len(test_ds)} samples...")
     with torch.no_grad():
         for i in tqdm(range(len(test_ds)), desc="Predicting"):
-            img_tensor, _ = test_ds[i]
+            img_tensor, _, _ = test_ds[i]
             img_batch = img_tensor.unsqueeze(0).to(DEVICE)
 
             output_batch = model(img_batch)
@@ -108,9 +109,11 @@ def main():
             pred_np[3] = pred_np[3] * HEIGHT_NORM_CONSTANT
 
             emb_path = test_ds.file_pairs[i][0]
-            core_id = _normalize_core_id(emb_path)
+            # Submission format: '<id>_<region>_<year>.npy' (no 'pred_' prefix,
+            # year preserved).
+            sub_id = _submission_id(emb_path)
 
-            save_path = os.path.join(predictions_dir, f"pred_{core_id}.npy")
+            save_path = os.path.join(predictions_dir, f"{sub_id}.npy")
             np.save(save_path, pred_np)
 
     print(f"Predictions saved to: {predictions_dir}")

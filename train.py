@@ -103,7 +103,7 @@ def visualize_results(model, dataset, num_samples=3):
 
     with torch.no_grad():
         for i, idx in enumerate(indices):
-            img_tensor, target_tensor = dataset[idx]
+            img_tensor, target_tensor, _ = dataset[idx]
             input_batch = img_tensor.unsqueeze(0).to(DEVICE)
             output_batch = model(input_batch)
 
@@ -225,12 +225,12 @@ def main():
         train_samples_seen = 0
 
         train_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS} [train]", leave=False)
-        for imgs, targets in train_pbar:
-            imgs, targets = imgs.to(DEVICE), targets.to(DEVICE)
+        for imgs, targets, masks in train_pbar:
+            imgs, targets, masks = imgs.to(DEVICE), targets.to(DEVICE), masks.to(DEVICE)
             optimizer.zero_grad()
             outputs = model(imgs)
 
-            loss, _, _, _, _ = criterion(outputs, targets)
+            loss, _, _, _, _ = criterion(outputs, targets, masks)
             loss.backward()
 
             # NEW: Gradient Clipping
@@ -253,11 +253,11 @@ def main():
 
         with torch.no_grad():
             val_pbar = tqdm(val_loader, desc=f"Epoch {epoch + 1}/{EPOCHS} [val]", leave=False)
-            for imgs, targets in val_pbar:
-                imgs, targets = imgs.to(DEVICE), targets.to(DEVICE)
+            for imgs, targets, masks in val_pbar:
+                imgs, targets, masks = imgs.to(DEVICE), targets.to(DEVICE), masks.to(DEVICE)
                 outputs = model(imgs)
 
-                loss, l_mae, l_ssim, l_grad, l_tversky = criterion(outputs, targets)
+                loss, l_mae, l_ssim, l_grad, l_tversky = criterion(outputs, targets, masks)
                 val_running_loss += loss.item() * imgs.size(0)
 
                 bs = imgs.size(0)

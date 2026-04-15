@@ -43,6 +43,30 @@ def _normalize_core_id(filename):
     return base
 
 
+def _submission_id(filename):
+    """
+    Extracts the submission file id from a test embedding filename,
+    preserving the year suffix required by the leaderboard.
+
+    Example: 'emb_3001_BE_2023_quantized.tif' -> '3001_BE_2023'
+    """
+    base = os.path.splitext(os.path.basename(filename))[0]
+
+    # Strip known prefixes (same set as _normalize_core_id, minus pred_/label_)
+    for prefix in ("gee_emb_", "tessera_emb_", "emb_", "s2_", "s1_"):
+        if base.startswith(prefix):
+            base = base[len(prefix):]
+            break
+
+    # Strip trailing embedding/test suffixes
+    for suffix in ("_embedding", "_embeddings", "_quantized", "_merged"):
+        if base.endswith(suffix):
+            base = base[:-len(suffix)]
+
+    # Keep the '_YYYY' year suffix — required by submission format.
+    return base
+
+
 def find_file_pairs(emb_dir, tar_dir):
     """
     Fast and robust O(N) file matching using a hash map and regex normalization.
@@ -142,10 +166,21 @@ class PixelEmbeddingDataset(Dataset):
         if tar_path is not None:
             with rasterio.open(tar_path) as src:
                 target = src.read().astype(np.float32)
-            target = np.nan_to_num(target)
+            raw_target = np.nan_to_num(target)
+            # Global validity mask: exclude pixels where all 4 bands are zero (nodata)
+            global_valid = ~np.all(raw_target == 0, axis=0)  # (H, W) bool
+            # nDSM-specific mask: additionally exclude pixels where nDSM==0
+            # but land cover is present (nDSM data hole, not true zero height)
+            has_landcover = (raw_target[0] > 0) | (raw_target[1] > 0) | (raw_target[2] > 0)
+            ndsm_hole = (raw_target[3] == 0) & has_landcover
+            height_valid = global_valid & ~ndsm_hole  # (H, W) bool
+            # Pack into (2, H, W): channel 0 = global, channel 1 = height-specific
+            valid_mask = np.stack([global_valid, height_valid], axis=0).astype(np.float32)
+            target = raw_target
             target[3, :, :] = np.clip(target[3, :, :] / HEIGHT_NORM_CONSTANT, 0.0, 1.5)
         else:
             target = np.zeros((4, image.shape[1], image.shape[2]), dtype=np.float32)
+            valid_mask = np.ones((2, image.shape[1], image.shape[2]), dtype=np.float32)
 
         # 1:1 Padding
         c, h, w = image.shape
@@ -154,6 +189,7 @@ class PixelEmbeddingDataset(Dataset):
             pad_w = max(0, self.patch_size - w)
             image = np.pad(image, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
             target = np.pad(target, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+            valid_mask = np.pad(valid_mask, ((0, 0), (0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
             h, w = image.shape[1], image.shape[2]
 
         # 1:1 Random Cropping
@@ -166,8 +202,9 @@ class PixelEmbeddingDataset(Dataset):
 
         image = image[:, top:top + self.patch_size, left:left + self.patch_size]
         target = target[:, top:top + self.patch_size, left:left + self.patch_size]
+        valid_mask = valid_mask[:, top:top + self.patch_size, left:left + self.patch_size]
 
-        return torch.from_numpy(image), torch.from_numpy(target)
+        return torch.from_numpy(image), torch.from_numpy(target), torch.from_numpy(valid_mask)
 
 # ---------------------------------------------------------
 # DATASET 2: Latent Token-Based (TerraMind, Thor)
@@ -203,10 +240,17 @@ class LatentTokenDataset(Dataset):
         if tar_path is not None:
             with rasterio.open(tar_path) as src:
                 target = src.read().astype(np.float32)
-            target = np.nan_to_num(target)
+            raw_target = np.nan_to_num(target)
+            global_valid = ~np.all(raw_target == 0, axis=0)
+            has_landcover = (raw_target[0] > 0) | (raw_target[1] > 0) | (raw_target[2] > 0)
+            ndsm_hole = (raw_target[3] == 0) & has_landcover
+            height_valid = global_valid & ~ndsm_hole
+            valid_mask = np.stack([global_valid, height_valid], axis=0).astype(np.float32)
+            target = raw_target
             target[3, :, :] = np.clip(target[3, :, :] / HEIGHT_NORM_CONSTANT, 0.0, 1.5)
         else:
             target = np.zeros((4, self.patch_size, self.patch_size), dtype=np.float32)
+            valid_mask = np.ones((2, self.patch_size, self.patch_size), dtype=np.float32)
 
         # Pad Embedding to its specific small size
         c, h_emb, w_emb = image.shape
@@ -222,6 +266,7 @@ class LatentTokenDataset(Dataset):
             pad_h = max(0, self.patch_size - h_tar)
             pad_w = max(0, self.patch_size - w_tar)
             target = np.pad(target, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+            valid_mask = np.pad(valid_mask, ((0, 0), (0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
 
         # Multi-scale Cropping
         if self.is_train:
@@ -236,5 +281,6 @@ class LatentTokenDataset(Dataset):
 
         image = image[:, top_emb:top_emb + emb_patch_size, left_emb:left_emb + emb_patch_size]
         target = target[:, top_tar:top_tar + self.patch_size, left_tar:left_tar + self.patch_size]
+        valid_mask = valid_mask[:, top_tar:top_tar + self.patch_size, left_tar:left_tar + self.patch_size]
 
-        return torch.from_numpy(image), torch.from_numpy(target)
+        return torch.from_numpy(image), torch.from_numpy(target), torch.from_numpy(valid_mask)

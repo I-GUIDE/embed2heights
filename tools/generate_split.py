@@ -25,8 +25,8 @@ from sklearn.model_selection import train_test_split
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_LABELS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "data", "train", "labels"))
-DEFAULT_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "splits")
+DEFAULT_LABELS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..","..", "data", "train", "labels"))
+DEFAULT_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "../splits")
 DEFAULT_VAL_RATIO = 0.2
 DEFAULT_SEED = 42
 

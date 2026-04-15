@@ -164,7 +164,9 @@ Composite score: `sum(mIoU_i * w_i) + sum((1 - RMSE_i / 30) * w_i)` — higher i
 |---|---|---|---|---|---|---|---|
 | 1 | **AlphaEarth** | 0.598 | 0.724 | 0.680 | 4.83m | 4.33m | **0.741** |
 | 2 | TerraMind S2 | 0.531 | 0.478 | 0.545 | 5.83m | 6.95m | 0.641 |
-| 3 | THOR S2 | 0.517 | 0.365 | 0.462 | 5.99m | 7.65m | 0.602 |
-| 4 | Tessera | 0.507 | 0.206 | 0.553 | 7.21m | 11.93m | 0.551 |
+| 3 | TerraMind S1 | 0.524 | 0.436 | 0.452 | 5.13m | 7.36m | 0.622 |
+| 4 | THOR S1 | 0.519 | 0.411 | 0.497 | 5.66m | 7.53m | 0.619 |
+| 5 | THOR S2 | 0.517 | 0.365 | 0.462 | 5.99m | 7.65m | 0.602 |
+| 6 | Tessera | 0.507 | 0.206 | 0.553 | 7.21m | 11.93m | 0.551 |
 
 See [logs/BASELINE_REPORT.md](logs/BASELINE_REPORT.md) for detailed analysis.

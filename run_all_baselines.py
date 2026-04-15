@@ -1,5 +1,5 @@
 """
-Run all 4 embedding baselines (AlphaEarth, Tessera, TerraMind, THOR) end-to-end.
+Run all 6 embedding baselines (AlphaEarth, Tessera, TerraMind-S2, THOR-S2, TerraMind-S1, THOR-S1) end-to-end.
 
 For each baseline this script:
   1. Trains a model via train.py  (checkpoints + loss curve + viz saved under runs/<exp>/)
@@ -7,7 +7,7 @@ For each baseline this script:
   3. Appends a row to runs/all_baselines_summary.csv with status + timing
 
 Usage:
-    python run_all_baselines.py                         # train + predict all 4 baselines
+    python run_all_baselines.py                         # train + predict all 6 baselines
     python run_all_baselines.py --only alphaearth thor  # run a subset
     python run_all_baselines.py --skip-train            # predict only (reuse existing checkpoints)
     python run_all_baselines.py --skip-predict          # train only
@@ -51,7 +51,7 @@ class Baseline:
     model_type: str = "auto"     # passed through to train.py / predict.py
 
 
-# Four baselines — one per embedding backbone.
+# Six baselines — one per embedding backbone / sensor combination.
 # model_type is set explicitly because train.py's dataset router
 # at train.py:182 does `if MODEL_TYPE == "lightunet"` — "auto" always
 # falls through to LatentTokenDataset, which is wrong for pixel-aligned embeddings.
@@ -71,6 +71,14 @@ BASELINES: List[Baseline] = [
     Baseline(key="thor_s2",      experiment_name="thor_s2_baseline",
              train_emb_subdir="thor_s2_emb",
              test_emb_subdir="thor_test_s2_emb",
+             model_type="decoder_residual"),
+    Baseline(key="terramind_s1", experiment_name="terramind_s1_baseline",
+             train_emb_subdir="terramind_s1_emb",
+             test_emb_subdir="terramind_test_s1_emb",
+             model_type="decoder_residual"),
+    Baseline(key="thor_s1",      experiment_name="thor_s1_baseline",
+             train_emb_subdir="thor_s1_emb",
+             test_emb_subdir="thor_test_s1_emb",
              model_type="decoder_residual"),
 ]
 
@@ -103,7 +111,7 @@ def parse_args():
                    help=f"Root directory for runs/ output (default: {DEFAULT_BASE_DIR})")
     p.add_argument("--only", nargs="+", default=None, metavar="KEY",
                    choices=[b.key for b in BASELINES],
-                   help="Run only the given baseline keys (default: all 4).")
+                   help="Run only the given baseline keys (default: all 6).")
     p.add_argument("--skip-train", action="store_true", help="Skip training, run prediction only.")
     p.add_argument("--skip-predict", action="store_true", help="Skip prediction, run training only.")
     p.add_argument("--predict-test", action="store_true",
