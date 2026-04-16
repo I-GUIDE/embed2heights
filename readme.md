@@ -128,6 +128,16 @@ Predictions are saved as `pred_<core_id>.npy` files with shape `(4, 256, 256)`:
 | `decoder_residual` | EfficientDecoder256 (progressive upsampling) | ViT tokens (16x16) | TerraMind, THOR |
 | `auto` | Auto-select based on input spatial size | Any | Default |
 
+### Pixel-Aligned Backbone Notes
+
+AlphaEarth and Tessera embeddings are already dense, pixel-aligned feature maps, not raw imagery. The current pixel backbones are designed to preserve `256x256` spatial detail while adding task-specific context for land-cover fractions and height.
+
+- `hrnet_w18` / `hrnet_w32`: keep a full-resolution branch throughout the network while adding lower-resolution context branches. This is useful for sparse buildings/water because boundaries stay sharp, and for height because lower-resolution branches provide broader scene context. `hrnet_w18` is the current best validation model; `hrnet_w32` has more capacity but needs tuning.
+- `embedding_refiner`: keeps full resolution end-to-end, calibrates AlphaEarth channels, applies ConvNeXt-style refinement blocks, and uses ASPP for larger receptive field without downsampling. This is the most parameter-efficient strong backbone.
+- `lightunet`: remains a strong simple baseline once paired with the current multi-head prediction head.
+
+See `logs/ALPHAEARTH_BACKBONE_REPORT.md` for the detailed architecture rationale and validation comparison.
+
 AlphaEarth single-modality backbone comparison:
 
 ```bash

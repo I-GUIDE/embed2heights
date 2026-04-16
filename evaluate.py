@@ -41,6 +41,9 @@ EXP_TO_EMB = {
     "alphaearth_hrnet_w32_softplus_bs16_lr5e5_aux005": "alphaearth_emb",
     "alphaearth_hrnet_w18_softplus_bs16_lr1e4_aux005": "alphaearth_emb",
     
+    
+    "lightunet_alphaearth": "alphaearth_emb",
+    
     "tessera_baseline": "tessera_emb",
     "terramind_s2_baseline": "terramind_s2_emb",
     "thor_s2_baseline": "thor_s2_emb",

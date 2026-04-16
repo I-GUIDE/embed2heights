@@ -51,6 +51,7 @@ class LightUNet(nn.Module):
         super(LightUNet, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
+        self.supports_aux_outputs = True
 
         # Architecture: Light version (32->64->128->256)
         self.inc = DoubleConv(n_channels, 32)
@@ -67,9 +68,9 @@ class LightUNet(nn.Module):
         self.up3 = UpsampleBlock(64, 32)
         self.conv3 = DoubleConv(64, 32)
 
-        self.outc = nn.Conv2d(32, n_classes, kernel_size=1)
+        self.head = MultiTaskPredictionHead(in_ch=32, out_channels=n_classes)
 
-    def forward(self, x):
+    def forward(self, x, return_aux=False):
         x1 = self.inc(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
@@ -87,8 +88,7 @@ class LightUNet(nn.Module):
         x = torch.cat([x1, x], dim=1)
         x = self.conv3(x)
 
-        logits = self.outc(x)
-        return logits
+        return self.head(x, return_aux=return_aux)
 
 
 # ==========================================
