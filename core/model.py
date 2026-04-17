@@ -468,12 +468,20 @@ class ConvGNAct(nn.Module):
 
 
 class MultiTaskPredictionHead(nn.Module):
-    """Metric-aware multi-head predictor.
+    """Metric-aware multi-head predictor (v2).
 
-    The public contract remains a 4-channel tensor:
-    [building_fraction, vegetation_fraction, water_fraction, height].
-    Presence is supervised as an auxiliary task and used for height gating, but
-    it is not fused back into the final land-cover fractions.
+    Improvements over v1:
+    - Deeper shared trunk (2-layer residual) for genuine multi-task sharing.
+    - Presence derived from fraction logits via lightweight 1x1 (no redundant head).
+    - FiLM conditioning: fraction signals modulate height features via learned
+      scale/shift, replacing raw concatenation of mismatched-scale tensors.
+    - Height deltas are non-negative (softplus on delta itself), enforcing the
+      physical constraint that buildings/vegetation only add height.
+    - Fraction-based gating: height contribution proportional to coverage, not
+      binary presence — fixes systematic over-prediction at boundaries.
+    - Shared height trunk with 3 lightweight 1x1 output projections.
+
+    Output contract: 4-channel tensor [building_frac, veg_frac, water_frac, height].
     """
 
     def __init__(self, in_ch, out_channels=4, hidden_ch=None, drop=0.05):
@@ -481,54 +489,75 @@ class MultiTaskPredictionHead(nn.Module):
         if out_channels != 4:
             raise ValueError("MultiTaskPredictionHead assumes 4 output channels")
         hidden_ch = hidden_ch or min(160, max(64, in_ch // 2))
+        self._hidden_ch = hidden_ch
 
+        # --- Deeper shared trunk: 2 layers + residual ---
         self.shared = nn.Sequential(
             ConvGNAct(in_ch, hidden_ch, kernel_size=3),
             nn.Dropout2d(drop) if drop > 0 else nn.Identity(),
         )
+        self.shared_res = nn.Sequential(
+            ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
+            nn.Conv2d(hidden_ch, hidden_ch, 3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(hidden_ch), hidden_ch),
+        )
+        self.shared_act = nn.GELU()
+
+        # --- Fraction head ---
         self.fraction_head = nn.Sequential(
             ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
             nn.Conv2d(hidden_ch, 3, 1),
         )
-        self.presence_head = nn.Sequential(
-            ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
-            nn.Conv2d(hidden_ch, 3, 1),
-        )
 
-        height_in = hidden_ch + 6
-        self.height_base_head = nn.Sequential(
-            ConvGNAct(height_in, hidden_ch, kernel_size=3),
-            nn.Conv2d(hidden_ch, 1, 1),
+        # --- Presence derived from fraction (lightweight, no redundant head) ---
+        self.presence_proj = nn.Conv2d(3, 3, 1)
+
+        # --- FiLM conditioning: fraction -> scale/shift for height features ---
+        self.film_scale = nn.Conv2d(3, hidden_ch, 1)
+        self.film_shift = nn.Conv2d(3, hidden_ch, 1)
+
+        # --- Shared height trunk + 3 lightweight output projections ---
+        self.height_trunk = nn.Sequential(
+            ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
+            ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
         )
-        self.height_building_delta = nn.Sequential(
-            ConvGNAct(height_in, hidden_ch, kernel_size=3),
-            nn.Conv2d(hidden_ch, 1, 1),
-        )
-        self.height_vegetation_delta = nn.Sequential(
-            ConvGNAct(height_in, hidden_ch, kernel_size=3),
-            nn.Conv2d(hidden_ch, 1, 1),
-        )
+        self.height_base_proj = nn.Conv2d(hidden_ch, 1, 1)
+        self.height_building_delta_proj = nn.Conv2d(hidden_ch, 1, 1)
+        self.height_vegetation_delta_proj = nn.Conv2d(hidden_ch, 1, 1)
 
     def forward(self, x, return_aux=False):
+        # Shared trunk with residual
         x = self.shared(x)
+        x = self.shared_act(x + self.shared_res(x))
+
+        # Fraction prediction
         fraction_logits = self.fraction_head(x)
-        presence_logits = self.presence_head(x)
         seg = torch.sigmoid(fraction_logits)
+
+        # Presence derived from fraction logits (not a separate head)
+        presence_logits = self.presence_proj(fraction_logits)
         presence_prob = torch.sigmoid(presence_logits)
 
-        height_features = torch.cat([x, seg, presence_prob], dim=1)
-        base_height = F.softplus(self.height_base_head(height_features), threshold=20.0)
-        building_height = F.softplus(
-            self.height_building_delta(height_features), threshold=20.0
-        )
-        vegetation_height = F.softplus(
-            self.height_vegetation_delta(height_features), threshold=20.0
-        )
+        # FiLM conditioning: fraction modulates height features
+        scale = self.film_scale(seg)
+        shift = self.film_shift(seg)
+        h = x * (1.0 + scale) + shift
 
-        gates = presence_prob[:, :2, :, :]
-        residual = gates[:, 0:1, :, :] * (building_height - base_height)
-        residual = residual + gates[:, 1:2, :, :] * (vegetation_height - base_height)
-        height = torch.clamp(base_height + residual, min=0.0)
+        # Shared height trunk -> 3 lightweight projections
+        h = self.height_trunk(h)
+        base_height = F.softplus(self.height_base_proj(h), threshold=20.0)
+        # Deltas are non-negative: buildings/vegetation only add height
+        building_delta = F.softplus(self.height_building_delta_proj(h), threshold=20.0)
+        vegetation_delta = F.softplus(self.height_vegetation_delta_proj(h), threshold=20.0)
+
+        # Absolute heights for auxiliary supervision
+        building_height = base_height + building_delta
+        vegetation_height = base_height + vegetation_delta
+
+        # Fraction-gated height: contribution proportional to coverage
+        height = base_height \
+            + seg[:, 0:1, :, :] * building_delta \
+            + seg[:, 1:2, :, :] * vegetation_delta
         out = torch.cat([seg, height], dim=1)
 
         if not return_aux:

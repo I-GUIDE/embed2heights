@@ -2,16 +2,25 @@
 Evaluate baseline predictions against ground-truth labels.
 
 Computes the 5 leaderboard metrics:
-  - mIoU_buildings  (weight 25%)
-  - mIoU_trees      (weight 15%)
-  - mIoU_water      (weight 15%)
-  - RMSE_building_height  (weight 25%)
+  - iou_buildings   (weight 25%)
+  - iou_trees       (weight 15%)
+  - iou_water       (weight 15%)
+  - RMSE_building_height   (weight 25%)
   - RMSE_vegetation_height (weight 20%)
 
+Metric definitions are derived from the 2026-04-17 all-zero probe submission
+(see logs/METRIC_PROBE_REPORT.md):
+  - IoU: per-image positive-only Jaccard, binarized with label > 0 and
+    pred > pred_threshold, empty/empty -> 1.0 (sklearn zero_division=1.0
+    convention). Averaged over samples.
+  - RMSE: per-image RMSE on pixels where label_class > label_threshold,
+    averaged over samples.
+
 Usage:
-    python evaluate.py                       # evaluate all baselines with predictions
-    python evaluate.py --only alphaearth     # evaluate one baseline
-    python evaluate.py --threshold 0.3       # custom binarization threshold
+    python evaluate.py                            # evaluate all baselines
+    python evaluate.py --only alphaearth          # one experiment
+    python evaluate.py --pred-threshold 0.3       # custom pred binarization
+    python evaluate.py --label-threshold 0.5      # probe alternate label convention
 """
 
 import argparse
@@ -41,7 +50,9 @@ EXP_TO_EMB = {
     "alphaearth_hrnet_w32_softplus_bs16_lr5e5_aux005": "alphaearth_emb",
     "alphaearth_hrnet_w18_softplus_bs16_lr1e4_aux005": "alphaearth_emb",
     
-    
+    "lightunet_v2head": "alphaearth_emb",  
+    "hrnet_w18_v2head": "alphaearth_emb",    
+      
     "lightunet_alphaearth": "alphaearth_emb",
     
     "tessera_baseline": "tessera_emb",
@@ -61,11 +72,12 @@ CH_VEGETATION = 1
 CH_WATER = 2
 CH_HEIGHT = 3
 
-# Leaderboard weights
+# Leaderboard weights (official key names use the IoU_* prefix, matching the
+# leaderboard columns iou_build / iou_veg / iou_water).
 WEIGHTS = {
-    "mIoU_buildings": 0.25,
-    "mIoU_trees": 0.15,
-    "mIoU_water": 0.15,
+    "iou_buildings": 0.25,
+    "iou_trees": 0.15,
+    "iou_water": 0.15,
     "RMSE_building_height": 0.25,
     "RMSE_vegetation_height": 0.20,
 }
@@ -89,23 +101,26 @@ def normalize_core_id(filename):
 
 
 def binary_iou(pred_mask, true_mask):
-    """IoU for a single binary class."""
-    intersection = np.logical_and(pred_mask, true_mask).sum()
+    """
+    Per-image positive-class IoU with the official empty-case convention:
+      - Both pred and gt empty -> 1.0 (perfect agreement that class is absent)
+      - Exactly one empty     -> 0.0 (total disagreement)
+      - Otherwise              -> |pred ∩ gt| / |pred ∪ gt|
+
+    Matches sklearn's jaccard_score(zero_division=1.0). Derived from the
+    2026-04-17 dummy-probe submission, which returned non-zero IoU values
+    for an all-zero prediction — only consistent with the empty/empty -> 1
+    convention.
+    """
+    pred_any = bool(pred_mask.any())
+    true_any = bool(true_mask.any())
+    if not pred_any and not true_any:
+        return 1.0
     union = np.logical_or(pred_mask, true_mask).sum()
     if union == 0:
-        return float('nan')  # class absent in both pred and gt
-    return intersection / union
-
-
-def mean_iou(pred_mask, true_mask):
-    """
-    Mean IoU = mean(IoU_positive, IoU_negative).
-    Standard definition for binary segmentation.
-    """
-    iou_pos = binary_iou(pred_mask, true_mask)
-    iou_neg = binary_iou(~pred_mask, ~true_mask)
-    vals = [v for v in [iou_pos, iou_neg] if not np.isnan(v)]
-    return np.mean(vals) if vals else float('nan')
+        return 1.0
+    inter = np.logical_and(pred_mask, true_mask).sum()
+    return float(inter / union)
 
 
 def get_val_core_ids(emb_dir, labels_dir, split_file=None):
@@ -146,8 +161,16 @@ def get_val_core_ids(emb_dir, labels_dir, split_file=None):
     return {normalize_core_id(e) for e, _ in val_pairs}
 
 
-def evaluate_experiment(pred_dir, labels_dir, threshold=0.5, val_only_ids=None):
-    """Compute the 5 metrics for one experiment."""
+def evaluate_experiment(pred_dir, labels_dir, pred_threshold=0.5,
+                        label_threshold=0.0, val_only_ids=None):
+    """
+    Compute the 5 metrics for one experiment.
+
+    Aggregation matches the leaderboard (derived from the 2026-04-17 probe):
+      - IoU: per-image positive-only Jaccard (empty/empty -> 1), averaged over samples.
+      - RMSE: per-image RMSE on pixels where label_class > label_threshold,
+              averaged over samples (NOT pixel-level global RMSE).
+    """
     pred_files = sorted(glob.glob(os.path.join(pred_dir, "*.npy")))
     if not pred_files:
         return None
@@ -156,14 +179,12 @@ def evaluate_experiment(pred_dir, labels_dir, threshold=0.5, val_only_ids=None):
     label_files = glob.glob(os.path.join(labels_dir, "**", "label_*.tif"), recursive=True)
     label_map = {normalize_core_id(f): f for f in label_files}
 
-    # Accumulators
-    miou_building_list = []
-    miou_trees_list = []
-    miou_water_list = []
-    se_building_height = []   # squared errors for building pixels
-    se_vegetation_height = [] # squared errors for vegetation pixels
-    n_building_px = 0
-    n_vegetation_px = 0
+    # Accumulators — all per-image
+    iou_building_list = []
+    iou_trees_list = []
+    iou_water_list = []
+    rmse_building_list = []   # per-image RMSE on building pixels
+    rmse_vegetation_list = [] # per-image RMSE on vegetation pixels
     matched = 0
 
     for pf in pred_files:
@@ -184,48 +205,43 @@ def evaluate_experiment(pred_dir, labels_dir, threshold=0.5, val_only_ids=None):
         pred = pred[:, :h, :w]
         label = label[:, :h, :w]
 
-        # --- Binarize for mIoU ---
-        pred_bld = pred[CH_BUILDING] > threshold
-        true_bld = label[CH_BUILDING] > threshold
-        pred_veg = pred[CH_VEGETATION] > threshold
-        true_veg = label[CH_VEGETATION] > threshold
-        pred_wat = pred[CH_WATER] > threshold
-        true_wat = label[CH_WATER] > threshold
+        # --- Binarize for IoU ---
+        pred_bld = pred[CH_BUILDING] > pred_threshold
+        true_bld = label[CH_BUILDING] > label_threshold
+        pred_veg = pred[CH_VEGETATION] > pred_threshold
+        true_veg = label[CH_VEGETATION] > label_threshold
+        pred_wat = pred[CH_WATER] > pred_threshold
+        true_wat = label[CH_WATER] > label_threshold
 
-        miou_building_list.append(mean_iou(pred_bld, true_bld))
-        miou_trees_list.append(mean_iou(pred_veg, true_veg))
-        miou_water_list.append(mean_iou(pred_wat, true_wat))
+        iou_building_list.append(binary_iou(pred_bld, true_bld))
+        iou_trees_list.append(binary_iou(pred_veg, true_veg))
+        iou_water_list.append(binary_iou(pred_wat, true_wat))
 
-        # --- RMSE on height channel, conditioned on class presence in GT ---
-        bld_mask = label[CH_BUILDING] > threshold
-        veg_mask = label[CH_VEGETATION] > threshold
+        # --- RMSE on height channel, per-image, conditioned on GT class presence ---
+        bld_mask = label[CH_BUILDING] > label_threshold
+        veg_mask = label[CH_VEGETATION] > label_threshold
 
         if bld_mask.any():
             diff = pred[CH_HEIGHT][bld_mask] - label[CH_HEIGHT][bld_mask]
-            se_building_height.append(np.sum(diff ** 2))
-            n_building_px += bld_mask.sum()
+            rmse_building_list.append(float(np.sqrt(np.mean(diff.astype(np.float64) ** 2))))
 
         if veg_mask.any():
             diff = pred[CH_HEIGHT][veg_mask] - label[CH_HEIGHT][veg_mask]
-            se_vegetation_height.append(np.sum(diff ** 2))
-            n_vegetation_px += veg_mask.sum()
+            rmse_vegetation_list.append(float(np.sqrt(np.mean(diff.astype(np.float64) ** 2))))
 
     if matched == 0:
         return None
 
     def safe_nanmean(arr):
         vals = [v for v in arr if not np.isnan(v)]
-        return np.mean(vals) if vals else float('nan')
-
-    rmse_bld_h = np.sqrt(sum(se_building_height) / n_building_px) if n_building_px > 0 else float('nan')
-    rmse_veg_h = np.sqrt(sum(se_vegetation_height) / n_vegetation_px) if n_vegetation_px > 0 else float('nan')
+        return float(np.mean(vals)) if vals else float('nan')
 
     metrics = {
-        "mIoU_buildings": safe_nanmean(miou_building_list),
-        "mIoU_trees": safe_nanmean(miou_trees_list),
-        "mIoU_water": safe_nanmean(miou_water_list),
-        "RMSE_building_height": rmse_bld_h,
-        "RMSE_vegetation_height": rmse_veg_h,
+        "iou_buildings": safe_nanmean(iou_building_list),
+        "iou_trees": safe_nanmean(iou_trees_list),
+        "iou_water": safe_nanmean(iou_water_list),
+        "RMSE_building_height": safe_nanmean(rmse_building_list),
+        "RMSE_vegetation_height": safe_nanmean(rmse_vegetation_list),
         "n_samples": matched,
     }
     return metrics
@@ -234,19 +250,25 @@ def evaluate_experiment(pred_dir, labels_dir, threshold=0.5, val_only_ids=None):
 def compute_weighted_score(metrics):
     """
     Combine into a single leaderboard-style score.
-    mIoU metrics: higher is better (0-1)
-    RMSE metrics: lower is better — we convert to (1 - RMSE/max_RMSE) so
-    all components are "higher is better" before weighting.
-    We use 30m as the max height (HEIGHT_NORM_CONSTANT from dataset.py).
+
+    IoU metrics: higher is better (0-1), contribute directly.
+    RMSE metrics: `max(0, 1 - RMSE / MAX_HEIGHT)` then weighted. Higher is better.
+
+    NOTE on MAX_HEIGHT: the 2026-04-17 probe confirmed the formula uses
+    `max(0, 1 - RMSE/X)` with a class-specific X that is SMALL (≤4m for
+    building, ≤10.9m for vegetation — our dummy clamped both RMSE terms to 0).
+    The exact X per class is still unknown and requires a follow-up probe with
+    a better height prediction. Using 30m below is a placeholder that
+    over-estimates the RMSE contribution — the absolute score here will NOT
+    match the leaderboard's total, though the IoU part does.
     """
-    MAX_HEIGHT = 30.0
+    MAX_HEIGHT = 30.0  # placeholder; true X per class is smaller, TBD by probe.
     parts = {}
     for k, w in WEIGHTS.items():
         v = metrics.get(k, float('nan'))
         if np.isnan(v):
             parts[k] = float('nan')
         elif "RMSE" in k:
-            # Clamp RMSE contribution to [0, 1] then invert
             parts[k] = max(0.0, 1.0 - v / MAX_HEIGHT) * w
         else:
             parts[k] = v * w
@@ -260,7 +282,13 @@ def parse_args():
     p.add_argument("--data-dir", default=DEFAULT_DATA_DIR, help="Root data directory containing <emb>/ and labels/")
     p.add_argument("--labels-dir", default=DEFAULT_LABELS_DIR)
     p.add_argument("--only", nargs="+", default=None, help="Evaluate only these experiment names")
-    p.add_argument("--threshold", type=float, default=0.5, help="Binarization threshold for mIoU (default 0.5)")
+    p.add_argument("--pred-threshold", "--threshold", dest="pred_threshold", type=float, default=0.5,
+                   help="Binarization threshold for PREDICTION channels (default 0.5). "
+                        "The legacy alias --threshold is accepted.")
+    p.add_argument("--label-threshold", type=float, default=0.0,
+                   help="Binarization threshold for LABEL channels in both IoU and RMSE "
+                        "pixel selection. Default 0.0 matches the leaderboard "
+                        "(any non-zero fraction counts as positive).")
     p.add_argument("--val-only", action="store_true",
                    help="Evaluate only on the 20%% val split (reproduces train.py's split with seed=42)")
     return p.parse_args()
@@ -295,7 +323,12 @@ def main():
 
         split_label = f"val-only, {len(val_ids)} samples" if val_ids else "all"
         print(f"Evaluating {exp_name} ({split_label}) ...", end=" ", flush=True)
-        metrics = evaluate_experiment(pred_dir, args.labels_dir, threshold=args.threshold, val_only_ids=val_ids)
+        metrics = evaluate_experiment(
+            pred_dir, args.labels_dir,
+            pred_threshold=args.pred_threshold,
+            label_threshold=args.label_threshold,
+            val_only_ids=val_ids,
+        )
         if metrics is None:
             print("no matched samples, skipping.")
             continue
@@ -308,19 +341,19 @@ def main():
     # --- Print results table ---
     split_mode = "val-only (20%, seed=42)" if args.val_only else "all samples"
     print("\n" + "=" * 90)
-    print(f"  Evaluation Results  (threshold={args.threshold}, split={split_mode})")
+    print(f"  Evaluation Results  (pred>{args.pred_threshold}, label>{args.label_threshold}, split={split_mode})")
     print("=" * 90)
 
-    header = f"{'Experiment':<28} {'mIoU_bld':>9} {'mIoU_tree':>9} {'mIoU_wat':>9} {'RMSE_bH':>9} {'RMSE_vH':>9} {'Score':>8}"
+    header = f"{'Experiment':<28} {'iou_bld':>9} {'iou_tree':>9} {'iou_wat':>9} {'RMSE_bH':>9} {'RMSE_vH':>9} {'Score':>8}"
     print(header)
     print("-" * 90)
 
     for exp, m in sorted(all_results.items(), key=lambda x: -x[1].get("weighted_score", 0)):
         line = (
             f"{exp:<28} "
-            f"{m['mIoU_buildings']:>9.4f} "
-            f"{m['mIoU_trees']:>9.4f} "
-            f"{m['mIoU_water']:>9.4f} "
+            f"{m['iou_buildings']:>9.4f} "
+            f"{m['iou_trees']:>9.4f} "
+            f"{m['iou_water']:>9.4f} "
             f"{m['RMSE_building_height']:>9.4f} "
             f"{m['RMSE_vegetation_height']:>9.4f} "
             f"{m['weighted_score']:>8.4f}"
@@ -328,10 +361,11 @@ def main():
         print(line)
 
     print("-" * 90)
-    print(f"  Weights: mIoU_bld={WEIGHTS['mIoU_buildings']:.0%}  mIoU_tree={WEIGHTS['mIoU_trees']:.0%}  "
-          f"mIoU_wat={WEIGHTS['mIoU_water']:.0%}  RMSE_bH={WEIGHTS['RMSE_building_height']:.0%}  "
+    print(f"  Weights: iou_bld={WEIGHTS['iou_buildings']:.0%}  iou_tree={WEIGHTS['iou_trees']:.0%}  "
+          f"iou_wat={WEIGHTS['iou_water']:.0%}  RMSE_bH={WEIGHTS['RMSE_building_height']:.0%}  "
           f"RMSE_vH={WEIGHTS['RMSE_vegetation_height']:.0%}")
-    print(f"  Score = sum(mIoU_i * w_i) + sum((1 - RMSE_i/30) * w_i)  [higher is better]")
+    print(f"  Score = sum(iou_i * w_i) + sum(max(0, 1 - RMSE_i/X_i) * w_i)   [higher is better]")
+    print(f"  NOTE: X_i (RMSE normalization) is unknown; placeholder=30 over-estimates RMSE contribution.")
     print("=" * 90)
 
 

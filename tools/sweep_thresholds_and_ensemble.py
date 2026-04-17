@@ -28,6 +28,8 @@ EXPERIMENTS = {
     "lightunet": "lightunet_alphaearth",
     "refiner": "alphaearth_refiner_softplus_bs16_lr1e4_aux005",
     "w32": "alphaearth_hrnet_w32_softplus_bs16_lr5e5_aux005",
+    "w18_v2": "hrnet_w18_v2head",
+    "lunet_v2": "lightunet_v2head",
 }
 
 
@@ -242,10 +244,15 @@ def main():
         "lightunet": "lightunet",
         "refiner": "refiner",
         "w32": "w32",
+        "w18_v2": "w18_v2",
+        "lunet_v2": "lunet_v2",
         "avg_w18_lightunet_refiner": {"type": "mean", "models": ["w18", "lightunet", "refiner"]},
         "avg_w18_lightunet": {"type": "mean", "models": ["w18", "lightunet"]},
         "avg_w18_refiner": {"type": "mean", "models": ["w18", "refiner"]},
         "avg_all4": {"type": "mean", "models": ["w18", "lightunet", "refiner", "w32"]},
+        "avg_all6": {"type": "mean", "models": ["w18", "lightunet", "refiner", "w32", "w18_v2", "lunet_v2"]},
+        "avg_v2_pair": {"type": "mean", "models": ["w18_v2", "lunet_v2"]},
+        "avg_w18_both": {"type": "mean", "models": ["w18", "w18_v2"]},
         "weighted_metric_v1": {
             "type": "weighted_channels",
             "weights": {
