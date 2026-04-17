@@ -26,7 +26,7 @@ import numpy as np
 SCRIPT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from core.dataset import _submission_id  # noqa: E402
+from core.dataset import submission_id  # noqa: E402
 
 DEFAULT_TEST_DIR = Path("/u/dingqi2/workspace/esa/data/test/alphaearth_test_emb")
 
@@ -65,7 +65,7 @@ def main():
     arr[3] = args.height_value
 
     for f in test_files:
-        sub_id = _submission_id(str(f))
+        sub_id = submission_id(str(f))
         np.save(args.output_dir / f"{sub_id}.npy", arr)
 
     args.zip_path.parent.mkdir(parents=True, exist_ok=True)

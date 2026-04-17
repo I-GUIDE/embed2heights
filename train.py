@@ -1,156 +1,133 @@
+"""
+Train a single emb2heights backbone.
+
+The script is deliberately monolithic: one process trains one model on one
+embedding source and writes all artifacts under `runs/<experiment_name>/`.
+Compose multiple training runs in a shell script or slurm array — there is no
+multi-baseline driver.
+"""
 import os
+import json
 import random
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import torch.optim as optim
-import torch.nn.functional as F
 import rasterio
 from torch.utils.data import DataLoader
 from sklearn.model_selection import train_test_split
 from tqdm.auto import tqdm
 
-# --- IMPORT FROM CORE MODULES ---
 from core.model import build_model
-from core.dataset import PixelEmbeddingDataset, LatentTokenDataset, find_file_pairs, save_split, load_split, HEIGHT_NORM_CONSTANT
+from core.dataset import (
+    find_file_pairs, save_split, load_split,
+    pick_dataset_class,
+)
 from core.losses import ImprovedCompositeLoss
 
-# --- 1. EXPERIMENT TRACKING ---
-EXPERIMENT_NAME = "terramid_run02/"
-BASE_DIR = "./runs"
-EXP_DIR = os.path.join(BASE_DIR, EXPERIMENT_NAME)
-VIZ_OUTPUT_DIR = os.path.join(EXP_DIR, "visualizations")
 
-# Paths for saving models and plots
-BEST_MODEL_PATH = os.path.join(EXP_DIR, "model_best.pth")
-LAST_MODEL_PATH = os.path.join(EXP_DIR, "model_last.pth")
-LOSS_CURVE_PATH = os.path.join(EXP_DIR, "loss_curve.png")
-CONFIG_LOG_PATH = os.path.join(EXP_DIR, "training_params.txt")
-
-# --- 2. CONFIGURATION ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-TRAIN_EMBEDDINGS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "data", "train", "alphaearth_emb"))
-TRAIN_TARGETS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "data", "train", "labels"))
+DEFAULT_TRAIN_EMB = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "data", "train", "alphaearth_emb"))
+DEFAULT_TRAIN_TAR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "data", "train", "labels"))
 
-BATCH_SIZE = 32
-PATCH_SIZE = 256
-EPOCHS = 30
-LEARNING_RATE = 2e-4
-WEIGHT_DECAY = 1e-4  # L2 Regularization
-VAL_SPLIT = 0.2
-LAMBDAS = [1.0, 0.5, 0.5, 2.0]  # [MAE, SSIM, Gradient, Structure/Tversky]
-RANDOM_SEED = 42
-MODEL_TYPE = "auto"  # one of: auto, lightunet, decoder_residual, embedding_refiner, hrnet_w18, hrnet_w32
-PIXEL_MODEL_TYPES = ("lightunet", "embedding_refiner", "hrnet_w18", "hrnet_w32")
-USE_AMP = True
-GRAD_ACCUM_STEPS = 1
-NUM_WORKERS = 2
-AUX_WEIGHT = 0.25
+MODEL_CHOICES = [
+    "auto", "lightunet", "decoder_residual", "embedding_refiner",
+    "hrnet_w18", "hrnet_w32",
+]
 
-if torch.cuda.is_available():
-    DEVICE = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
-else:
-    DEVICE = torch.device("cpu")
-
-torch.manual_seed(RANDOM_SEED)
-np.random.seed(RANDOM_SEED)
-random.seed(RANDOM_SEED)
+# Defaults — every one is overridable from the CLI.
+DEFAULTS = {
+    "experiment_name": "run01",
+    "output_dir":      os.path.join(SCRIPT_DIR, "runs"),
+    "batch_size":      32,
+    "patch_size":      256,
+    "epochs":          30,
+    "lr":              2e-4,
+    "weight_decay":    1e-4,
+    "val_split":       0.2,
+    "lambdas":         [1.0, 0.5, 0.5, 2.0],   # [MAE, SSIM, Gradient, Tversky]
+    "aux_weight":      0.25,
+    "seed":            42,
+    "model_type":      "auto",
+    "amp":             True,
+    "grad_accum":      1,
+    "num_workers":     2,
+}
 
 
-def save_experiment_config():
-    """Logs all hyperparameters to a text file in the experiment folder."""
-    os.makedirs(EXP_DIR, exist_ok=True)
-    os.makedirs(VIZ_OUTPUT_DIR, exist_ok=True)
+def select_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
-    with open(CONFIG_LOG_PATH, "w") as f:
-        f.write(f"--- EXPERIMENT: {EXPERIMENT_NAME} ---\n")
-        f.write(f"OUTPUT_DIR: {BASE_DIR}\n")
-        f.write(f"BATCH_SIZE: {BATCH_SIZE}\n")
-        f.write(f"PATCH_SIZE: {PATCH_SIZE}\n")
-        f.write(f"EPOCHS: {EPOCHS}\n")
-        f.write(f"LEARNING_RATE: {LEARNING_RATE}\n")
-        f.write(f"WEIGHT_DECAY: {WEIGHT_DECAY}\n")
-        f.write(f"LOSS LAMBDAS: {LAMBDAS}\n")
-        f.write(f"AUX_WEIGHT: {AUX_WEIGHT}\n")
-        f.write(f"MODEL_TYPE: {MODEL_TYPE}\n")
-        f.write(f"USE_AMP: {USE_AMP}\n")
-        f.write(f"GRAD_ACCUM_STEPS: {GRAD_ACCUM_STEPS}\n")
-        f.write(f"NUM_WORKERS: {NUM_WORKERS}\n")
-        f.write(f"TRAIN_EMBEDDINGS_DIR: {TRAIN_EMBEDDINGS_DIR}\n")
-        f.write(f"TRAIN_TARGETS_DIR: {TRAIN_TARGETS_DIR}\n")
-        f.write(f"VAL_SPLIT: {VAL_SPLIT}\n")
-        f.write(f"OPTIMIZER: AdamW\n")
-        f.write(f"SCHEDULER: ReduceLROnPlateau (factor=0.5, patience=2)\n")
-        f.write(f"GRADIENT CLIPPING: max_norm=1.0\n")
-    print(f"📁 Created experiment folder: {EXP_DIR}")
+
+def seed_everything(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train emb2heights baseline models")
-    parser.add_argument("--model-type", type=str, default=MODEL_TYPE,
-                        choices=["auto", "lightunet", "decoder_residual", "embedding_refiner",
-                                 "hrnet_w18", "hrnet_w32"])
-    parser.add_argument("--output-dir", type=str, default=BASE_DIR)
-    parser.add_argument("--train-embeddings-dir", type=str, default=TRAIN_EMBEDDINGS_DIR)
-    parser.add_argument("--train-targets-dir", type=str, default=TRAIN_TARGETS_DIR)
-    parser.add_argument("--experiment-name", type=str, default=EXPERIMENT_NAME)
-    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
-    parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
-    parser.add_argument("--epochs", type=int, default=EPOCHS)
-    parser.add_argument("--lr", type=float, default=LEARNING_RATE)
-    parser.add_argument("--weight-decay", type=float, default=WEIGHT_DECAY)
-    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default=USE_AMP,
-                        help="Use CUDA automatic mixed precision when available.")
-    parser.add_argument("--grad-accum-steps", type=int, default=GRAD_ACCUM_STEPS,
-                        help="Accumulate gradients over N mini-batches before optimizer step.")
-    parser.add_argument("--num-workers", type=int, default=NUM_WORKERS)
-    parser.add_argument("--aux-weight", type=float, default=AUX_WEIGHT,
-                        help="Weight for auxiliary multi-head supervision.")
-    parser.add_argument("--split-file", type=str, default=None,
-                        help="Path to a JSON file defining train/val split. If not found, a new split is created and saved.")
-    return parser.parse_args()
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--model-type",           default=DEFAULTS["model_type"], choices=MODEL_CHOICES)
+    p.add_argument("--output-dir",           default=DEFAULTS["output_dir"])
+    p.add_argument("--train-embeddings-dir", default=DEFAULT_TRAIN_EMB)
+    p.add_argument("--train-targets-dir",    default=DEFAULT_TRAIN_TAR)
+    p.add_argument("--experiment-name",      default=DEFAULTS["experiment_name"])
+    p.add_argument("--batch-size",     type=int,   default=DEFAULTS["batch_size"])
+    p.add_argument("--patch-size",     type=int,   default=DEFAULTS["patch_size"])
+    p.add_argument("--epochs",         type=int,   default=DEFAULTS["epochs"])
+    p.add_argument("--lr",             type=float, default=DEFAULTS["lr"])
+    p.add_argument("--weight-decay",   type=float, default=DEFAULTS["weight_decay"])
+    p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=DEFAULTS["amp"],
+                   help="Use CUDA automatic mixed precision when available.")
+    p.add_argument("--grad-accum-steps", type=int, default=DEFAULTS["grad_accum"],
+                   help="Accumulate gradients over N mini-batches before optimizer step.")
+    p.add_argument("--num-workers",    type=int, default=DEFAULTS["num_workers"])
+    p.add_argument("--aux-weight",     type=float, default=DEFAULTS["aux_weight"],
+                   help="Weight for auxiliary multi-head supervision.")
+    p.add_argument("--seed",           type=int, default=DEFAULTS["seed"])
+    p.add_argument("--split-file",     default=None,
+                   help="Path to a JSON split file. Loaded if present, else a new split is saved there.")
+    return p.parse_args()
 
 
+def make_dataloaders(args):
+    all_pairs = find_file_pairs(args.train_embeddings_dir, args.train_targets_dir)
+    if not all_pairs:
+        raise ValueError(
+            f"No (embedding, label) pairs found.\n"
+            f"  train_embeddings_dir='{args.train_embeddings_dir}'\n"
+            f"  train_targets_dir='{args.train_targets_dir}'\n"
+            "Check filename conventions and directory paths."
+        )
 
-def visualize_results(model, dataset, num_samples=3):
-    """Generates sample visualizations from the dataset."""
-    model.eval()
-    indices = random.sample(range(len(dataset)), min(num_samples, len(dataset)))
-    target_names = ["% Building", "% Vegetation", "% Water", "nDSM Height (m)"]
+    if args.split_file and os.path.exists(args.split_file):
+        train_pairs, val_pairs = load_split(args.split_file, all_pairs)
+    else:
+        train_pairs, val_pairs = train_test_split(
+            all_pairs, test_size=DEFAULTS["val_split"], random_state=args.seed
+        )
+        if args.split_file:
+            save_split(args.split_file, train_pairs, val_pairs)
 
-    with torch.no_grad():
-        for i, idx in enumerate(indices):
-            img_tensor, target_tensor, _ = dataset[idx]
-            input_batch = img_tensor.unsqueeze(0).to(DEVICE)
-            output_batch = model(input_batch)
+    with rasterio.open(train_pairs[0][0]) as src:
+        n_channels = src.count
 
-            target_batch = align_target_to_output(target_tensor.unsqueeze(0).to(DEVICE), output_batch)
+    DatasetCls = pick_dataset_class(args.model_type, n_channels)
+    if DatasetCls.__name__ == "LatentTokenDataset":
+        train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, scale_factor=16, is_train=True)
+        val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, scale_factor=16, is_train=False)
+    else:
+        train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, is_train=True)
+        val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, is_train=False)
 
-            pred = output_batch.squeeze().cpu().numpy()
-            true = target_batch.squeeze().cpu().numpy()
-
-            # UN-NORMALIZE HEIGHT FOR VISUALIZATION
-            pred[3] = pred[3] * HEIGHT_NORM_CONSTANT
-            true[3] = true[3] * HEIGHT_NORM_CONSTANT
-
-            fig, axes = plt.subplots(2, 4, figsize=(20, 10))
-            for c in range(4):
-                vmin, vmax = (0, 1) if c < 3 else (0, HEIGHT_NORM_CONSTANT)
-                axes[0, c].imshow(true[c], cmap='viridis', vmin=vmin, vmax=vmax)
-                axes[0, c].set_title(f"True {target_names[c]}")
-                axes[0, c].axis('off')
-
-                axes[1, c].imshow(pred[c], cmap='viridis', vmin=vmin, vmax=vmax)
-                axes[1, c].set_title(f"Pred {target_names[c]}")
-                axes[1, c].axis('off')
-
-            plt.suptitle(f"{model.__class__.__name__} Prediction (Sample {i})")
-            plt.tight_layout()
-            plt.savefig(os.path.join(VIZ_OUTPUT_DIR, f"viz_{i}.png"))
-            plt.close()
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=args.num_workers)
+    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    return train_loader, val_loader, train_ds, val_ds, n_channels
 
 
 def forward_for_training(model, imgs):
@@ -159,185 +136,152 @@ def forward_for_training(model, imgs):
     return model(imgs)
 
 
-def main():
-    global BASE_DIR, EXPERIMENT_NAME, EXP_DIR, VIZ_OUTPUT_DIR
-    global BEST_MODEL_PATH, LAST_MODEL_PATH, LOSS_CURVE_PATH, CONFIG_LOG_PATH
-    global TRAIN_EMBEDDINGS_DIR, TRAIN_TARGETS_DIR
-    global MODEL_TYPE, EPOCHS, BATCH_SIZE, PATCH_SIZE, USE_AMP
-    global LEARNING_RATE, WEIGHT_DECAY, GRAD_ACCUM_STEPS, NUM_WORKERS, AUX_WEIGHT
+def save_experiment_config(exp_dir, args, device, use_amp):
+    os.makedirs(exp_dir, exist_ok=True)
+    cfg = {
+        "experiment_name": args.experiment_name,
+        "model_type":      args.model_type,
+        "output_dir":      args.output_dir,
+        "batch_size":      args.batch_size,
+        "patch_size":      args.patch_size,
+        "epochs":          args.epochs,
+        "lr":              args.lr,
+        "weight_decay":    args.weight_decay,
+        "loss_lambdas":    DEFAULTS["lambdas"],
+        "aux_weight":      args.aux_weight,
+        "amp":             use_amp,
+        "grad_accum":      args.grad_accum_steps,
+        "num_workers":     args.num_workers,
+        "seed":            args.seed,
+        "train_embeddings_dir": args.train_embeddings_dir,
+        "train_targets_dir":    args.train_targets_dir,
+        "val_split":       DEFAULTS["val_split"],
+        "device":          str(device),
+        "optimizer":       "AdamW",
+        "scheduler":       "ReduceLROnPlateau(factor=0.5, patience=2)",
+        "grad_clip":       1.0,
+    }
+    with open(os.path.join(exp_dir, "training_params.json"), "w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"Created experiment folder: {exp_dir}")
 
-    args = parse_args()
-    MODEL_TYPE = args.model_type
-    BASE_DIR = args.output_dir
-    TRAIN_EMBEDDINGS_DIR = args.train_embeddings_dir
-    TRAIN_TARGETS_DIR = args.train_targets_dir
-    EXPERIMENT_NAME = args.experiment_name
-    BATCH_SIZE = args.batch_size
-    PATCH_SIZE = args.patch_size
-    EPOCHS = args.epochs
-    LEARNING_RATE = args.lr
-    WEIGHT_DECAY = args.weight_decay
-    USE_AMP = args.amp and DEVICE.type == "cuda"
-    GRAD_ACCUM_STEPS = max(1, args.grad_accum_steps)
-    NUM_WORKERS = max(0, args.num_workers)
-    AUX_WEIGHT = args.aux_weight
 
-    EXP_DIR = os.path.join(BASE_DIR, EXPERIMENT_NAME)
-    VIZ_OUTPUT_DIR = os.path.join(EXP_DIR, "visualizations")
-    BEST_MODEL_PATH = os.path.join(EXP_DIR, "model_best.pth")
-    LAST_MODEL_PATH = os.path.join(EXP_DIR, "model_last.pth")
-    LOSS_CURVE_PATH = os.path.join(EXP_DIR, "loss_curve.png")
-    CONFIG_LOG_PATH = os.path.join(EXP_DIR, "training_params.txt")
+def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
+              grad_accum_steps=1, use_amp=False, desc=""):
+    """Train or eval one epoch. Returns (avg_loss, component_avgs[mae,ssim,grad,tversky])."""
+    model.train(train)
+    running_loss = 0.0
+    components = torch.zeros(4, device=device)
+    samples_seen = 0
 
-    save_experiment_config()
-
-    print("--- 1. Data Setup ---")
-    all_train_pairs = find_file_pairs(TRAIN_EMBEDDINGS_DIR, TRAIN_TARGETS_DIR)
-    if len(all_train_pairs) == 0:
-        raise ValueError(
-            "No training (embedding, label) pairs found. "
-            f"train_embeddings_dir='{TRAIN_EMBEDDINGS_DIR}', "
-            f"train_targets_dir='{TRAIN_TARGETS_DIR}'. "
-            "Check filename conventions and directory paths."
-        )
-
-    split_file = args.split_file
-    if split_file and os.path.exists(split_file):
-        train_pairs, val_pairs = load_split(split_file, all_train_pairs)
-    else:
-        train_pairs, val_pairs = train_test_split(
-            all_train_pairs, test_size=VAL_SPLIT, random_state=RANDOM_SEED
-        )
-        if split_file:
-            save_split(split_file, train_pairs, val_pairs)
-
-    # Peek at the first embedding to determine channels and spatial dims
-    sample_emb_path = train_pairs[0][0]
-    with rasterio.open(sample_emb_path) as src:
-        n_channels = src.count
-
-    # Resolve dataset type: pixel-level (256x256) vs patch-level (16x16)
-    if MODEL_TYPE == "auto":
-        use_pixel_dataset = (n_channels < 512)  # AlphaEarth=64, Tessera=128 vs TerraMind/THOR=768
-    else:
-        # Pixel models consume 256x256 embeddings; decoder_residual consumes 16x16 ViT tokens.
-        use_pixel_dataset = MODEL_TYPE in PIXEL_MODEL_TYPES
-
-    if use_pixel_dataset:
-        train_ds = PixelEmbeddingDataset(train_pairs, patch_size=PATCH_SIZE, is_train=True)
-        val_ds = PixelEmbeddingDataset(val_pairs, patch_size=PATCH_SIZE, is_train=False)
-    else:
-        train_ds = LatentTokenDataset(train_pairs, patch_size=PATCH_SIZE, scale_factor=16, is_train=True)
-        val_ds = LatentTokenDataset(val_pairs, patch_size=PATCH_SIZE, scale_factor=16, is_train=False)
-
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
-
-    n_classes = 4
-
-    print("--- 2. Model Init ---")
-    model, selected_model = build_model(MODEL_TYPE, n_channels, n_classes)
-    model = model.to(DEVICE)
-    print(f"Using model: {selected_model} (input channels={n_channels})")
-
-    # NEW: AdamW with Weight Decay
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
-
-    # NEW: Aggressive Scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
-    criterion = ImprovedCompositeLoss(lambdas=LAMBDAS, aux_weight=AUX_WEIGHT).to(DEVICE)
-
-    print(f"Starting training on {DEVICE}...")
-
-    train_losses, val_losses = [], []
-    best_val_loss = float('inf')
-
-    # --- TRAINING LOOP ---
-    for epoch in range(EPOCHS):
-        model.train()
-        running_loss = 0.0
-        train_samples_seen = 0
+    pbar = tqdm(loader, desc=desc, leave=False)
+    if train:
         optimizer.zero_grad(set_to_none=True)
 
-        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{EPOCHS} [train]", leave=False)
-        for step, (imgs, targets, masks) in enumerate(train_pbar, start=1):
-            imgs, targets, masks = imgs.to(DEVICE), targets.to(DEVICE), masks.to(DEVICE)
+    context = torch.enable_grad() if train else torch.no_grad()
+    with context:
+        for step, (imgs, targets, masks) in enumerate(pbar, start=1):
+            imgs, targets, masks = imgs.to(device), targets.to(device), masks.to(device)
 
-            with torch.amp.autocast("cuda", enabled=USE_AMP):
+            with torch.amp.autocast("cuda", enabled=use_amp):
                 outputs = forward_for_training(model, imgs)
-                loss, _, _, _, _ = criterion(outputs, targets, masks)
-                scaled_loss = loss / GRAD_ACCUM_STEPS
+                loss, l_mae, l_ssim, l_grad, l_tversky = criterion(outputs, targets, masks)
+                step_loss = loss / grad_accum_steps if train else loss
 
-            scaler.scale(scaled_loss).backward()
+            if train:
+                scaler.scale(step_loss).backward()
+                should_step = step % grad_accum_steps == 0 or step == len(loader)
+                if should_step:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad(set_to_none=True)
 
-            should_step = step % GRAD_ACCUM_STEPS == 0 or step == len(train_loader)
-            if should_step:
-                # NEW: Gradient Clipping
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            bs = imgs.size(0)
+            running_loss += loss.item() * bs
+            components[0] += l_mae * bs
+            components[1] += l_ssim * bs
+            components[2] += l_grad * bs
+            components[3] += l_tversky * bs
+            samples_seen += bs
+            avg = running_loss / max(1, samples_seen)
+            pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{avg:.4f}")
 
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad(set_to_none=True)
-            running_loss += loss.item() * imgs.size(0)
-            train_samples_seen += imgs.size(0)
-            train_avg = running_loss / max(1, train_samples_seen)
-            train_pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{train_avg:.4f}")
+    avg_loss = running_loss / max(1, samples_seen)
+    comp_avg = (components / max(1, samples_seen)).cpu()
+    return avg_loss, comp_avg
 
-        epoch_loss = running_loss / len(train_ds)
-        train_losses.append(epoch_loss)
 
-        # --- VALIDATION LOOP ---
-        model.eval()
-        val_running_loss = 0.0
-        val_components = torch.zeros(4).to(DEVICE)
-        val_samples_seen = 0
-
-        with torch.no_grad():
-            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch + 1}/{EPOCHS} [val]", leave=False)
-            for imgs, targets, masks in val_pbar:
-                imgs, targets, masks = imgs.to(DEVICE), targets.to(DEVICE), masks.to(DEVICE)
-
-                with torch.amp.autocast("cuda", enabled=USE_AMP):
-                    outputs = forward_for_training(model, imgs)
-                    loss, l_mae, l_ssim, l_grad, l_tversky = criterion(outputs, targets, masks)
-                val_running_loss += loss.item() * imgs.size(0)
-
-                bs = imgs.size(0)
-                val_components[0] += l_mae * bs
-                val_components[1] += l_ssim * bs
-                val_components[2] += l_grad * bs
-                val_components[3] += l_tversky * bs
-                val_samples_seen += bs
-                val_avg_live = val_running_loss / max(1, val_samples_seen)
-                val_pbar.set_postfix(avg=f"{val_avg_live:.4f}")
-
-        epoch_val_loss = val_running_loss / len(val_ds)
-        epoch_comp = val_components / len(val_ds)
-        val_losses.append(epoch_val_loss)
-
-        scheduler.step(epoch_val_loss)
-
-        if epoch_val_loss < best_val_loss:
-            best_val_loss = epoch_val_loss
-            torch.save(model.state_dict(), BEST_MODEL_PATH)
-            print(f"   >> Model Saved! (New Best Val Loss: {best_val_loss:.4f})")
-
-        print(f"Epoch {epoch + 1}/{EPOCHS} | Train: {epoch_loss:.4f} | Val: {epoch_val_loss:.4f}")
-        print(
-            f"   >> Val Breakdown: MAE:{epoch_comp[0]:.3f} | SSIM:{epoch_comp[1]:.3f} | Grad:{epoch_comp[2]:.3f} | Tversky:{epoch_comp[3]:.3f}")
-
-    print("--- 3. Saving & Visualizing ---")
-    torch.save(model.state_dict(), LAST_MODEL_PATH)
-
+def plot_loss_curve(train_losses, val_losses, out_path, experiment_name):
     plt.figure()
-    plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Validation Loss')
-    plt.title(f"Training Loss Curve ({EXPERIMENT_NAME})")
+    plt.plot(train_losses, label="Train Loss")
+    plt.plot(val_losses,   label="Validation Loss")
+    plt.title(f"Training Loss Curve ({experiment_name})")
     plt.legend()
-    plt.savefig(LOSS_CURVE_PATH)
+    plt.savefig(out_path)
     plt.close()
+
+
+def main():
+    args = parse_args()
+    device = select_device()
+    seed_everything(args.seed)
+
+    exp_dir = os.path.join(args.output_dir, args.experiment_name)
+    best_model_path = os.path.join(exp_dir, "model_best.pth")
+    last_model_path = os.path.join(exp_dir, "model_last.pth")
+    loss_curve_path = os.path.join(exp_dir, "loss_curve.png")
+
+    use_amp = args.amp and device.type == "cuda"
+    grad_accum_steps = max(1, args.grad_accum_steps)
+    save_experiment_config(exp_dir, args, device, use_amp)
+
+    print("--- 1. Data Setup ---")
+    train_loader, val_loader, train_ds, val_ds, n_channels = make_dataloaders(args)
+
+    print("--- 2. Model Init ---")
+    model, selected_model = build_model(args.model_type, n_channels, n_classes=4)
+    model = model.to(device)
+    print(f"Using model: {selected_model} (input channels={n_channels})")
+
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
+    criterion = ImprovedCompositeLoss(lambdas=DEFAULTS["lambdas"], aux_weight=args.aux_weight).to(device)
+
+    print(f"Starting training on {device}...")
+    train_losses, val_losses = [], []
+    best_val_loss = float("inf")
+
+    for epoch in range(args.epochs):
+        tr_loss, _ = run_epoch(
+            model, train_loader, criterion, optimizer, scaler, device,
+            train=True, grad_accum_steps=grad_accum_steps, use_amp=use_amp,
+            desc=f"Epoch {epoch + 1}/{args.epochs} [train]",
+        )
+        val_loss, val_comp = run_epoch(
+            model, val_loader, criterion, optimizer, scaler, device,
+            train=False, use_amp=use_amp,
+            desc=f"Epoch {epoch + 1}/{args.epochs} [val]",
+        )
+        train_losses.append(tr_loss)
+        val_losses.append(val_loss)
+        scheduler.step(val_loss)
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            torch.save(model.state_dict(), best_model_path)
+            print(f"   >> New best val loss {best_val_loss:.4f} — saved.")
+
+        print(f"Epoch {epoch + 1}/{args.epochs} | Train: {tr_loss:.4f} | Val: {val_loss:.4f}")
+        print(f"   >> Val breakdown: MAE:{val_comp[0]:.3f} | SSIM:{val_comp[1]:.3f} | "
+              f"Grad:{val_comp[2]:.3f} | Tversky:{val_comp[3]:.3f}")
+
+    print("--- 3. Saving ---")
+    torch.save(model.state_dict(), last_model_path)
+    plot_loss_curve(train_losses, val_losses, loss_curve_path, args.experiment_name)
+
 
 if __name__ == "__main__":
     main()

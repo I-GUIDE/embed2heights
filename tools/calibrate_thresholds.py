@@ -1,63 +1,25 @@
 import argparse
-import glob
 import json
-import os
-import re
+import sys
 from pathlib import Path
 
 import numpy as np
 import rasterio
 
-
 SCRIPT_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SCRIPT_DIR))
+
+from core.dataset import normalize_core_id  # noqa: E402
+from core.metrics import load_val_ids, build_label_map  # noqa: E402
+
 DEFAULT_LABELS_DIR = SCRIPT_DIR.parent / "data" / "train" / "labels"
 DEFAULT_SPLIT_FILE = SCRIPT_DIR / "splits" / "split.json"
 CLASS_NAMES = ("building", "vegetation", "water")
 CLASS_WEIGHTS = (0.25, 0.15, 0.15)
+# calibrate_thresholds uses a stricter label binarization (0.5) — intentional,
+# it's tuning against the old `mean(pos, neg)` IoU curve rather than the
+# probe-verified leaderboard metric. Keep in sync with comments below.
 LABEL_THRESHOLD = 0.5
-
-
-def normalize_core_id(filename):
-    base = os.path.splitext(os.path.basename(filename))[0]
-    if base.startswith("label_"):
-        base = base[len("label_"):]
-    if base.startswith("pred_"):
-        base = base[len("pred_"):]
-    for prefix in ("gee_emb_", "tessera_emb_", "emb_", "s2_", "s1_"):
-        if base.startswith(prefix):
-            base = base[len(prefix):]
-            break
-    for suffix in ("_embedding", "_embeddings", "_quantized", "_merged"):
-        if base.endswith(suffix):
-            base = base[: -len(suffix)]
-    return re.sub(r"_\d{4}$", "", base)
-
-
-def binary_iou(pred_mask, true_mask):
-    intersection = np.logical_and(pred_mask, true_mask).sum()
-    union = np.logical_or(pred_mask, true_mask).sum()
-    if union == 0:
-        return np.nan
-    return intersection / union
-
-
-def mean_iou(pred_mask, true_mask):
-    pos = binary_iou(pred_mask, true_mask)
-    neg = binary_iou(~pred_mask, ~true_mask)
-    vals = [v for v in (pos, neg) if not np.isnan(v)]
-    return float(np.mean(vals)) if vals else np.nan
-
-
-def load_val_ids(split_file):
-    with open(split_file, "r", encoding="utf-8") as f:
-        return set(json.load(f)["val"])
-
-
-def build_label_map(labels_dir):
-    label_files = glob.glob(str(labels_dir / "**" / "label_*.tif"), recursive=True)
-    if not label_files:
-        raise FileNotFoundError(f"No label_*.tif files found in {labels_dir}")
-    return {normalize_core_id(path): Path(path) for path in label_files}
 
 
 def build_prediction_map(pred_dir):

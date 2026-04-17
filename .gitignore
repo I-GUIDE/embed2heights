@@ -3,7 +3,6 @@ data/
 
 # Experiment outputs (checkpoints, loss curves, predictions)
 runs/
-run_all_baselines.sbatch
 
 # Python
 __pycache__/

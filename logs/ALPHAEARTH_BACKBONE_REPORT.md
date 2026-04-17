@@ -3,6 +3,15 @@
 **Date**: 2026-04-15
 **Scope**: Single-modality backbone comparison on AlphaEarth embeddings, prior to multimodal fusion.
 
+> **⚠ Scores use the pre-probe metric.**
+> All mIoU and Score values in this report were computed with the old
+> `mean(IoU_pos, IoU_neg)` at threshold 0.5. The 2026-04-17 dummy probe
+> (see [METRIC_PROBE_REPORT.md](METRIC_PROBE_REPORT.md)) proved the server
+> uses positive-only per-image IoU at `label > 0`. Re-running `evaluate.py`
+> on the same checkpoints produces lower absolute IoU numbers, though the
+> backbone ranking is largely preserved. RMSE numbers are also affected
+> (per-image macro now, not global pixel-accumulated).
+
 ---
 
 ## Executive Summary

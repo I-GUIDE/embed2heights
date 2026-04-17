@@ -1,43 +1,35 @@
 # Emb2Heights Baselines
 
-Baseline models for the **ESA Embed2Heights** competition. Predicts 4-channel output per pixel from pre-computed Geospatial Foundation Model (GFM) embeddings:
-`[% Building, % Vegetation, % Water, Height (m)]`.
+Baselines for the **ESA Embed2Heights** competition. Each model predicts a 4-channel output per pixel from pre-computed Geospatial Foundation Model (GFM) embeddings: `[building_fraction, vegetation_fraction, water_fraction, height_m]`.
 
-## Data Layout
+## Repository Layout
 
 ```
-esa/
-├── data/
-│   ├── train/                          # 2,024 labeled patches (256x256 @ 10m)
-│   │   ├── alphaearth_emb/             # 64ch pixel-aligned
-│   │   ├── tessera_emb/                # 128ch pixel-aligned
-│   │   ├── terramind_s1_emb/           # 768ch ViT tokens (16x16)
-│   │   ├── terramind_s2_emb/           # 768ch ViT tokens (16x16)
-│   │   ├── thor_s1_emb/                # 768ch ViT tokens (16x16)
-│   │   ├── thor_s2_emb/                # 768ch ViT tokens (16x16)
-│   │   └── labels/                     # 4ch ground truth
-│   └── test/                           # 946 unlabeled patches
-│       ├── alphaearth_test_emb/
-│       ├── tessera_test_emb/
-│       ├── terramind_test_s2_emb/
-│       └── thor_test_s2_emb/
-└── emb2heights-baselines/              # this repo
-    ├── core/
-    │   ├── dataset.py                  # PixelEmbeddingDataset, LatentTokenDataset
-    │   ├── model.py                    # LightUNet, EfficientDecoder256
-    │   └── losses.py                   # ImprovedCompositeLoss
-    ├── tools/
-    │   ├── generate_split.py           # create reproducible train/val splits
-    │   └── download_data.py            # download dataset from EOTDL
-    ├── train.py                        # single-baseline training
-    ├── predict.py                      # inference (val or test)
-    ├── evaluate.py                     # compute 5 leaderboard metrics
-    ├── run_all_baselines.py            # batch train/predict all 4 baselines
-    ├── splits/                         # saved train/val split JSONs
-    ├── runs/                           # experiment checkpoints & outputs
-    ├── submission/                     # competition submission files
-    └── logs/                           # evaluation reports
+emb2heights-backbone/
+├── core/
+│   ├── dataset.py     # PixelEmbeddingDataset, LatentTokenDataset, id/path helpers
+│   ├── model.py       # LightUNet, EmbeddingRefiner, HRNet-W{18,32}, EfficientDecoder256Fast
+│   ├── losses.py      # ImprovedCompositeLoss (MAE + SSIM + Gradient + Tversky + aux)
+│   └── metrics.py     # Leaderboard metric helpers (WEIGHTS, binary_iou, compute_weighted_score)
+├── tools/
+│   ├── download_data.py                   # pull the EOTDL dataset
+│   ├── generate_split.py                  # write splits/split.json
+│   ├── calibrate_thresholds.py            # per-class threshold sweep on a val prediction dir
+│   ├── sweep_thresholds_and_ensemble.py   # in-memory ensemble + threshold sweep using evaluate.py's metric
+│   ├── create_test_ensemble_submission.py # materialize the weighted_metric_v1 ensemble on the test set
+│   ├── make_dummy_submission.py           # build an all-constant .zip submission (metric probing)
+│   ├── predict_dummy_metrics.py           # predict leaderboard values under each candidate formula
+│   └── *.ipynb                            # ad-hoc analysis notebooks
+├── splits/               # saved train/val split JSONs (reproducible seed=42 split)
+├── runs/                 # experiment outputs (gitignored): model_best.pth, predictions/, etc.
+├── submission/           # zipped test-set predictions ready to upload (gitignored)
+├── logs/                 # evaluation / experiment reports
+├── train.py              # single-experiment training
+├── predict.py            # inference (val or test)
+└── evaluate.py           # compute the 5 leaderboard metrics on runs/*/predictions
 ```
+
+Data is expected one level up from this repo (`../data/train/...`, `../data/test/...`); override with `--train-embeddings-dir`, `--train-targets-dir`, `--test-embeddings-dir`.
 
 ## Setup
 
@@ -46,7 +38,7 @@ conda env create -f environment.yml
 conda activate emb2heights
 ```
 
-## Quick Start
+## Workflow
 
 ### 1. Download data
 
@@ -56,139 +48,135 @@ Requires EOTDL authentication (`eotdl auth login`):
 python tools/download_data.py --path ../data
 ```
 
-### 2. Generate train/val split
+### 2. Generate a reproducible train/val split
 
-Split labeled data into reproducible train and validation sets (default 80/20, seed=42):
-
-```bash
-python tools/generate_split.py
-# Creates splits/train.json, splits/val.json, splits/split.json
-```
-
-### 3. Train all baselines
+The split is keyed by normalized core id so the same patch lives in the same split regardless of embedding source:
 
 ```bash
-python run_all_baselines.py --skip-predict
+python tools/generate_split.py            # writes splits/{train,val,split}.json, 80/20, seed=42
 ```
 
-Or train a single baseline:
+Pass `splits/split.json` to `train.py` via `--split-file` to reuse it.
+
+### 3. Train a single baseline
 
 ```bash
 python train.py \
-    --model-type lightunet \
+    --model-type hrnet_w18 \
     --train-embeddings-dir ../data/train/alphaearth_emb \
-    --train-targets-dir ../data/train/labels \
-    --experiment-name alphaearth_run01 \
-    --split-file splits/split.json \
+    --train-targets-dir    ../data/train/labels \
+    --experiment-name      alphaearth_hrnet_w18 \
+    --split-file           splits/split.json \
     --epochs 30
 ```
 
-### 4. Evaluate on validation set
+Artifacts go to `runs/<experiment_name>/`: `model_best.pth`, `model_last.pth`, `loss_curve.png`, `training_params.json`.
 
-```bash
-# Predict on training data (val split)
-python run_all_baselines.py --skip-train
+There is **no multi-baseline driver script** — launch a shell loop or slurm array to sweep over multiple backbones/sources.
 
-# Evaluate
-python evaluate.py --val-only
-```
+### 4. Predict
 
-### 5. Generate competition submission
-
-Predict on the test set (no labels required):
-
-```bash
-python run_all_baselines.py --skip-train --predict-test
-```
-
-Or for a single baseline:
+Validation (paired with labels, for offline scoring):
 
 ```bash
 python predict.py \
-    --experiment-name alphaearth_baseline \
-    --model-type lightunet \
-    --test-embeddings-dir ../data/test/alphaearth_test_emb \
-    --predictions-dir submission/alphaearth
+    --experiment-name      alphaearth_hrnet_w18 \
+    --model-type           hrnet_w18 \
+    --test-embeddings-dir  ../data/train/alphaearth_emb \
+    --test-targets-dir     ../data/train/labels
 ```
 
-Predictions are saved as `pred_<core_id>.npy` files with shape `(4, 256, 256)`:
-- Channel 0: Building coverage (0-1)
-- Channel 1: Vegetation coverage (0-1)
-- Channel 2: Water coverage (0-1)
-- Channel 3: Height in meters
-
-## Model Architectures
-
-| `--model-type` | Architecture | Input Type | Used for |
-|---|---|---|---|
-| `lightunet` | LightUNet (encoder-decoder with skip connections) | Pixel-aligned (256x256) | AlphaEarth, Tessera |
-| `embedding_refiner` | Full-resolution ConvNeXt/ASPP refiner with multi-head prediction | Pixel-aligned (256x256) | AlphaEarth, Tessera |
-| `hrnet_w18` | HRNet-style high-resolution backbone, width 18, with multi-head prediction | Pixel-aligned (256x256) | AlphaEarth, Tessera |
-| `hrnet_w32` | HRNet-style high-resolution backbone, width 32, with multi-head prediction | Pixel-aligned (256x256) | AlphaEarth, Tessera |
-| `decoder_residual` | EfficientDecoder256 (progressive upsampling) | ViT tokens (16x16) | TerraMind, THOR |
-| `auto` | Auto-select based on input spatial size | Any | Default |
-
-### Pixel-Aligned Backbone Notes
-
-AlphaEarth and Tessera embeddings are already dense, pixel-aligned feature maps, not raw imagery. The current pixel backbones are designed to preserve `256x256` spatial detail while adding task-specific context for land-cover fractions and height.
-
-- `hrnet_w18` / `hrnet_w32`: keep a full-resolution branch throughout the network while adding lower-resolution context branches. This is useful for sparse buildings/water because boundaries stay sharp, and for height because lower-resolution branches provide broader scene context. `hrnet_w18` is the current best validation model; `hrnet_w32` has more capacity but needs tuning.
-- `embedding_refiner`: keeps full resolution end-to-end, calibrates AlphaEarth channels, applies ConvNeXt-style refinement blocks, and uses ASPP for larger receptive field without downsampling. This is the most parameter-efficient strong backbone.
-- `lightunet`: remains a strong simple baseline once paired with the current multi-head prediction head.
-
-See `logs/ALPHAEARTH_BACKBONE_REPORT.md` for the detailed architecture rationale and validation comparison.
-
-AlphaEarth single-modality backbone comparison:
+Competition test set (label-free, submission-ready filenames):
 
 ```bash
-python train.py --model-type embedding_refiner --experiment-name alphaearth_refiner --split-file splits/split.json --batch-size 8 --grad-accum-steps 4 --lr 1e-4 --aux-weight 0.05 --num-workers 0
-python train.py --model-type hrnet_w18 --experiment-name alphaearth_hrnet_w18 --split-file splits/split.json --batch-size 4 --grad-accum-steps 4 --lr 1e-4 --aux-weight 0.05 --num-workers 0
-python train.py --model-type hrnet_w32 --experiment-name alphaearth_hrnet_w32 --split-file splits/split.json --batch-size 2 --grad-accum-steps 8 --lr 5e-5 --aux-weight 0.05 --num-workers 0
+python predict.py \
+    --experiment-name      alphaearth_hrnet_w18 \
+    --model-type           hrnet_w18 \
+    --test-embeddings-dir  ../data/test/alphaearth_test_emb \
+    --predictions-dir      submission/alphaearth_hrnet_w18
 ```
 
-## Loss Function
+Predictions are `(4, 256, 256)` float32 arrays — channels: `[building%, veg%, water%, height_m]`.
 
-`ImprovedCompositeLoss` with 4 weighted terms:
-- **MAE** (w=1.0): pixel-level regression with foreground/background split
-- **SSIM** (w=0.5): structural similarity on land-cover channels
-- **Gradient** (w=0.5): edge sharpness penalty on land-cover channels
-- **Tversky** (w=2.0): asymmetric segmentation loss (alpha=0.3, beta=0.7) + 2x height boosting on building pixels
-- **Auxiliary multi-head loss**: for compatible models, lightly supervises class-presence logits and building/vegetation height heads before they are fused into the final 4-channel prediction
+### 5. Evaluate
 
-## Training Configuration
+```bash
+python evaluate.py                                # every runs/*/predictions
+python evaluate.py --only alphaearth_hrnet_w18    # one experiment
+python evaluate.py --val-only                     # restrict to each experiment's own val split
+python evaluate.py --pred-threshold 0.3           # non-default prediction binarization
+```
 
-| Parameter | Value |
-|---|---|
-| Optimizer | AdamW (lr=2e-4, weight_decay=1e-4) |
-| LR Scheduler | ReduceLROnPlateau (factor=0.5, patience=2) |
-| Gradient Clipping | max_norm=1.0 |
-| Batch Size | 32 |
-| Epochs | 30 |
-| Train/Val Split | 80/20 (seed=42) |
+The metric formulas were reverse-engineered by the 2026-04-17 dummy-probe submission (see [logs/METRIC_PROBE_REPORT.md](logs/METRIC_PROBE_REPORT.md)) and are shared between `evaluate.py` and the `tools/` scripts via `core/metrics.py`.
 
-## Evaluation Metrics
+### 6. Ensembles & threshold tuning
 
-5 leaderboard metrics with weights:
+- `tools/sweep_thresholds_and_ensemble.py` — load every AlphaEarth experiment, evaluate a grid of single-model / weighted / averaged ensembles at several prediction thresholds, print a leaderboard-style table (in-memory only, no files written).
+- `tools/calibrate_thresholds.py --pred-dir runs/<exp>/predictions` — pick per-class thresholds on the val split, optionally materialize hard-thresholded predictions.
+- `tools/create_test_ensemble_submission.py` — materialize the `weighted_metric_v1` ensemble on the test set (raw + calibrated hard-mask variants), and write an `ensemble_manifest.json`.
 
-| Metric | Weight | Task |
-|---|---|---|
-| mIoU Buildings | 25% | Segmentation |
-| mIoU Trees | 15% | Segmentation |
-| mIoU Water | 15% | Segmentation |
-| RMSE Building Height | 25% | Height regression |
-| RMSE Vegetation Height | 20% | Height regression |
+## Models
 
-Composite score: `sum(mIoU_i * w_i) + sum((1 - RMSE_i / 30) * w_i)` — higher is better.
+| `--model-type`       | Architecture                                           | Expected input              |
+|----------------------|--------------------------------------------------------|-----------------------------|
+| `lightunet`          | Light U-Net (32/64/128/256), multi-head output         | Pixel-aligned 256x256       |
+| `embedding_refiner`  | Full-resolution ConvNeXt blocks + ASPP, multi-head     | Pixel-aligned 256x256       |
+| `hrnet_w18`          | HRNet-style multi-resolution (width 18), multi-head    | Pixel-aligned 256x256       |
+| `hrnet_w32`          | Same as above, width 32                                | Pixel-aligned 256x256       |
+| `decoder_residual`   | `EfficientDecoder256Fast` — bottleneck + 4× upsample  | ViT tokens 16x16 (768ch)    |
+| `auto`               | Pick by input channels (<512 → pixel, else token)     | Any                         |
 
-## Baseline Results (Validation, 405 samples)
+`decoder` is accepted as an alias for `decoder_residual`. Pixel-aligned backbones (all the AlphaEarth / Tessera options) share a common `MultiTaskPredictionHead` with a fraction head, a fraction-derived presence head, and a fraction-gated softplus height head.
 
-| # | Baseline | mIoU_bld | mIoU_tree | mIoU_wat | RMSE_bH | RMSE_vH | Score |
-|---|---|---|---|---|---|---|---|
-| 1 | **AlphaEarth** | 0.598 | 0.724 | 0.680 | 4.83m | 4.33m | **0.741** |
-| 2 | TerraMind S2 | 0.531 | 0.478 | 0.545 | 5.83m | 6.95m | 0.641 |
-| 3 | TerraMind S1 | 0.524 | 0.436 | 0.452 | 5.13m | 7.36m | 0.622 |
-| 4 | THOR S1 | 0.519 | 0.411 | 0.497 | 5.66m | 7.53m | 0.619 |
-| 5 | THOR S2 | 0.517 | 0.365 | 0.462 | 5.99m | 7.65m | 0.602 |
-| 6 | Tessera | 0.507 | 0.206 | 0.553 | 7.21m | 11.93m | 0.551 |
+## Loss
 
-See [logs/BASELINE_REPORT.md](logs/BASELINE_REPORT.md) for detailed analysis.
+`ImprovedCompositeLoss` sums five weighted terms, with `valid_mask` on every term to exclude nodata pixels (all four bands zero) and nDSM holes (nDSM=0 but land cover present).
+
+| Term                 | Default weight | Applied to       |
+|----------------------|----------------|------------------|
+| MAE (fg/bg split)    | 1.0            | All 4 channels   |
+| SSIM                 | 0.5            | Land cover (0–2) |
+| Gradient difference  | 0.5            | Land cover (0–2) |
+| Tversky (α=0.3, β=0.7) + 5× building-pixel height boost | 2.0 | Land cover + height |
+| Auxiliary multi-head supervision | 0.25          | Presence logits + per-class height heads (if backbone supports it) |
+
+## Training configuration (defaults in `train.py`)
+
+| Parameter           | Value                                    |
+|---------------------|------------------------------------------|
+| Optimizer           | AdamW, lr=2e-4, weight_decay=1e-4        |
+| Scheduler           | ReduceLROnPlateau (factor=0.5, patience=2)|
+| Gradient clipping   | max_norm=1.0                             |
+| Batch size          | 32                                       |
+| Epochs              | 30                                       |
+| Patch size          | 256                                      |
+| Train/val split     | 80/20 (seed=42)                          |
+| AMP                 | Enabled on CUDA                          |
+| Aux weight          | 0.25                                     |
+
+Most of these are overridable from the CLI.
+
+## Leaderboard metric (verified via 2026-04-17 probe)
+
+| Metric                    | Weight | Definition                                                                                  |
+|---------------------------|--------|---------------------------------------------------------------------------------------------|
+| `iou_buildings`           | 25%    | Per-image positive-only IoU (`pred > 0.5`, `label > 0`); empty/empty → 1.0; sample-averaged |
+| `iou_trees`               | 15%    | same                                                                                         |
+| `iou_water`               | 15%    | same                                                                                         |
+| `RMSE_building_height`    | 25%    | Per-image RMSE on pixels where building label > 0; sample-averaged                          |
+| `RMSE_vegetation_height`  | 20%    | same for vegetation                                                                          |
+
+Composite score: `Σ iou_i × w_i + Σ max(0, 1 − RMSE_i / X_i) × w_i`. `X_class` is bounded by the probe (`X_building < 4m`, `X_vegetation < 10.9m`) but its exact values are still unknown; `compute_weighted_score` uses `30` as a placeholder, which over-estimates the RMSE contribution.
+
+See [logs/METRIC_PROBE_REPORT.md](logs/METRIC_PROBE_REPORT.md) for the full derivation.
+
+## Experiment history
+
+| Report                                                      | Summary                                                                |
+|-------------------------------------------------------------|------------------------------------------------------------------------|
+| [logs/BASELINE_REPORT.md](logs/BASELINE_REPORT.md)          | Original 6-embedding comparison (**uses pre-probe metric — see banner**)|
+| [logs/ALPHAEARTH_BACKBONE_REPORT.md](logs/ALPHAEARTH_BACKBONE_REPORT.md) | LightUNet vs EmbeddingRefiner vs HRNet-W{18,32} on AlphaEarth  |
+| [logs/BEST_RESULT.md](logs/BEST_RESULT.md)                  | Current champion (weighted ensemble of W18 + LightUNet + Refiner)      |
+| [logs/METRIC_PROBE_REPORT.md](logs/METRIC_PROBE_REPORT.md)  | Metric formula reverse-engineering                                     |
+| [logs/LABEL_BAND_ANALYSIS.md](logs/LABEL_BAND_ANALYSIS.md)  | Label distribution, nodata, class imbalance                            |
+| [logs/GOAL.md](logs/GOAL.md)                                | Challenge-level background                                             |

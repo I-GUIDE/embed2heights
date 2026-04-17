@@ -19,24 +19,19 @@ import argparse
 import json
 import os
 import glob
-import re
+import sys
 
 from sklearn.model_selection import train_test_split
 
-
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_LABELS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..","..", "data", "train", "labels"))
-DEFAULT_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "../splits")
+sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
+
+from core.dataset import normalize_core_id  # noqa: E402
+
+DEFAULT_LABELS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "data", "train", "labels"))
+DEFAULT_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "..", "splits")
 DEFAULT_VAL_RATIO = 0.2
 DEFAULT_SEED = 42
-
-
-def normalize_core_id(filename):
-    base = os.path.splitext(os.path.basename(filename))[0]
-    if base.startswith("label_"):
-        base = base[len("label_"):]
-    base = re.sub(r'_\d{4}$', '', base)
-    return base
 
 
 def parse_args():

@@ -3,6 +3,13 @@
 
 > Pinned tracker for the current best strategy combo on the ESA Embed2Heights leaderboard.
 > **Last updated:** 2026-04-15 · **Current best score:** `0.7641` (val, raw ensemble) · **Submitted:** `—`
+>
+> **⚠ Scores here predate the 2026-04-17 metric probe** — they use
+> `mean(IoU_pos, IoU_neg)` at threshold 0.5 and global pixel-accumulated RMSE.
+> The leaderboard uses positive-only per-image IoU at `label > 0` and per-image
+> RMSE on class-present pixels ([METRIC_PROBE_REPORT.md](METRIC_PROBE_REPORT.md)).
+> Re-evaluate with `evaluate.py` or `tools/sweep_thresholds_and_ensemble.py`
+> before promoting a new champion.
 
 ## 📊 Current Champion
 
