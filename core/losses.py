@@ -191,8 +191,20 @@ class ImprovedCompositeLoss(nn.Module):
         global_1ch = global_mask.squeeze(1)       # (B, H, W)
         height_1ch = height_mask.squeeze(1)       # (B, H, W)
 
+        # With the dual-head design (v3), submission channels 0-2 of `preds`
+        # are presence_prob (binary-aligned), so the soft-regression losses
+        # (MAE/SSIM/Gradient/Tversky on land cover) must target the auxiliary
+        # `fractions` instead, which is still a soft [0,1] coverage regressor.
+        # Height (channel 3) continues to come from `preds[:, 3]`.
+        if aux_outputs is not None and "fractions" in aux_outputs:
+            class_pred = aux_outputs["fractions"]  # (B, 3, H, W) — soft fractions
+        else:
+            class_pred = preds[:, :3, :, :]        # fallback for models without a split head
+
+        reg_pred = torch.cat([class_pred, preds[:, 3:4, :, :]], dim=1)  # (B, 4, H, W) for MAE
+
         # --- 1. Base MAE (Foreground / Background Split) with nodata masking ---
-        abs_err = torch.abs(preds - targets)
+        abs_err = torch.abs(reg_pred - targets)
         fg_mask = (targets > 0).float() * ch_mask
         bg_mask = (1.0 - (targets > 0).float()) * ch_mask
 
@@ -208,21 +220,21 @@ class ImprovedCompositeLoss(nn.Module):
         # --- 2. Structural & Gradient Loss on Land Cover Only ---
         # Zero out predictions at nodata pixels so they match targets (no spurious loss)
         lc_mask = global_mask.expand(-1, 3, -1, -1)       # (B, 3, H, W)
-        lc_pred = preds[:, :3, :, :] * lc_mask
+        lc_pred = class_pred * lc_mask
         lc_target = targets[:, :3, :, :] * lc_mask
 
         loss_ssim = self.ssim(lc_pred, lc_target)
         loss_grad = self.gdl(lc_pred, lc_target)
 
-        # --- 3. Multi-Class Tversky Loss with nodata masking (global mask for land cover) ---
+        # --- 3. Multi-Class Tversky Loss on the auxiliary soft fractions ---
         # Pass the mask explicitly so invalid pixels are excluded from TP/FP/FN
         # (no dilution from zero-filled nodata regions).
         gm_bool = global_1ch.bool()
-        t_build = self.tversky(torch.relu(preds[:, 0, :, :]),
+        t_build = self.tversky(torch.relu(class_pred[:, 0, :, :]),
                                targets[:, 0, :, :], valid_mask=gm_bool)
-        t_veg = self.tversky(torch.relu(preds[:, 1, :, :]),
+        t_veg = self.tversky(torch.relu(class_pred[:, 1, :, :]),
                              targets[:, 1, :, :], valid_mask=gm_bool)
-        t_water = self.tversky(torch.relu(preds[:, 2, :, :]),
+        t_water = self.tversky(torch.relu(class_pred[:, 2, :, :]),
                                targets[:, 2, :, :], valid_mask=gm_bool)
 
         loss_tversky = (t_build + t_veg + t_water) / 3.0
@@ -242,17 +254,21 @@ class ImprovedCompositeLoss(nn.Module):
                      (self.w_structure * loss_tversky) + \
                      (self.w_structure * loss_height_boost)
 
-        # --- 5. Optional auxiliary supervision for multi-head models ---
+        # --- 5. Auxiliary supervision for the dual-head model ---
+        # Presence target is `label > 0` (matches the leaderboard's IoU
+        # binarization — see logs/METRIC_PROBE_REPORT.md). Previously 0.5.
         if aux_outputs is not None and "presence_logits" in aux_outputs:
-            presence_target = (targets[:, :3, :, :] > 0.5).float()
+            presence_target = (targets[:, :3, :, :] > 0).float()
             presence_loss = F.binary_cross_entropy_with_logits(
                 aux_outputs["presence_logits"], presence_target, reduction="none"
             )
             presence_loss = torch.sum(presence_loss * lc_mask) / (torch.sum(lc_mask) + 1e-6)
 
             target_height = targets[:, 3:4, :, :]
-            bld_height_mask = (targets[:, 0:1, :, :] > 0.5).float() * height_mask
-            veg_height_mask = (targets[:, 1:2, :, :] > 0.5).float() * height_mask
+            # Aux class-height supervision matches the leaderboard RMSE pixel
+            # selection (label > 0).
+            bld_height_mask = (targets[:, 0:1, :, :] > 0).float() * height_mask
+            veg_height_mask = (targets[:, 1:2, :, :] > 0).float() * height_mask
 
             def masked_l1(pred, target, mask):
                 return torch.sum(torch.abs(pred - target) * mask) / (torch.sum(mask) + 1e-6)

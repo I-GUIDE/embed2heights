@@ -47,7 +47,9 @@ DEFAULTS = {
     "weight_decay":    1e-4,
     "val_split":       0.2,
     "lambdas":         [1.0, 0.5, 0.5, 2.0],   # [MAE, SSIM, Gradient, Tversky]
-    "aux_weight":      0.25,
+    # Presence head is now the submission output for land-cover channels,
+    # so its BCE supervision is primary, not auxiliary. Bumped from 0.25.
+    "aux_weight":      1.0,
     "seed":            42,
     "model_type":      "auto",
     "amp":             True,

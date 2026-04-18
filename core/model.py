@@ -288,18 +288,27 @@ class ConvGNAct(nn.Module):
 class MultiTaskPredictionHead(nn.Module):
     """Metric-aware multi-head predictor (v2).
 
-    Improvements over v1:
+    Metric-aligned dual-head design (v3, 2026-04-17):
     - Deeper shared trunk (2-layer residual) for genuine multi-task sharing.
-    - Presence derived from fraction logits via lightweight 1x1 (no redundant head).
-    - FiLM conditioning: fraction signals modulate height features via learned
-      scale/shift, replacing raw concatenation of mismatched-scale tensors.
-    - Height deltas are non-negative (softplus on delta itself), enforcing the
-      physical constraint that buildings/vegetation only add height.
-    - Fraction-based gating: height contribution proportional to coverage, not
-      binary presence — fixes systematic over-prediction at boundaries.
-    - Shared height trunk with 3 lightweight 1x1 output projections.
+    - **Presence head** is an independent classifier on shared features (not
+      a 1x1 reparam of the fraction head). Supervised by BCE on `label > 0`,
+      it learns a calibrated binary mask whose channel outputs ARE the
+      submission's land-cover channels. Aligns directly with the leaderboard
+      metric (positive-only IoU at pred > 0.5 vs label > 0 — see
+      logs/METRIC_PROBE_REPORT.md).
+    - **Fraction head** remains as an auxiliary regressor on soft coverage,
+      supervised by MAE/SSIM/Gradient/Tversky. Its output is NOT submitted;
+      it stays inside the head to condition the height branch.
+    - FiLM conditioning and height gating use the soft `fractions` — giving
+      the height branch fine-grained coverage information (essential on edge
+      pixels where a small fraction means partial building height).
+    - Height deltas are non-negative (softplus), enforcing the physical
+      constraint that buildings/vegetation only add above ground.
 
-    Output contract: 4-channel tensor [building_frac, veg_frac, water_frac, height].
+    Output contract: 4-channel tensor [presence_building, presence_veg,
+    presence_water, height]. Channels 0-2 are calibrated probabilities in
+    [0, 1] trained with BCE on `label > 0`; threshold 0.5 at inference is the
+    natural decision boundary.
     """
 
     def __init__(self, in_ch, out_channels=4, hidden_ch=None, drop=0.05):
@@ -321,16 +330,19 @@ class MultiTaskPredictionHead(nn.Module):
         )
         self.shared_act = nn.GELU()
 
-        # --- Fraction head ---
+        # --- Fraction head (auxiliary: soft coverage regression) ---
         self.fraction_head = nn.Sequential(
             ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
             nn.Conv2d(hidden_ch, 3, 1),
         )
 
-        # --- Presence derived from fraction (lightweight, no redundant head) ---
-        self.presence_proj = nn.Conv2d(3, 3, 1)
+        # --- Presence head (main: binary classifier for submission channels 0-2) ---
+        self.presence_head = nn.Sequential(
+            ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
+            nn.Conv2d(hidden_ch, 3, 1),
+        )
 
-        # --- FiLM conditioning: fraction -> scale/shift for height features ---
+        # --- FiLM conditioning: soft fractions modulate height features ---
         self.film_scale = nn.Conv2d(3, hidden_ch, 1)
         self.film_shift = nn.Conv2d(3, hidden_ch, 1)
 
@@ -348,17 +360,17 @@ class MultiTaskPredictionHead(nn.Module):
         x = self.shared(x)
         x = self.shared_act(x + self.shared_res(x))
 
-        # Fraction prediction
+        # Auxiliary soft fraction (for height gating + regression losses)
         fraction_logits = self.fraction_head(x)
-        seg = torch.sigmoid(fraction_logits)
+        fractions = torch.sigmoid(fraction_logits)
 
-        # Presence derived from fraction logits (not a separate head)
-        presence_logits = self.presence_proj(fraction_logits)
+        # Main presence classifier (submission channels 0-2)
+        presence_logits = self.presence_head(x)
         presence_prob = torch.sigmoid(presence_logits)
 
-        # FiLM conditioning: fraction modulates height features
-        scale = self.film_scale(seg)
-        shift = self.film_shift(seg)
+        # FiLM conditioning uses soft fractions (fine-grained coverage signal)
+        scale = self.film_scale(fractions)
+        shift = self.film_shift(fractions)
         h = x * (1.0 + scale) + shift
 
         # Shared height trunk -> 3 lightweight projections
@@ -368,22 +380,26 @@ class MultiTaskPredictionHead(nn.Module):
         building_delta = F.softplus(self.height_building_delta_proj(h), threshold=20.0)
         vegetation_delta = F.softplus(self.height_vegetation_delta_proj(h), threshold=20.0)
 
-        # Absolute heights for auxiliary supervision
+        # Absolute class heights (for auxiliary supervision)
         building_height = base_height + building_delta
         vegetation_height = base_height + vegetation_delta
 
-        # Fraction-gated height: contribution proportional to coverage
+        # Fraction-gated height: partial coverage gives partial contribution.
+        # (Using fractions, not presence, keeps edge-pixel heights calibrated.)
         height = base_height \
-            + seg[:, 0:1, :, :] * building_delta \
-            + seg[:, 1:2, :, :] * vegetation_delta
-        out = torch.cat([seg, height], dim=1)
+            + fractions[:, 0:1, :, :] * building_delta \
+            + fractions[:, 1:2, :, :] * vegetation_delta
+
+        # Submission: channels 0-2 are presence_prob (binary-aligned),
+        # channel 3 is the fraction-gated height.
+        out = torch.cat([presence_prob, height], dim=1)
 
         if not return_aux:
             return out
         return {
             "out": out,
             "fraction_logits": fraction_logits,
-            "fractions": seg,
+            "fractions": fractions,
             "presence_logits": presence_logits,
             "presence_prob": presence_prob,
             "height_base": base_height,

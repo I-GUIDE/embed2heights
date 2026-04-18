@@ -4,6 +4,7 @@ data/
 # Experiment outputs (checkpoints, loss curves, predictions)
 runs/
 
+
 # Python
 __pycache__/
 *.py[cod]
@@ -12,6 +13,7 @@ __pycache__/
 dist/
 build/
 *.egg
+
 
 # Jupyter
 .ipynb_checkpoints/
@@ -34,6 +36,8 @@ Thumbs.db
 
 # logs
 logs/ISSUE_*
-
+logs/train/*
 submission/
 .claude
+.codex
+run.sbatch
