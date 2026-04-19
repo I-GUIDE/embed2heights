@@ -34,7 +34,7 @@ DEFAULTS = {
 }
 
 MODEL_CHOICES = [
-    "auto", "lightunet", "decoder", "decoder_residual",
+    "auto", "lightunet", "decoder", "decoder_residual", "token_neck",
     "embedding_refiner", "hrnet_w18", "hrnet_w32",
 ]
 

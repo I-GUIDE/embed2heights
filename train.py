@@ -32,7 +32,7 @@ DEFAULT_TRAIN_EMB = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "data", "trai
 DEFAULT_TRAIN_TAR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "data", "train", "labels"))
 
 MODEL_CHOICES = [
-    "auto", "lightunet", "decoder_residual", "embedding_refiner",
+    "auto", "lightunet", "decoder_residual", "token_neck", "embedding_refiner",
     "hrnet_w18", "hrnet_w32",
 ]
 

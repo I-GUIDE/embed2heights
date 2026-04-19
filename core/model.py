@@ -150,6 +150,123 @@ class EfficientDecoder256Fast(nn.Module):
 
 
 # ==========================================
+# 2b. NECK + U-NET DECODER FOR VIT TOKENS
+# ==========================================
+#
+# Rationale: last-layer ViT tokens at 16x16 have no native multi-scale
+# features, so a pure upsampling decoder (EfficientDecoder256Fast) has no
+# skip connections to recover fine spatial detail. The neck synthesises a
+# pseudo pyramid by projecting the single source feature into independent
+# per-scale representations (each scale learns its own 1x1 projection +
+# refinement conv), which the U-Net-style decoder then consumes as skips.
+# Inspired by the "neck" reported in the IBM ESA TerraMind challenge writeup.
+
+
+class TokenPyramidNeck(nn.Module):
+    """Produce a 4-level pseudo pyramid from a single 16x16 token grid.
+
+    Each level first 1x1-projects the source at the cheap 16x16 resolution,
+    then bilinear-upsamples, then applies a 3x3 conv to specialise per scale.
+    """
+
+    def __init__(self, in_ch=768, level_channels=(256, 128, 64, 32)):
+        super().__init__()
+        if len(level_channels) != 4:
+            raise ValueError("TokenPyramidNeck expects 4 level channel sizes")
+        c16, c32, c64, c128 = level_channels
+
+        self.level_16 = ConvGNAct(in_ch, c16, kernel_size=1, padding=0)
+
+        self.level_32 = nn.Sequential(
+            ConvGNAct(in_ch, c32, kernel_size=1, padding=0),
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+            ConvGNAct(c32, c32, kernel_size=3),
+        )
+        self.level_64 = nn.Sequential(
+            ConvGNAct(in_ch, c64, kernel_size=1, padding=0),
+            nn.Upsample(scale_factor=4, mode="bilinear", align_corners=False),
+            ConvGNAct(c64, c64, kernel_size=3),
+        )
+        self.level_128 = nn.Sequential(
+            ConvGNAct(in_ch, c128, kernel_size=1, padding=0),
+            nn.Upsample(scale_factor=8, mode="bilinear", align_corners=False),
+            ConvGNAct(c128, c128, kernel_size=3),
+        )
+
+    def forward(self, x):
+        return {
+            16: self.level_16(x),
+            32: self.level_32(x),
+            64: self.level_64(x),
+            128: self.level_128(x),
+        }
+
+
+class TokenNeckDecoder(nn.Module):
+    """U-Net-style decoder for 16x16 ViT tokens with a pseudo multi-scale neck.
+
+    Flow (input: B x 768 x 16 x 16):
+        neck -> {16:256, 32:128, 64:64, 128:32}
+        stage 16->32:  upsample(256->128) cat neck[32] -> conv -> 128
+        stage 32->64:  upsample(128->64)  cat neck[64] -> conv -> 64
+        stage 64->128: upsample(64->32)   cat neck[128]-> conv -> 32
+        stage 128->256: upsample(32->32) -> conv -> 32
+        head: MultiTaskPredictionHead(32) -> 4ch submission tensor.
+    """
+
+    def __init__(self, n_channels=768, n_classes=4,
+                 level_channels=(256, 128, 64, 32), drop=0.05):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("TokenNeckDecoder assumes 4 output channels")
+        self.supports_aux_outputs = True
+        c16, c32, c64, c128 = level_channels
+
+        self.neck = TokenPyramidNeck(n_channels, level_channels)
+
+        # Each up block: bilinear x2 + 3x3 conv to halve channels smoothly.
+        self.up_16_32 = UpsampleBlock(c16, c32)
+        self.fuse_32 = nn.Sequential(
+            ConvGNAct(c32 + c32, c32, kernel_size=3),
+            ConvGNAct(c32, c32, kernel_size=3),
+        )
+
+        self.up_32_64 = UpsampleBlock(c32, c64)
+        self.fuse_64 = nn.Sequential(
+            ConvGNAct(c64 + c64, c64, kernel_size=3),
+            ConvGNAct(c64, c64, kernel_size=3),
+        )
+
+        self.up_64_128 = UpsampleBlock(c64, c128)
+        self.fuse_128 = nn.Sequential(
+            ConvGNAct(c128 + c128, c128, kernel_size=3),
+            ConvGNAct(c128, c128, kernel_size=3),
+        )
+
+        self.up_128_256 = UpsampleBlock(c128, c128)
+        self.fuse_256 = ConvGNAct(c128, c128, kernel_size=3)
+
+        self.head = MultiTaskPredictionHead(c128, out_channels=n_classes, drop=drop)
+
+    def forward(self, x, return_aux=False):
+        pyr = self.neck(x)
+
+        x = self.up_16_32(pyr[16])
+        x = self.fuse_32(torch.cat([x, pyr[32]], dim=1))
+
+        x = self.up_32_64(x)
+        x = self.fuse_64(torch.cat([x, pyr[64]], dim=1))
+
+        x = self.up_64_128(x)
+        x = self.fuse_128(torch.cat([x, pyr[128]], dim=1))
+
+        x = self.up_128_256(x)
+        x = self.fuse_256(x)
+
+        return self.head(x, return_aux=return_aux)
+
+
+# ==========================================
 # 3. EMBEDDING REFINER (encoder-light, decoder-heavy)
 # ==========================================
 #
@@ -659,6 +776,8 @@ def build_model(model_type, n_channels, n_classes):
         selected = "decoder_residual"
     if selected == "decoder_residual":
         return EfficientDecoder256Fast(in_channels=n_channels, out_channels=n_classes), selected
+    if selected == "token_neck":
+        return TokenNeckDecoder(n_channels=n_channels, n_classes=n_classes), selected
     if selected == "embedding_refiner":
         return EmbeddingRefiner(n_channels=n_channels, n_classes=n_classes), selected
     if selected == "hrnet_w18":
@@ -668,5 +787,5 @@ def build_model(model_type, n_channels, n_classes):
 
     raise ValueError(
         f"Unknown model_type '{model_type}'. "
-        "Use one of: auto, lightunet, decoder_residual, embedding_refiner, hrnet_w18, hrnet_w32"
+        "Use one of: auto, lightunet, decoder_residual, token_neck, embedding_refiner, hrnet_w18, hrnet_w32"
     )

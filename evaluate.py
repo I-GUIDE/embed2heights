@@ -197,8 +197,7 @@ def main():
     print(f"  Weights: iou_bld={WEIGHTS['iou_buildings']:.0%}  iou_tree={WEIGHTS['iou_trees']:.0%}  "
           f"iou_wat={WEIGHTS['iou_water']:.0%}  RMSE_bH={WEIGHTS['RMSE_building_height']:.0%}  "
           f"RMSE_vH={WEIGHTS['RMSE_vegetation_height']:.0%}")
-    print("  Score = sum(iou_i * w_i) + sum(max(0, 1 - RMSE_i / 30) * w_i)   [higher is better]")
-    print("  NOTE: RMSE normalization is a placeholder; true X_class is smaller. See METRIC_PROBE_REPORT.md.")
+    print("  Score = sum(iou_i * w_i) + max(0, 1 - RMSE_bH/3.0)*w + max(0, 1 - RMSE_vH/5.0)*w   [higher is better]")
     print("=" * 90)
 
 

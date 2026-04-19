@@ -177,8 +177,8 @@ def main():
     print(f"  Weights: iou_bld={WEIGHTS['iou_buildings']:.0%}  iou_tree={WEIGHTS['iou_trees']:.0%}  "
           f"iou_wat={WEIGHTS['iou_water']:.0%}  RMSE_bH={WEIGHTS['RMSE_building_height']:.0%}  "
           f"RMSE_vH={WEIGHTS['RMSE_vegetation_height']:.0%}")
-    print(f"  Score uses placeholder RMSE ceiling from core/metrics.RMSE_NORMALIZATION "
-          f"— absolute value over-estimates leaderboard total (see METRIC_PROBE_REPORT.md).")
+    print(f"  Score uses per-class RMSE ceilings from core/metrics.RMSE_NORMALIZATION "
+          f"(building=3.0m, vegetation=5.0m).")
 
 
 if __name__ == "__main__":

@@ -43,7 +43,8 @@ Labels are **continuous**, not discrete categories — each pixel stores the per
 
 - Pixel-aligned embeddings preserve full 256x256 spatial resolution — decoders can use skip connections directly.
 - ViT token embeddings are 16x spatially downsampled — decoders must upsample from 16x16 to 256x256.
-- Test set contains only S2 variants (no S1).
+- Train and test sets contain the same embedding families, including both S1 and S2 variants for TerraMind and THOR.
+
 
 ---
 

@@ -35,8 +35,8 @@ Thumbs.db
 
 
 # logs
-logs/ISSUE_*
-logs/train/*
+!logs/GOAL.md
+# logs/train/*
 submission/
 .claude
 .codex

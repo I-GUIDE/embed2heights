@@ -34,10 +34,11 @@ WEIGHTS = {
 # positive). See METRIC_PROBE_REPORT.md.
 LABEL_THRESHOLD = 0.0
 
-# Placeholder for `max(0, 1 - RMSE / X)` — X_class is unknown (bounded by
-# X_bld < 4m, X_veg < 10.9m from the probe). Using 30 over-estimates the RMSE
-# contribution, but IoU portion and model ranking are correct.
-RMSE_NORMALIZATION = 30.0
+# Per-class RMSE normalization for `max(0, 1 - RMSE / X)`.
+RMSE_NORMALIZATION = {
+    "RMSE_building_height":   3.0,
+    "RMSE_vegetation_height": 5.0,
+}
 
 
 def binary_iou(pred_mask, true_mask):
@@ -65,7 +66,8 @@ def compute_weighted_score(metrics, max_height=RMSE_NORMALIZATION):
     Combine the 5 leaderboard metrics into a single score.
 
     IoU metrics: higher is better (0-1), weighted directly.
-    RMSE metrics: `max(0, 1 - RMSE / max_height)` then weighted.
+    RMSE metrics: `max(0, 1 - RMSE / max_height[key])` then weighted.
+    `max_height` can be a dict keyed by metric name, or a scalar applied to all.
     """
     parts = {}
     for key, weight in WEIGHTS.items():
@@ -73,7 +75,8 @@ def compute_weighted_score(metrics, max_height=RMSE_NORMALIZATION):
         if np.isnan(value):
             parts[key] = float("nan")
         elif "RMSE" in key:
-            parts[key] = max(0.0, 1.0 - value / max_height) * weight
+            norm = max_height[key] if isinstance(max_height, dict) else max_height
+            parts[key] = max(0.0, 1.0 - value / norm) * weight
         else:
             parts[key] = value * weight
     score = sum(v for v in parts.values() if not np.isnan(v))

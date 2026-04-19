@@ -103,35 +103,59 @@ def main():
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    # Always zip from on-disk files so the ZIP entries inherit the same Unix
-    # file-mode `external_attr` (0x81800000) that the dummy probe used —
-    # some strict server-side parsers reject entries written via
-    # `writestr`, which leaves `external_attr` = 0x01800000 (missing the
-    # S_IFREG bit). For the binarize path we materialize the transformed
-    # files to a temp directory before zipping.
+    # We always materialize the (possibly transformed) files into a temp
+    # `predictions/` subdirectory and then shell out to the system `zip`
+    # command (Info-ZIP). Python's zipfile module produces archives whose
+    # ZipInfo fields (no UT extra timestamps, placeholder 1980 date_time,
+    # lower create_version) have been observed to hang strict server-side
+    # parsers — the known-working submissions were all created by Info-ZIP
+    # via the `zip` CLI. Shelling out gives us byte-pattern-identical
+    # output to those working zips.
     import shutil
+    import subprocess
     import tempfile
+
+    zip_cli = shutil.which("zip")
+    if zip_cli is None:
+        raise RuntimeError(
+            "/usr/bin/zip (Info-ZIP) not found on PATH. "
+            "This tool requires it to produce a server-compatible archive."
+        )
+
     with tempfile.TemporaryDirectory(prefix="make_submission_") as tmpd:
+        tmp_path = Path(tmpd)
+        pred_dir_in_tmp = tmp_path / "predictions"
+        pred_dir_in_tmp.mkdir()
+
         if args.binarize_thresholds is None:
-            source_files = [(f, f.name) for f in files]
+            print(f"Staging {len(files)} files (no transform) to {pred_dir_in_tmp}")
+            for npy in files:
+                shutil.copy2(npy, pred_dir_in_tmp / npy.name)
         else:
             thr = np.asarray(args.binarize_thresholds, dtype=np.float32)
             print(f"Binarizing class channels at thresholds {tuple(float(t) for t in thr)} (bld, veg, wat)")
-            tmp_path = Path(tmpd)
             for npy in files:
                 arr = np.load(npy).astype(np.float32)
                 for c in range(3):
                     arr[c] = (arr[c] > thr[c]).astype(np.float32)
-                dst = tmp_path / npy.name
-                np.save(dst, arr)
-            source_files = [(tmp_path / f.name, f.name) for f in files]
+                np.save(pred_dir_in_tmp / npy.name, arr)
 
-        with zipfile.ZipFile(args.output, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-            for src, name in source_files:
-                zf.write(src, arcname=f"predictions/{name}")
+        # Remove any pre-existing output zip so `zip` creates a fresh archive.
+        if args.output.exists():
+            args.output.unlink()
+
+        print(f"Zipping via {zip_cli} -r ...")
+        proc = subprocess.run(
+            [zip_cli, "-r", "-q", str(args.output.absolute()), "predictions"],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"zip failed (rc={proc.returncode}):\n{proc.stderr}")
 
     size_mb = args.output.stat().st_size / (1024 * 1024)
-    print(f"\nSubmission written: {args.output}  ({size_mb:.1f} MB, {len(files)} entries)")
+    print(f"\nSubmission written: {args.output}  ({size_mb:.1f} MB, {len(files)} entries + 1 dir)")
     print(f"Internal layout: predictions/<id>.npy")
 
 
