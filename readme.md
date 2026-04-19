@@ -185,13 +185,3 @@ Same head (`MultiTaskPredictionHead` v35), same train/val split (`splits/split.j
 
 AlphaEarth dominates every sub-metric — unsurprising, since it is already a pixel-aligned GFM. The ViT-token sources (TerraMind S1/S2, THOR S1/S2) cluster tightly around 0.46–0.48 and are nearly indistinguishable at this head/decoder budget; building IoU in particular collapses (<4%), suggesting the 16×16 → 256×256 decoder is the bottleneck for sharp boundary classes rather than the embedding itself. Tessera — pixel-aligned at 128ch and trained with the same `lightunet` head as AlphaEarth — still lands in the same 0.46 band (building IoU 1.2%), which isolates the gap to the embedding itself rather than to the pixel-vs-token decoder choice.
 
-## Experiment history
-
-| Report                                                      | Summary                                                                |
-|-------------------------------------------------------------|------------------------------------------------------------------------|
-| [logs/BASELINE_REPORT.md](logs/BASELINE_REPORT.md)          | Original 6-embedding comparison (**uses pre-probe metric — see banner**)|
-| [logs/ALPHAEARTH_BACKBONE_REPORT.md](logs/ALPHAEARTH_BACKBONE_REPORT.md) | LightUNet vs EmbeddingRefiner vs HRNet-W{18,32} on AlphaEarth  |
-| [logs/BEST_RESULT.md](logs/BEST_RESULT.md)                  | Current champion (weighted ensemble of W18 + LightUNet + Refiner)      |
-| [logs/METRIC_PROBE_REPORT.md](logs/METRIC_PROBE_REPORT.md)  | Metric formula reverse-engineering                                     |
-| [logs/LABEL_BAND_ANALYSIS.md](logs/LABEL_BAND_ANALYSIS.md)  | Label distribution, nodata, class imbalance                            |
-| [logs/GOAL.md](logs/GOAL.md)                                | Challenge-level background                                             |
