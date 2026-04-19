@@ -141,7 +141,8 @@ class ImprovedCompositeLoss(nn.Module):
     4. Structure-Boosted Height MAE.
     """
 
-    def __init__(self, lambdas=[1.0, 0.5, 0.5, 2.0], bg_weight=0.05):
+    def __init__(self, lambdas=[1.0, 0.5, 0.5, 2.0], bg_weight=0.05,
+                 aux_weight=0.25):
         super().__init__()
         self.ssim = SSIMLoss(window_size=11)
         self.gdl = GradientDifferenceLoss()
@@ -155,6 +156,7 @@ class ImprovedCompositeLoss(nn.Module):
         self.w_structure = lambdas[3]  # Represents both Tversky and Building-Height weights
 
         self.bg_weight = bg_weight
+        self.aux_weight = aux_weight
 
         # Height is now normalized, so we weight all 4 channels equally in base MAE
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
@@ -162,12 +164,17 @@ class ImprovedCompositeLoss(nn.Module):
     def forward(self, preds, targets, valid_mask=None):
         """
         Args:
-            preds:      (B, 4, H, W) model predictions
+            preds:      (B, 4, H, W) model predictions, or a dict with
+                        preds["out"] plus optional auxiliary heads
             targets:    (B, 4, H, W) ground truth
             valid_mask: (B, 2, H, W) float mask. Channel 0 = global validity (for land cover),
                         Channel 1 = height validity (global + nDSM hole exclusion).
                         If None, all pixels are valid.
         """
+        aux_outputs = preds if isinstance(preds, dict) else None
+        if aux_outputs is not None:
+            preds = aux_outputs["out"]
+
         device = preds.device
         mae_weights = self.mae_weights.to(device)
 
@@ -184,8 +191,20 @@ class ImprovedCompositeLoss(nn.Module):
         global_1ch = global_mask.squeeze(1)       # (B, H, W)
         height_1ch = height_mask.squeeze(1)       # (B, H, W)
 
+        # With the dual-head design (v3), submission channels 0-2 of `preds`
+        # are presence_prob (binary-aligned), so the soft-regression losses
+        # (MAE/SSIM/Gradient/Tversky on land cover) must target the auxiliary
+        # `fractions` instead, which is still a soft [0,1] coverage regressor.
+        # Height (channel 3) continues to come from `preds[:, 3]`.
+        if aux_outputs is not None and "fractions" in aux_outputs:
+            class_pred = aux_outputs["fractions"]  # (B, 3, H, W) — soft fractions
+        else:
+            class_pred = preds[:, :3, :, :]        # fallback for models without a split head
+
+        reg_pred = torch.cat([class_pred, preds[:, 3:4, :, :]], dim=1)  # (B, 4, H, W) for MAE
+
         # --- 1. Base MAE (Foreground / Background Split) with nodata masking ---
-        abs_err = torch.abs(preds - targets)
+        abs_err = torch.abs(reg_pred - targets)
         fg_mask = (targets > 0).float() * ch_mask
         bg_mask = (1.0 - (targets > 0).float()) * ch_mask
 
@@ -201,21 +220,21 @@ class ImprovedCompositeLoss(nn.Module):
         # --- 2. Structural & Gradient Loss on Land Cover Only ---
         # Zero out predictions at nodata pixels so they match targets (no spurious loss)
         lc_mask = global_mask.expand(-1, 3, -1, -1)       # (B, 3, H, W)
-        lc_pred = preds[:, :3, :, :] * lc_mask
+        lc_pred = class_pred * lc_mask
         lc_target = targets[:, :3, :, :] * lc_mask
 
         loss_ssim = self.ssim(lc_pred, lc_target)
         loss_grad = self.gdl(lc_pred, lc_target)
 
-        # --- 3. Multi-Class Tversky Loss with nodata masking (global mask for land cover) ---
+        # --- 3. Multi-Class Tversky Loss on the auxiliary soft fractions ---
         # Pass the mask explicitly so invalid pixels are excluded from TP/FP/FN
         # (no dilution from zero-filled nodata regions).
         gm_bool = global_1ch.bool()
-        t_build = self.tversky(torch.relu(preds[:, 0, :, :]),
+        t_build = self.tversky(torch.relu(class_pred[:, 0, :, :]),
                                targets[:, 0, :, :], valid_mask=gm_bool)
-        t_veg = self.tversky(torch.relu(preds[:, 1, :, :]),
+        t_veg = self.tversky(torch.relu(class_pred[:, 1, :, :]),
                              targets[:, 1, :, :], valid_mask=gm_bool)
-        t_water = self.tversky(torch.relu(preds[:, 2, :, :]),
+        t_water = self.tversky(torch.relu(class_pred[:, 2, :, :]),
                                targets[:, 2, :, :], valid_mask=gm_bool)
 
         loss_tversky = (t_build + t_veg + t_water) / 3.0
@@ -229,10 +248,67 @@ class ImprovedCompositeLoss(nn.Module):
         loss_height_boost = torch.sum(height_err * (1.0 + 5.0 * build_presence_mask)) / height_valid_count
 
         # --- Combine Total Loss ---
-        total_loss = (self.w_mae * loss_mae) + \
-                     (self.w_ssim * loss_ssim) + \
-                     (self.w_grad * loss_grad) + \
-                     (self.w_structure * loss_tversky) + \
-                     (self.w_structure * loss_height_boost)
+        weighted_mae = self.w_mae * loss_mae
+        weighted_ssim = self.w_ssim * loss_ssim
+        weighted_grad = self.w_grad * loss_grad
+        weighted_tversky = self.w_structure * loss_tversky
+        weighted_height_boost = self.w_structure * loss_height_boost
+        total_loss = weighted_mae + weighted_ssim + weighted_grad + \
+            weighted_tversky + weighted_height_boost
 
-        return total_loss, loss_mae, loss_ssim, loss_grad, loss_tversky
+        # --- 5. Auxiliary supervision for the dual-head model ---
+        # Presence target is `label > 0` (matches the leaderboard's IoU
+        # binarization — see logs/METRIC_PROBE_REPORT.md). Previously 0.5.
+        zero = torch.zeros((), device=device, dtype=preds.dtype)
+        presence_loss = zero
+        aux_height_building_loss = zero
+        aux_height_vegetation_loss = zero
+        if aux_outputs is not None and "presence_logits" in aux_outputs:
+            presence_target = (targets[:, :3, :, :] > 0).float()
+            presence_loss = F.binary_cross_entropy_with_logits(
+                aux_outputs["presence_logits"], presence_target, reduction="none"
+            )
+            presence_loss = torch.sum(presence_loss * lc_mask) / (torch.sum(lc_mask) + 1e-6)
+
+            target_height = targets[:, 3:4, :, :]
+            # Aux class-height supervision matches the leaderboard RMSE pixel
+            # selection (label > 0).
+            bld_height_mask = (targets[:, 0:1, :, :] > 0).float() * height_mask
+            veg_height_mask = (targets[:, 1:2, :, :] > 0).float() * height_mask
+
+            def masked_l1(pred, target, mask):
+                return torch.sum(torch.abs(pred - target) * mask) / (torch.sum(mask) + 1e-6)
+
+            if "height_building" in aux_outputs:
+                aux_height_building_loss = masked_l1(
+                    aux_outputs["height_building"], target_height, bld_height_mask
+                )
+            if "height_vegetation" in aux_outputs:
+                aux_height_vegetation_loss = masked_l1(
+                    aux_outputs["height_vegetation"], target_height, veg_height_mask
+                )
+
+            total_loss = total_loss + self.aux_weight * (
+                presence_loss + aux_height_building_loss + aux_height_vegetation_loss
+            )
+
+        aux_height_loss = aux_height_building_loss + aux_height_vegetation_loss
+        components = {
+            "mae": loss_mae,
+            "ssim": loss_ssim,
+            "grad": loss_grad,
+            "tversky": loss_tversky,
+            "height_boost": loss_height_boost,
+            "presence_bce": presence_loss,
+            "aux_height_building": aux_height_building_loss,
+            "aux_height_vegetation": aux_height_vegetation_loss,
+            "aux_height": aux_height_loss,
+            "weighted_mae": weighted_mae,
+            "weighted_ssim": weighted_ssim,
+            "weighted_grad": weighted_grad,
+            "weighted_tversky": weighted_tversky,
+            "weighted_height_boost": weighted_height_boost,
+            "weighted_presence_bce": self.aux_weight * presence_loss,
+            "weighted_aux_height": self.aux_weight * aux_height_loss,
+        }
+        return total_loss, components

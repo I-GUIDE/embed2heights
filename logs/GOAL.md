@@ -43,7 +43,8 @@ Labels are **continuous**, not discrete categories — each pixel stores the per
 
 - Pixel-aligned embeddings preserve full 256x256 spatial resolution — decoders can use skip connections directly.
 - ViT token embeddings are 16x spatially downsampled — decoders must upsample from 16x16 to 256x256.
-- Test set contains only S2 variants (no S1).
+- Train and test sets contain the same embedding families, including both S1 and S2 variants for TerraMind and THOR.
+
 
 ---
 
@@ -53,26 +54,50 @@ Labels are **continuous**, not discrete categories — each pixel stores the per
 
 | Metric | Weight | Task | Better |
 |---|---|---|---|
-| **mIoU_buildings** | 25% | Segmentation | Higher |
-| **mIoU_trees** | 15% | Segmentation | Higher |
-| **mIoU_water** | 15% | Segmentation | Higher |
+| **iou_buildings** | 25% | Segmentation | Higher |
+| **iou_trees** | 15% | Segmentation | Higher |
+| **iou_water** | 15% | Segmentation | Higher |
 | **RMSE_building_height** | 25% | Height regression | Lower |
 | **RMSE_vegetation_height** | 20% | Height regression | Lower |
 
-### Metric Definitions
+### Metric Definitions (verified 2026-04-17 via dummy-probe submission)
 
-- **mIoU** = mean(IoU_positive, IoU_negative) for binary segmentation at threshold 0.5. Predictions and labels are both binarized before computing IoU.
-- **RMSE** = root mean squared error of predicted height vs. ground truth, computed **only on pixels where the GT class is present** (building pixels for building height, vegetation pixels for vegetation height).
+Official definitions were not disclosed in the rules / Data page / starter
+notebook. They were reverse-engineered from an all-zero submission on
+2026-04-17 — see [METRIC_PROBE_REPORT.md](METRIC_PROBE_REPORT.md) for the
+full derivation.
+
+- **IoU_class (positive-only, per-image)**
+  For each test patch, binarize the label channel with `label > 0` (ANY
+  nonzero fraction counts as positive) and the prediction channel with
+  `pred > pred_threshold` (submitter-controlled; 0.5 is conventional).
+  Compute `|P ∩ T| / |P ∪ T|` for the positive class only. When **both**
+  P and T are empty, IoU = 1.0 (sklearn `zero_division=1.0` convention).
+  When exactly one is empty, IoU = 0.0. Final class metric = mean of
+  per-image IoU over all test samples.
+
+- **RMSE_class (per-image macro, GT-masked)**
+  For each test patch, compute `sqrt(mean((pred_height - gt_height)² on
+  pixels where gt_class > 0))`. Skip patches where no gt pixel passes.
+  Final metric = mean of per-image RMSE over all remaining samples.
+  **Per-image** averaging, NOT global pixel-accumulated.
 
 ### Composite Score Formula
 
 ```
-Score = sum(mIoU_i * w_i) + sum((1 - RMSE_i / 30) * w_i)
+Score = sum(iou_class * w_class) + sum(max(0, 1 - RMSE_class / X_class) * w_class)
 ```
 
-- All terms are normalized to [0, 1]. **Higher is better.**
-- 30 meters is the normalization ceiling for RMSE — predictions with RMSE >= 30m contribute 0 to the score.
-- Building segmentation (25%) and building height (25%) together account for **50%** of the total score — buildings are the most important class.
+- IoU portion is confirmed exactly (matched leaderboard to 4 decimals).
+- RMSE portion uses `max(0, 1 - RMSE/X)` per class. `X_class` (normalization
+  ceiling) is UNKNOWN but small: X_building < 4m and X_vegetation < 10.9m
+  (our dummy's RMSE values clamped both contributions to 0). A follow-up
+  probe with nonzero height predictions is needed to pin X down.
+- **Common misconception (what we had before)**: it is NOT `mean(IoU_pos,
+  IoU_neg)` at threshold 0.5, and RMSE is NOT `/30` global pixel-level.
+  Both were plausible defaults that diverged from the actual leaderboard
+  metric, which is why pre-2026-04-17 local val scores ran ~0.25-0.35
+  higher than the leaderboard.
 
 ### Submission Format
 

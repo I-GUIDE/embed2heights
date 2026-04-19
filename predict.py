@@ -1,123 +1,153 @@
+"""
+Load a trained model and write per-patch predictions as .npy files.
+
+Two modes:
+  - Paired (validation): --test-targets-dir given, filenames use `core_id.npy`.
+  - Label-free (test set submission): no --test-targets-dir, filenames include
+    the year suffix required by the leaderboard (`<core>_<region>_<year>.npy`).
+"""
 import os
 import argparse
 import numpy as np
 import torch
+import rasterio
 from tqdm.auto import tqdm
 
-# --- IMPORT FROM CORE MODULES ---
 from core.model import build_model
 from core.dataset import (
-    PixelEmbeddingDataset, LatentTokenDataset,
-    find_file_pairs, find_embedding_files,
-    _submission_id,
+    find_file_pairs,
+    find_embedding_files,
+    normalize_core_id,
+    submission_id,
+    pick_dataset_class,
     HEIGHT_NORM_CONSTANT,
 )
 
-# --- DEFAULTS ---
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-EXPERIMENT_NAME = "terramind_decoder_run01"
-BASE_DIR = os.path.join(SCRIPT_DIR, "runs")
-MODEL_TYPE = "decoder_residual"
-PATCH_SIZE = 256
-MAX_SAMPLES = 0
 
-if torch.cuda.is_available():
-    DEVICE = torch.device("cuda")
-elif torch.backends.mps.is_available():
-    DEVICE = torch.device("mps")
-else:
-    DEVICE = torch.device("cpu")
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULTS = {
+    "experiment_name": "terramind_decoder_run01",
+    "base_dir": os.path.join(SCRIPT_DIR, "runs"),
+    "model_type": "decoder_residual",
+    "patch_size": 256,
+    "max_samples": 0,
+}
+
+MODEL_CHOICES = [
+    "auto", "lightunet", "decoder", "decoder_residual", "token_neck",
+    "embedding_refiner", "hrnet_w18", "hrnet_w32",
+]
+
+
+def select_device():
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    return torch.device("cpu")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Load a trained model and run inference, saving predictions as .npy files."
-    )
-    parser.add_argument("--experiment-name", type=str, default=EXPERIMENT_NAME)
-    parser.add_argument("--base-dir", type=str, default=BASE_DIR,
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--experiment-name", default=DEFAULTS["experiment_name"])
+    parser.add_argument("--base-dir", default=DEFAULTS["base_dir"],
                         help="Root directory containing experiment subfolders.")
-    parser.add_argument("--model-type", type=str, default=MODEL_TYPE,
-                        choices=["auto", "lightunet", "decoder", "decoder_residual"],
+    parser.add_argument("--model-type", default=DEFAULTS["model_type"], choices=MODEL_CHOICES,
                         help="Model architecture used during training.")
-    parser.add_argument("--model-path", type=str, default=None,
+    parser.add_argument("--model-path", default=None,
                         help="Path to the .pth checkpoint. Defaults to <base-dir>/<experiment-name>/model_best.pth.")
-    parser.add_argument("--test-embeddings-dir", type=str, required=True,
+    parser.add_argument("--test-embeddings-dir", required=True,
                         help="Directory containing embedding .tif files.")
-    parser.add_argument("--test-targets-dir", type=str, default=None,
-                        help="Directory containing label .tif files. Optional — when omitted, "
-                             "runs label-free inference (for competition test set).")
-    parser.add_argument("--predictions-dir", type=str, default=None,
+    parser.add_argument("--test-targets-dir", default=None,
+                        help="Optional directory of label .tif files. When omitted, "
+                             "runs label-free inference (competition test set).")
+    parser.add_argument("--predictions-dir", default=None,
                         help="Output directory for .npy predictions. Defaults to <base-dir>/<experiment-name>/predictions.")
-    parser.add_argument("--patch-size", type=int, default=PATCH_SIZE)
-    parser.add_argument("--max-samples", type=int, default=MAX_SAMPLES,
+    parser.add_argument("--patch-size", type=int, default=DEFAULTS["patch_size"])
+    parser.add_argument("--max-samples", type=int, default=DEFAULTS["max_samples"],
                         help="Limit inference to N samples (0 = all).")
+    parser.add_argument("--thresholds", type=float, nargs=3, default=None,
+                        metavar=("BLD", "VEG", "WAT"),
+                        help="Optional per-class thresholds to bake into the output. "
+                             "When set, class channels (0-2) are written as {0.0, 1.0} "
+                             "using pred > threshold. Default keeps raw sigmoid probs "
+                             "(recommended — lets you sweep thresholds later).")
     return parser.parse_args()
+
+
+def resolve_inputs(args):
+    """Return a list of embedding paths (label-free) or (emb, label) tuples."""
+    if args.test_targets_dir:
+        pairs = find_file_pairs(args.test_embeddings_dir, args.test_targets_dir)
+        if not pairs:
+            raise RuntimeError("No matching file pairs found. Check --test-embeddings-dir and --test-targets-dir.")
+        return pairs
+    emb_files = find_embedding_files(args.test_embeddings_dir)
+    if not emb_files:
+        raise RuntimeError(f"No .tif files found in {args.test_embeddings_dir}")
+    return emb_files
 
 
 def main():
     args = parse_args()
+    device = select_device()
 
     exp_dir = os.path.join(args.base_dir, args.experiment_name)
     model_path = args.model_path or os.path.join(exp_dir, "model_best.pth")
     predictions_dir = args.predictions_dir or os.path.join(exp_dir, "predictions")
-
     os.makedirs(predictions_dir, exist_ok=True)
 
-    # --- Load data ---
-    if args.test_targets_dir:
-        # Paired mode: match embeddings to labels
-        print(f"Loading file pairs from embeddings: {args.test_embeddings_dir}")
-        pairs = find_file_pairs(args.test_embeddings_dir, args.test_targets_dir)
-        if not pairs:
-            raise RuntimeError("No matching file pairs found. Check --test-embeddings-dir and --test-targets-dir.")
-    else:
-        # Label-free mode: list embedding files only (competition test set)
-        print(f"Loading embeddings (label-free): {args.test_embeddings_dir}")
-        emb_files = find_embedding_files(args.test_embeddings_dir)
-        if not emb_files:
-            raise RuntimeError(f"No .tif files found in {args.test_embeddings_dir}")
-        pairs = emb_files  # list of strings, dataset classes handle this
-
+    inputs = resolve_inputs(args)
     if args.max_samples > 0:
-        pairs = pairs[:args.max_samples]
+        inputs = inputs[:args.max_samples]
 
-    is_lightunet = args.model_type.lower() == "lightunet"
-    if is_lightunet:
-        test_ds = PixelEmbeddingDataset(pairs, patch_size=args.patch_size, is_train=False)
+    sample_emb_path = inputs[0][0] if isinstance(inputs[0], tuple) else inputs[0]
+    with rasterio.open(sample_emb_path) as src:
+        n_channels = src.count
+
+    DatasetCls = pick_dataset_class(args.model_type, n_channels)
+    if DatasetCls.__name__ == "LatentTokenDataset":
+        test_ds = DatasetCls(inputs, patch_size=args.patch_size, scale_factor=16, is_train=False)
     else:
-        test_ds = LatentTokenDataset(pairs, patch_size=args.patch_size, scale_factor=16, is_train=False)
+        test_ds = DatasetCls(inputs, patch_size=args.patch_size, is_train=False)
 
-    # --- Load model ---
     sample_img, _, _ = test_ds[0]
     model, selected_model = build_model(args.model_type, n_channels=sample_img.shape[0], n_classes=4)
-    model = model.to(DEVICE)
-    model.load_state_dict(torch.load(model_path, map_location=DEVICE))
+    model = model.to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     print(f"Loaded model: {selected_model} from {model_path} (input channels={sample_img.shape[0]})")
+    if args.thresholds is not None:
+        print(f"Baking per-class thresholds into output: bld={args.thresholds[0]}, "
+              f"veg={args.thresholds[1]}, wat={args.thresholds[2]}")
 
-    # --- Run inference ---
     print(f"Running inference on {len(test_ds)} samples...")
     with torch.no_grad():
+        pred_shape = None
         for i in tqdm(range(len(test_ds)), desc="Predicting"):
             img_tensor, _, _ = test_ds[i]
-            img_batch = img_tensor.unsqueeze(0).to(DEVICE)
+            img_batch = img_tensor.unsqueeze(0).to(device)
 
             output_batch = model(img_batch)
-            pred_np = output_batch.squeeze().cpu().numpy().astype(np.float32)
+            pred = output_batch.squeeze().cpu().numpy().astype(np.float32)
 
-            # Denormalize height channel: model output [0,1] -> physical meters
-            pred_np[3] = pred_np[3] * HEIGHT_NORM_CONSTANT
+            # Model emits height / HEIGHT_NORM_CONSTANT; rescale to meters.
+            pred[3] = pred[3] * HEIGHT_NORM_CONSTANT
+
+            if args.thresholds is not None:
+                for c, t in enumerate(args.thresholds):
+                    pred[c] = (pred[c] > t).astype(np.float32)
 
             emb_path = test_ds.file_pairs[i][0]
-            # Submission format: '<id>_<region>_<year>.npy' (no 'pred_' prefix,
-            # year preserved).
-            sub_id = _submission_id(emb_path)
-
-            save_path = os.path.join(predictions_dir, f"{sub_id}.npy")
-            np.save(save_path, pred_np)
+            # Submission format keeps the year suffix; val mode normalizes it
+            # away so predictions can be matched to labels by core id.
+            out_id = submission_id(emb_path) if args.test_targets_dir is None else normalize_core_id(emb_path)
+            np.save(os.path.join(predictions_dir, f"{out_id}.npy"), pred)
+            pred_shape = pred.shape
 
     print(f"Predictions saved to: {predictions_dir}")
-    print(f"Output shape per file: {pred_np.shape}  [building%, veg%, water%, height_m]")
+    if pred_shape is not None:
+        print(f"Output shape per file: {pred_shape}  [building%, veg%, water%, height_m]")
 
 
 if __name__ == "__main__":

@@ -9,62 +9,70 @@ from torch.utils.data import Dataset
 
 HEIGHT_NORM_CONSTANT = 30.0
 
-def _normalize_core_id(filename):
-    """
-    Extracts the pure core ID by stripping all known prefixes,
-    embedding suffixes, and year suffixes.
+# Backbones that consume pixel-aligned 256x256 embeddings. Everything else is
+# treated as 16x16 ViT tokens and routed through the upsampling decoder.
+PIXEL_MODEL_TYPES = ("lightunet", "embedding_refiner", "hrnet_w18", "hrnet_w32")
+TOKEN_MODEL_TYPES = ("decoder", "decoder_residual")
 
-    Handles both train and test naming conventions:
-      Train: gee_emb_0000_BE.tif, tessera_emb_0000_BE.tif, s2_0000_BE_2023_embeddings.tif
-      Test:  emb_3001_BE_2023_quantized.tif, 3001_BE_2023_merged.tif, s2_3001_BE_2023_embedding.tif
-    """
-    base = os.path.splitext(os.path.basename(filename))[0]
+_EMB_PREFIXES = ("gee_emb_", "tessera_emb_", "emb_", "s2_", "s1_")
+_EMB_SUFFIXES = ("_embedding", "_embeddings", "_quantized", "_merged")
+_YEAR_RE = re.compile(r"_\d{4}$")
 
-    # 1. Strip label / prediction prefixes
-    if base.startswith("label_"):
-        base = base[len("label_"):]
-    if base.startswith("pred_"):
-        base = base[len("pred_"):]
 
-    # 2. Strip embedding prefixes (order matters: longer prefixes first)
-    for prefix in ("gee_emb_", "tessera_emb_", "emb_", "s2_", "s1_"):
+def _strip_prefixes(base, prefixes):
+    for prefix in prefixes:
         if base.startswith(prefix):
-            base = base[len(prefix):]
-            break
-
-    # 3. Strip trailing embedding/test suffixes
-    for suffix in ("_embedding", "_embeddings", "_quantized", "_merged"):
-        if base.endswith(suffix):
-            base = base[:-len(suffix)]
-
-    # 4. Strip trailing year suffixes (e.g., '_2021', '_2023')
-    base = re.sub(r'_\d{4}$', '', base)
-
+            return base[len(prefix):]
     return base
 
 
-def _submission_id(filename):
+def _strip_suffixes(base, suffixes):
+    for suffix in suffixes:
+        if base.endswith(suffix):
+            return base[:-len(suffix)]
+    return base
+
+
+def normalize_core_id(filename):
     """
-    Extracts the submission file id from a test embedding filename,
-    preserving the year suffix required by the leaderboard.
+    Core ID with year suffix stripped. Used to match embeddings to labels and
+    to key a split file across sensors/years.
+
+    Handles train/test naming, e.g.
+      Train: gee_emb_0000_BE.tif, tessera_emb_0000_BE.tif, s2_0000_BE_2023_embeddings.tif
+      Test:  emb_3001_BE_2023_quantized.tif, s2_3001_BE_2023_embedding.tif
+    """
+    base = os.path.splitext(os.path.basename(filename))[0]
+    base = _strip_prefixes(base, ("label_", "pred_"))
+    base = _strip_prefixes(base, _EMB_PREFIXES)
+    base = _strip_suffixes(base, _EMB_SUFFIXES)
+    return _YEAR_RE.sub("", base)
+
+
+def submission_id(filename):
+    """
+    Leaderboard submission id — same as `normalize_core_id` but keeps the
+    '_YYYY' year suffix that the submission format requires.
 
     Example: 'emb_3001_BE_2023_quantized.tif' -> '3001_BE_2023'
     """
     base = os.path.splitext(os.path.basename(filename))[0]
+    base = _strip_prefixes(base, _EMB_PREFIXES)
+    return _strip_suffixes(base, _EMB_SUFFIXES)
 
-    # Strip known prefixes (same set as _normalize_core_id, minus pred_/label_)
-    for prefix in ("gee_emb_", "tessera_emb_", "emb_", "s2_", "s1_"):
-        if base.startswith(prefix):
-            base = base[len(prefix):]
-            break
 
-    # Strip trailing embedding/test suffixes
-    for suffix in ("_embedding", "_embeddings", "_quantized", "_merged"):
-        if base.endswith(suffix):
-            base = base[:-len(suffix)]
+def pick_dataset_class(model_type, n_channels):
+    """Resolve (model_type, n_channels) to the right Dataset subclass.
 
-    # Keep the '_YYYY' year suffix — required by submission format.
-    return base
+    `model_type == 'auto'` routes by channel count (the rough pixel vs ViT-token
+    discriminator); an explicit model type routes by the PIXEL_MODEL_TYPES list.
+    """
+    mt = model_type.lower()
+    if mt == "auto":
+        is_pixel = n_channels < 512
+    else:
+        is_pixel = mt in PIXEL_MODEL_TYPES
+    return PixelEmbeddingDataset if is_pixel else LatentTokenDataset
 
 
 def find_file_pairs(emb_dir, tar_dir):
@@ -81,12 +89,12 @@ def find_file_pairs(emb_dir, tar_dir):
     # 2. Build a fast lookup dictionary for the labels: {normalized_id: full_path}
     label_map = {}
     for l_path in label_files:
-        norm_id = _normalize_core_id(l_path)
+        norm_id = normalize_core_id(l_path)
         label_map[norm_id] = l_path
 
     # 3. Match embeddings to the lookup dictionary instantly
     for e_path in emb_files:
-        norm_id = _normalize_core_id(e_path)
+        norm_id = normalize_core_id(e_path)
 
         if norm_id in label_map:
             pairs.append((e_path, label_map[norm_id]))
@@ -107,8 +115,8 @@ def find_embedding_files(emb_dir):
 def save_split(split_path, train_pairs, val_pairs):
     """Save train/val split to a JSON file using normalized core IDs."""
     data = {
-        "train": [_normalize_core_id(e) for e, _ in train_pairs],
-        "val": [_normalize_core_id(e) for e, _ in val_pairs],
+        "train": [normalize_core_id(e) for e, _ in train_pairs],
+        "val": [normalize_core_id(e) for e, _ in val_pairs],
     }
     with open(split_path, "w") as f:
         json.dump(data, f, indent=2)
@@ -125,7 +133,7 @@ def load_split(split_path, all_pairs):
 
     train_pairs, val_pairs = [], []
     for pair in all_pairs:
-        core_id = _normalize_core_id(pair[0])
+        core_id = normalize_core_id(pair[0])
         if core_id in train_ids:
             train_pairs.append(pair)
         elif core_id in val_ids:
@@ -177,7 +185,7 @@ class PixelEmbeddingDataset(Dataset):
             # Pack into (2, H, W): channel 0 = global, channel 1 = height-specific
             valid_mask = np.stack([global_valid, height_valid], axis=0).astype(np.float32)
             target = raw_target
-            target[3, :, :] = np.clip(target[3, :, :] / HEIGHT_NORM_CONSTANT, 0.0, 1.5)
+            target[3, :, :] = np.maximum(target[3, :, :], 0.0) / HEIGHT_NORM_CONSTANT
         else:
             target = np.zeros((4, image.shape[1], image.shape[2]), dtype=np.float32)
             valid_mask = np.ones((2, image.shape[1], image.shape[2]), dtype=np.float32)
@@ -247,7 +255,7 @@ class LatentTokenDataset(Dataset):
             height_valid = global_valid & ~ndsm_hole
             valid_mask = np.stack([global_valid, height_valid], axis=0).astype(np.float32)
             target = raw_target
-            target[3, :, :] = np.clip(target[3, :, :] / HEIGHT_NORM_CONSTANT, 0.0, 1.5)
+            target[3, :, :] = np.maximum(target[3, :, :], 0.0) / HEIGHT_NORM_CONSTANT
         else:
             target = np.zeros((4, self.patch_size, self.patch_size), dtype=np.float32)
             valid_mask = np.ones((2, self.patch_size, self.patch_size), dtype=np.float32)

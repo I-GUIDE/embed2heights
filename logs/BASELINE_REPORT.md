@@ -4,6 +4,17 @@
 **Task**: Predict sub-pixel land cover (Building, Vegetation, Water) and surface height (nDSM) from GFM embeddings.
 **Dataset**: 2024 patches, 256x256 @ 10m resolution (France), 4-band labels `[building%, vegetation%, water%, height_m]`.
 
+> **⚠ Stale metric — read with care.**
+> Scores and the § 2 metric definitions below use the **pre-2026-04-17 formula**:
+> `mean(IoU_pos, IoU_neg)` at threshold 0.5 and global pixel-accumulated RMSE.
+> The 2026-04-17 dummy-probe submission proved this is NOT the leaderboard metric.
+> See [METRIC_PROBE_REPORT.md](METRIC_PROBE_REPORT.md) for the corrected formulas
+> (positive-only per-image IoU at `label > 0`, per-image RMSE on class-present pixels).
+> Under the correct metric, sparse-class IoU drops ~0.25–0.35 (e.g. iou_bld
+> 0.598 → 0.267, iou_wat 0.680 → 0.389 for the AlphaEarth baseline). The
+> **ranking across embedding sources is still broadly valid**; the absolute
+> numbers are not.
+
 ---
 
 ## 1. Baseline Overview
