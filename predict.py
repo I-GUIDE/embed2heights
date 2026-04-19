@@ -66,6 +66,12 @@ def parse_args():
     parser.add_argument("--patch-size", type=int, default=DEFAULTS["patch_size"])
     parser.add_argument("--max-samples", type=int, default=DEFAULTS["max_samples"],
                         help="Limit inference to N samples (0 = all).")
+    parser.add_argument("--thresholds", type=float, nargs=3, default=None,
+                        metavar=("BLD", "VEG", "WAT"),
+                        help="Optional per-class thresholds to bake into the output. "
+                             "When set, class channels (0-2) are written as {0.0, 1.0} "
+                             "using pred > threshold. Default keeps raw sigmoid probs "
+                             "(recommended — lets you sweep thresholds later).")
     return parser.parse_args()
 
 
@@ -111,6 +117,9 @@ def main():
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
     print(f"Loaded model: {selected_model} from {model_path} (input channels={sample_img.shape[0]})")
+    if args.thresholds is not None:
+        print(f"Baking per-class thresholds into output: bld={args.thresholds[0]}, "
+              f"veg={args.thresholds[1]}, wat={args.thresholds[2]}")
 
     print(f"Running inference on {len(test_ds)} samples...")
     with torch.no_grad():
@@ -124,6 +133,10 @@ def main():
 
             # Model emits height / HEIGHT_NORM_CONSTANT; rescale to meters.
             pred[3] = pred[3] * HEIGHT_NORM_CONSTANT
+
+            if args.thresholds is not None:
+                for c, t in enumerate(args.thresholds):
+                    pred[c] = (pred[c] > t).astype(np.float32)
 
             emb_path = test_ds.file_pairs[i][0]
             # Submission format keeps the year suffix; val mode normalizes it

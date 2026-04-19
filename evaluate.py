@@ -48,7 +48,13 @@ def evaluate_experiment(pred_dir, labels_dir, *, pred_threshold=0.5,
       - IoU: per-image positive-only Jaccard (empty/empty -> 1), sample-averaged.
       - RMSE: per-image RMSE on pixels where label_class > label_threshold,
               sample-averaged (NOT pixel-accumulated).
+
+    `pred_threshold` may be a scalar or a 3-tuple (bld, veg, wat) for per-class.
     """
+    if np.isscalar(pred_threshold):
+        thr_b = thr_v = thr_w = float(pred_threshold)
+    else:
+        thr_b, thr_v, thr_w = map(float, pred_threshold)
     pred_files = sorted(glob.glob(os.path.join(pred_dir, "*.npy")))
     if not pred_files:
         return None
@@ -75,9 +81,9 @@ def evaluate_experiment(pred_dir, labels_dir, *, pred_threshold=0.5,
         w = min(pred.shape[2], label.shape[2])
         pred, label = pred[:, :h, :w], label[:, :h, :w]
 
-        iou_b.append(binary_iou(pred[CH_BUILDING]  > pred_threshold, label[CH_BUILDING]   > label_threshold))
-        iou_v.append(binary_iou(pred[CH_VEGETATION] > pred_threshold, label[CH_VEGETATION] > label_threshold))
-        iou_w.append(binary_iou(pred[CH_WATER]     > pred_threshold, label[CH_WATER]      > label_threshold))
+        iou_b.append(binary_iou(pred[CH_BUILDING]  > thr_b, label[CH_BUILDING]   > label_threshold))
+        iou_v.append(binary_iou(pred[CH_VEGETATION] > thr_v, label[CH_VEGETATION] > label_threshold))
+        iou_w.append(binary_iou(pred[CH_WATER]     > thr_w, label[CH_WATER]      > label_threshold))
 
         # RMSE conditioned on GT class presence — per-image averaging.
         bld_mask = label[CH_BUILDING]    > label_threshold
@@ -112,7 +118,11 @@ def parse_args():
     p.add_argument("--labels-dir", default=DEFAULT_LABELS_DIR)
     p.add_argument("--only",       nargs="+", default=None, help="Evaluate only these experiment names")
     p.add_argument("--pred-threshold", "--threshold", dest="pred_threshold", type=float, default=0.5,
-                   help="Binarization threshold for PREDICTION channels (default 0.5).")
+                   help="Scalar binarization threshold for PREDICTION channels (default 0.5). "
+                        "Overridden by --thresholds if set.")
+    p.add_argument("--thresholds", type=float, nargs=3, default=None,
+                   metavar=("BLD", "VEG", "WAT"),
+                   help="Per-class prediction thresholds. Overrides --pred-threshold when set.")
     p.add_argument("--label-threshold", type=float, default=LABEL_THRESHOLD,
                    help="Binarization threshold for LABEL channels (default 0, matches leaderboard).")
     p.add_argument("--val-only", action="store_true",
@@ -148,9 +158,10 @@ def main():
 
         split_label = f"val-only, {len(val_ids)} samples" if val_ids else "all"
         print(f"Evaluating {exp_name} ({split_label}) ...", end=" ", flush=True)
+        effective_threshold = args.thresholds if args.thresholds is not None else args.pred_threshold
         metrics = evaluate_experiment(
             pred_dir, args.labels_dir,
-            pred_threshold=args.pred_threshold,
+            pred_threshold=effective_threshold,
             label_threshold=args.label_threshold,
             val_only_ids=val_ids,
         )
@@ -164,8 +175,10 @@ def main():
         print(f"done ({metrics['n_samples']} samples)")
 
     split_mode = "val-only (split.json)" if args.val_only else "all samples"
+    thr_desc = (f"bld>{args.thresholds[0]}, veg>{args.thresholds[1]}, wat>{args.thresholds[2]}"
+                if args.thresholds is not None else f"pred>{args.pred_threshold}")
     print("\n" + "=" * 90)
-    print(f"  Evaluation Results  (pred>{args.pred_threshold}, label>{args.label_threshold}, split={split_mode})")
+    print(f"  Evaluation Results  ({thr_desc}, label>{args.label_threshold}, split={split_mode})")
     print("=" * 90)
     header = f"{'Experiment':<36} {'iou_bld':>9} {'iou_tree':>9} {'iou_wat':>9} {'RMSE_bH':>9} {'RMSE_vH':>9} {'Score':>8}"
     print(header)

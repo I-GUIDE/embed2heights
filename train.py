@@ -58,6 +58,28 @@ DEFAULTS = {
 }
 
 
+RAW_COMPONENTS = (
+    "mae",
+    "ssim",
+    "grad",
+    "tversky",
+    "height_boost",
+    "presence_bce",
+    "aux_height_building",
+    "aux_height_vegetation",
+)
+
+WEIGHTED_COMPONENTS = (
+    "weighted_mae",
+    "weighted_ssim",
+    "weighted_grad",
+    "weighted_tversky",
+    "weighted_height_boost",
+    "weighted_presence_bce",
+    "weighted_aux_height",
+)
+
+
 def select_device():
     if torch.cuda.is_available():
         return torch.device("cuda")
@@ -170,10 +192,10 @@ def save_experiment_config(exp_dir, args, device, use_amp):
 
 def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
               grad_accum_steps=1, use_amp=False, desc=""):
-    """Train or eval one epoch. Returns (avg_loss, component_avgs[mae,ssim,grad,tversky])."""
+    """Train or eval one epoch. Returns (avg_loss, component_avgs)."""
     model.train(train)
     running_loss = 0.0
-    components = torch.zeros(4, device=device)
+    component_sums = {}
     samples_seen = 0
 
     pbar = tqdm(loader, desc=desc, leave=False)
@@ -187,7 +209,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 outputs = forward_for_training(model, imgs)
-                loss, l_mae, l_ssim, l_grad, l_tversky = criterion(outputs, targets, masks)
+                loss, loss_components = criterion(outputs, targets, masks)
                 step_loss = loss / grad_accum_steps if train else loss
 
             if train:
@@ -202,17 +224,31 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
 
             bs = imgs.size(0)
             running_loss += loss.item() * bs
-            components[0] += l_mae * bs
-            components[1] += l_ssim * bs
-            components[2] += l_grad * bs
-            components[3] += l_tversky * bs
+            for name, value in loss_components.items():
+                component_sums[name] = component_sums.get(name, 0.0) + value.detach().item() * bs
             samples_seen += bs
             avg = running_loss / max(1, samples_seen)
             pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{avg:.4f}")
 
     avg_loss = running_loss / max(1, samples_seen)
-    comp_avg = (components / max(1, samples_seen)).cpu()
+    comp_avg = {
+        name: value / max(1, samples_seen)
+        for name, value in component_sums.items()
+    }
     return avg_loss, comp_avg
+
+
+def format_components(components, names):
+    parts = []
+    for name in names:
+        if name in components:
+            parts.append(f"{name}:{components[name]:.3f}")
+    return " | ".join(parts)
+
+
+def write_history_record(path, record):
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 def plot_loss_curve(train_losses, val_losses, out_path, experiment_name):
@@ -234,10 +270,12 @@ def main():
     best_model_path = os.path.join(exp_dir, "model_best.pth")
     last_model_path = os.path.join(exp_dir, "model_last.pth")
     loss_curve_path = os.path.join(exp_dir, "loss_curve.png")
+    loss_history_path = os.path.join(exp_dir, "loss_history.jsonl")
 
     use_amp = args.amp and device.type == "cuda"
     grad_accum_steps = max(1, args.grad_accum_steps)
     save_experiment_config(exp_dir, args, device, use_amp)
+    open(loss_history_path, "w").close()
 
     print("--- 1. Data Setup ---")
     train_loader, val_loader, train_ds, val_ds, n_channels = make_dataloaders(args)
@@ -257,7 +295,7 @@ def main():
     best_val_loss = float("inf")
 
     for epoch in range(args.epochs):
-        tr_loss, _ = run_epoch(
+        tr_loss, tr_comp = run_epoch(
             model, train_loader, criterion, optimizer, scaler, device,
             train=True, grad_accum_steps=grad_accum_steps, use_amp=use_amp,
             desc=f"Epoch {epoch + 1}/{args.epochs} [train]",
@@ -270,6 +308,14 @@ def main():
         train_losses.append(tr_loss)
         val_losses.append(val_loss)
         scheduler.step(val_loss)
+        write_history_record(loss_history_path, {
+            "epoch": epoch + 1,
+            "train_loss": tr_loss,
+            "val_loss": val_loss,
+            "train_components": tr_comp,
+            "val_components": val_comp,
+            "lr": optimizer.param_groups[0]["lr"],
+        })
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -277,8 +323,10 @@ def main():
             print(f"   >> New best val loss {best_val_loss:.4f} — saved.")
 
         print(f"Epoch {epoch + 1}/{args.epochs} | Train: {tr_loss:.4f} | Val: {val_loss:.4f}")
-        print(f"   >> Val breakdown: MAE:{val_comp[0]:.3f} | SSIM:{val_comp[1]:.3f} | "
-              f"Grad:{val_comp[2]:.3f} | Tversky:{val_comp[3]:.3f}")
+        print(f"   >> Train raw: {format_components(tr_comp, RAW_COMPONENTS)}")
+        print(f"   >> Train weighted: {format_components(tr_comp, WEIGHTED_COMPONENTS)}")
+        print(f"   >> Val raw:   {format_components(val_comp, RAW_COMPONENTS)}")
+        print(f"   >> Val weighted: {format_components(val_comp, WEIGHTED_COMPONENTS)}")
 
     print("--- 3. Saving ---")
     torch.save(model.state_dict(), last_model_path)

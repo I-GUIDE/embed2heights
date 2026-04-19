@@ -299,11 +299,17 @@ class MultiTaskPredictionHead(nn.Module):
     - **Fraction head** remains as an auxiliary regressor on soft coverage,
       supervised by MAE/SSIM/Gradient/Tversky. Its output is NOT submitted;
       it stays inside the head to condition the height branch.
-    - FiLM conditioning and height gating use the soft `fractions` — giving
-      the height branch fine-grained coverage information (essential on edge
-      pixels where a small fraction means partial building height).
+    - FiLM conditioning uses the soft `fractions` to give the height branch
+      fine-grained coverage information at the feature level.
     - Height deltas are non-negative (softplus), enforcing the physical
       constraint that buildings/vegetation only add above ground.
+    - **Submitted height is a presence-gated blend of class specialists**
+      (`height_building`, `height_vegetation`) rather than a fraction-weighted
+      sum. This aligns with the leaderboard's per-class RMSE mask (`gt_class
+      > 0`): each specialist is reliable on its own class's pixels (trained
+      that way via aux L1), so the gate routes each pixel to the specialist
+      that matches the dominant present class. Background pixels fall back
+      to `base_height`.
 
     Output contract: 4-channel tensor [presence_building, presence_veg,
     presence_water, height]. Channels 0-2 are calibrated probabilities in
@@ -380,18 +386,28 @@ class MultiTaskPredictionHead(nn.Module):
         building_delta = F.softplus(self.height_building_delta_proj(h), threshold=20.0)
         vegetation_delta = F.softplus(self.height_vegetation_delta_proj(h), threshold=20.0)
 
-        # Absolute class heights (for auxiliary supervision)
+        # Absolute class heights (also used as specialists for the submission)
         building_height = base_height + building_delta
         vegetation_height = base_height + vegetation_delta
 
-        # Fraction-gated height: partial coverage gives partial contribution.
-        # (Using fractions, not presence, keeps edge-pixel heights calibrated.)
-        height = base_height \
-            + fractions[:, 0:1, :, :] * building_delta \
-            + fractions[:, 1:2, :, :] * vegetation_delta
+        # Presence-gated specialist selection for the single submitted height.
+        # Rationale: leaderboard's per-class RMSE masks pixels by `gt_class > 0`,
+        # which matches the presence head's supervision. `height_building` /
+        # `height_vegetation` are L1-trained on their class mask (losses.py),
+        # so each is reliable ONLY on that class's pixels. We therefore route
+        # each pixel to its relevant specialist by presence, and fall back to
+        # `base_height` on background pixels.
+        p_b = presence_prob[:, 0:1, :, :]
+        p_v = presence_prob[:, 1:2, :, :]
+        p_fg = 1.0 - (1.0 - p_b) * (1.0 - p_v)           # P(any of {b,v} present)
+        denom = p_b + p_v + 1e-6
+        w_b = p_b / denom
+        w_v = p_v / denom
+        h_fg = w_b * building_height + w_v * vegetation_height
+        height = p_fg * h_fg + (1.0 - p_fg) * base_height
 
         # Submission: channels 0-2 are presence_prob (binary-aligned),
-        # channel 3 is the fraction-gated height.
+        # channel 3 is the presence-gated specialist height.
         out = torch.cat([presence_prob, height], dim=1)
 
         if not return_aux:

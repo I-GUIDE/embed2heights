@@ -248,15 +248,21 @@ class ImprovedCompositeLoss(nn.Module):
         loss_height_boost = torch.sum(height_err * (1.0 + 5.0 * build_presence_mask)) / height_valid_count
 
         # --- Combine Total Loss ---
-        total_loss = (self.w_mae * loss_mae) + \
-                     (self.w_ssim * loss_ssim) + \
-                     (self.w_grad * loss_grad) + \
-                     (self.w_structure * loss_tversky) + \
-                     (self.w_structure * loss_height_boost)
+        weighted_mae = self.w_mae * loss_mae
+        weighted_ssim = self.w_ssim * loss_ssim
+        weighted_grad = self.w_grad * loss_grad
+        weighted_tversky = self.w_structure * loss_tversky
+        weighted_height_boost = self.w_structure * loss_height_boost
+        total_loss = weighted_mae + weighted_ssim + weighted_grad + \
+            weighted_tversky + weighted_height_boost
 
         # --- 5. Auxiliary supervision for the dual-head model ---
         # Presence target is `label > 0` (matches the leaderboard's IoU
         # binarization — see logs/METRIC_PROBE_REPORT.md). Previously 0.5.
+        zero = torch.zeros((), device=device, dtype=preds.dtype)
+        presence_loss = zero
+        aux_height_building_loss = zero
+        aux_height_vegetation_loss = zero
         if aux_outputs is not None and "presence_logits" in aux_outputs:
             presence_target = (targets[:, :3, :, :] > 0).float()
             presence_loss = F.binary_cross_entropy_with_logits(
@@ -273,16 +279,36 @@ class ImprovedCompositeLoss(nn.Module):
             def masked_l1(pred, target, mask):
                 return torch.sum(torch.abs(pred - target) * mask) / (torch.sum(mask) + 1e-6)
 
-            aux_height_loss = 0.0
             if "height_building" in aux_outputs:
-                aux_height_loss = aux_height_loss + masked_l1(
+                aux_height_building_loss = masked_l1(
                     aux_outputs["height_building"], target_height, bld_height_mask
                 )
             if "height_vegetation" in aux_outputs:
-                aux_height_loss = aux_height_loss + masked_l1(
+                aux_height_vegetation_loss = masked_l1(
                     aux_outputs["height_vegetation"], target_height, veg_height_mask
                 )
 
-            total_loss = total_loss + self.aux_weight * (presence_loss + aux_height_loss)
+            total_loss = total_loss + self.aux_weight * (
+                presence_loss + aux_height_building_loss + aux_height_vegetation_loss
+            )
 
-        return total_loss, loss_mae, loss_ssim, loss_grad, loss_tversky
+        aux_height_loss = aux_height_building_loss + aux_height_vegetation_loss
+        components = {
+            "mae": loss_mae,
+            "ssim": loss_ssim,
+            "grad": loss_grad,
+            "tversky": loss_tversky,
+            "height_boost": loss_height_boost,
+            "presence_bce": presence_loss,
+            "aux_height_building": aux_height_building_loss,
+            "aux_height_vegetation": aux_height_vegetation_loss,
+            "aux_height": aux_height_loss,
+            "weighted_mae": weighted_mae,
+            "weighted_ssim": weighted_ssim,
+            "weighted_grad": weighted_grad,
+            "weighted_tversky": weighted_tversky,
+            "weighted_height_boost": weighted_height_boost,
+            "weighted_presence_bce": self.aux_weight * presence_loss,
+            "weighted_aux_height": self.aux_weight * aux_height_loss,
+        }
+        return total_loss, components
