@@ -53,7 +53,8 @@ DEFAULTS = {
     "model_type":      "auto",
     "amp":             True,
     "grad_accum":      1,
-    "num_workers":     2,
+    "num_workers":     4,
+    "prefetch_factor": 1,
 }
 
 
@@ -101,6 +102,14 @@ def parse_args():
     p.add_argument("--secondary-train-embeddings-dir", default=None,
                    help="Optional second pixel-aligned embedding dir to concatenate with "
                         "--train-embeddings-dir, e.g. Tessera with AlphaEarth.")
+    p.add_argument("--tessera-presence-ch", type=int, default=16,
+                   help="Compressed Tessera channels exposed to the residual presence head.")
+    p.add_argument("--tessera-hidden-ch", type=int, default=None,
+                   help="Hidden width inside the Tessera compressor. Default derives from "
+                        "--tessera-presence-ch and preserves the original architecture.")
+    p.add_argument("--tessera-hidden-depth", type=int, default=0,
+                   help="Extra hidden 3x3 blocks inside the Tessera compressor. Increases "
+                        "parameters without changing --tessera-presence-ch.")
     p.add_argument("--train-targets-dir",    default=DEFAULT_TRAIN_TAR)
     p.add_argument("--experiment-name",      default=DEFAULTS["experiment_name"])
     p.add_argument("--batch-size",     type=int,   default=DEFAULTS["batch_size"])
@@ -113,6 +122,8 @@ def parse_args():
     p.add_argument("--grad-accum-steps", type=int, default=DEFAULTS["grad_accum"],
                    help="Accumulate gradients over N mini-batches before optimizer step.")
     p.add_argument("--num-workers",    type=int, default=DEFAULTS["num_workers"])
+    p.add_argument("--prefetch-factor", type=int, default=DEFAULTS["prefetch_factor"],
+                   help="Batches prefetched per DataLoader worker when num_workers > 0.")
     p.add_argument("--aux-weight",     type=float, default=DEFAULTS["aux_weight"],
                    help="Weight for auxiliary multi-head supervision.")
     p.add_argument("--seed",           type=int, default=DEFAULTS["seed"])
@@ -121,7 +132,7 @@ def parse_args():
     return p.parse_args()
 
 
-def make_dataloaders(args):
+def make_dataloaders(args, device):
     if args.secondary_train_embeddings_dir:
         all_pairs = find_multisource_file_pairs(
             args.train_embeddings_dir,
@@ -162,8 +173,17 @@ def make_dataloaders(args):
         train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, is_train=True)
         val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, is_train=False)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,  num_workers=args.num_workers)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
+
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    val_loader   = DataLoader(val_ds,   shuffle=False, **loader_kwargs)
     return train_loader, val_loader, train_ds, val_ds, n_channels
 
 
@@ -189,9 +209,16 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "amp":             use_amp,
         "grad_accum":      args.grad_accum_steps,
         "num_workers":     args.num_workers,
+        "prefetch_factor": args.prefetch_factor if args.num_workers > 0 else None,
+        "pin_memory":      device.type == "cuda",
+        "persistent_workers": args.num_workers > 0,
+        "non_blocking_transfer": device.type == "cuda",
         "seed":            args.seed,
         "train_embeddings_dir": args.train_embeddings_dir,
         "secondary_train_embeddings_dir": args.secondary_train_embeddings_dir,
+        "tessera_presence_ch": args.tessera_presence_ch,
+        "tessera_hidden_ch":   args.tessera_hidden_ch,
+        "tessera_hidden_depth": args.tessera_hidden_depth,
         "train_targets_dir":    args.train_targets_dir,
         "val_split":       DEFAULTS["val_split"],
         "device":          str(device),
@@ -217,9 +244,12 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
         optimizer.zero_grad(set_to_none=True)
 
     context = torch.enable_grad() if train else torch.no_grad()
+    non_blocking = device.type == "cuda"
     with context:
         for step, (imgs, targets, masks) in enumerate(pbar, start=1):
-            imgs, targets, masks = imgs.to(device), targets.to(device), masks.to(device)
+            imgs = imgs.to(device, non_blocking=non_blocking)
+            targets = targets.to(device, non_blocking=non_blocking)
+            masks = masks.to(device, non_blocking=non_blocking)
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 outputs = forward_for_training(model, imgs)
@@ -287,6 +317,8 @@ def main():
     args = parse_args()
     device = select_device()
     seed_everything(args.seed)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
 
     exp_dir = os.path.join(args.output_dir, args.experiment_name)
     best_model_path = os.path.join(exp_dir, "model_best.pth")
@@ -300,10 +332,17 @@ def main():
     open(loss_history_path, "w").close()
 
     print("--- 1. Data Setup ---")
-    train_loader, val_loader, train_ds, val_ds, n_channels = make_dataloaders(args)
+    train_loader, val_loader, train_ds, val_ds, n_channels = make_dataloaders(args, device)
 
     print("--- 2. Model Init ---")
-    model, selected_model = build_model(args.model_type, n_channels, n_classes=4)
+    model, selected_model = build_model(
+        args.model_type,
+        n_channels,
+        n_classes=4,
+        tessera_presence_ch=args.tessera_presence_ch,
+        tessera_hidden_ch=args.tessera_hidden_ch,
+        tessera_hidden_depth=args.tessera_hidden_depth,
+    )
     model = model.to(device)
     print(f"Using model: {selected_model} (input channels={n_channels})")
 

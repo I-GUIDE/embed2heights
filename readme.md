@@ -72,9 +72,10 @@ python train.py \
 
 To test whether Tessera's pixel-aligned boundary signal helps AlphaEarth IoU
 without letting weak Tessera features pollute height regression, use the
-Tessera-IoU fusion model. AlphaEarth drives the LightUNet, fraction heads, and
-height heads; Tessera is compressed from 128ch to 16ch and only feeds the
-presence/IoU logits:
+Tessera-IoU fusion model. AlphaEarth drives the LightUNet, fraction heads,
+height heads, and base presence logits; Tessera is compressed from 128ch to
+16ch by default and predicts a zero-initialized 3-channel residual correction
+on the presence/IoU logits:
 
 ```bash
 python train.py \
@@ -86,6 +87,29 @@ python train.py \
     --split-file splits/split.json \
     --epochs 30
 ```
+
+The Tessera branch exposes separate knobs for interface width and internal
+capacity. To test whether very small Tessera outputs are enough while keeping
+more extraction parameters inside the branch, keep `--tessera-presence-ch`
+small and increase `--tessera-hidden-ch` / `--tessera-hidden-depth`:
+
+```bash
+python train.py \
+    --model-type tessera_iou_fusion \
+    --train-embeddings-dir ../data/train/alphaearth_emb \
+    --secondary-train-embeddings-dir ../data/train/tessera_emb \
+    --train-targets-dir ../data/train/labels \
+    --experiment-name alphaearth_tessera_iou_residual_ch3_h64d1 \
+    --split-file splits/split.json \
+    --tessera-presence-ch 3 \
+    --tessera-hidden-ch 64 \
+    --tessera-hidden-depth 1 \
+    --epochs 30
+```
+
+`predict.py` reads these Tessera branch settings from
+`runs/<experiment_name>/training_params.json` by default; pass the same flags
+manually only when predicting from a checkpoint outside that experiment folder.
 
 Artifacts go to `runs/<experiment_name>/`: `model_best.pth`, `model_last.pth`, `loss_curve.png`, `training_params.json`.
 
@@ -152,7 +176,7 @@ The metric formulas were reverse-engineered by the 2026-04-17 dummy-probe submis
 | `embedding_refiner`  | Full-resolution ConvNeXt blocks + ASPP, multi-head     | Pixel-aligned 256x256       |
 | `hrnet_w18`          | HRNet-style multi-resolution (width 18), multi-head    | Pixel-aligned 256x256       |
 | `hrnet_w32`          | Same as above, width 32                                | Pixel-aligned 256x256       |
-| `tessera_iou_fusion` | AlphaEarth LightUNet + compressed Tessera IoU branch   | AlphaEarth+Tessera concat   |
+| `tessera_iou_fusion` | AlphaEarth LightUNet + compressed Tessera residual IoU branch | AlphaEarth+Tessera concat |
 | `decoder_residual`   | `EfficientDecoder256Fast` — bottleneck + 4× upsample  | ViT tokens 16x16 (768ch)    |
 | `auto`               | Pick by input channels (<512 → pixel, else token)     | Any                         |
 
@@ -160,7 +184,9 @@ The metric formulas were reverse-engineered by the 2026-04-17 dummy-probe submis
 When `--secondary-*-embeddings-dir` is set, the two pixel-aligned sources are
 concatenated channel-wise before the selected model sees them. With
 `tessera_iou_fusion`, the model explicitly splits this tensor as AlphaEarth
-64ch + Tessera 128ch and routes Tessera only to the presence/IoU branch.
+64ch + Tessera 128ch. Tessera is routed only to a zero-initialized residual
+presence-logit correction, and height routing still uses AlphaEarth-only
+presence logits.
 
 ## Loss
 

@@ -265,20 +265,24 @@ class ImprovedCompositeLoss(nn.Module):
         aux_height_vegetation_loss = zero
         if aux_outputs is not None and "presence_logits" in aux_outputs:
             presence_target = (targets[:, :3, :, :] > 0).float()
-            presence_logits = torch.where(
-                lc_mask.bool(),
-                aux_outputs["presence_logits"],
-                torch.zeros_like(aux_outputs["presence_logits"]),
-            )
-            presence_target = torch.where(
-                lc_mask.bool(),
-                presence_target,
-                torch.zeros_like(presence_target),
-            )
-            presence_loss = F.binary_cross_entropy_with_logits(
-                presence_logits, presence_target, reduction="none"
-            )
-            presence_loss = torch.sum(presence_loss * lc_mask) / (torch.sum(lc_mask) + 1e-6)
+
+            def masked_presence_bce(logits):
+                safe_logits = torch.where(
+                    lc_mask.bool(),
+                    logits,
+                    torch.zeros_like(logits),
+                )
+                safe_target = torch.where(
+                    lc_mask.bool(),
+                    presence_target,
+                    torch.zeros_like(presence_target),
+                )
+                loss = F.binary_cross_entropy_with_logits(
+                    safe_logits, safe_target, reduction="none"
+                )
+                return torch.sum(loss * lc_mask) / (torch.sum(lc_mask) + 1e-6)
+
+            presence_loss = masked_presence_bce(aux_outputs["presence_logits"])
 
             target_height = targets[:, 3:4, :, :]
             # Aux class-height supervision matches the leaderboard RMSE pixel

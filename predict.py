@@ -7,6 +7,7 @@ Two modes:
     the year suffix required by the leaderboard (`<core>_<region>_<year>.npy`).
 """
 import os
+import json
 import argparse
 import numpy as np
 import torch
@@ -64,6 +65,15 @@ def parse_args():
     parser.add_argument("--secondary-test-embeddings-dir", default=None,
                         help="Optional second pixel-aligned embedding dir to concatenate with "
                              "--test-embeddings-dir, e.g. Tessera with AlphaEarth.")
+    parser.add_argument("--tessera-presence-ch", type=int, default=None,
+                        help="Compressed Tessera channels used at training time. "
+                             "Defaults to training_params.json when available, else 16.")
+    parser.add_argument("--tessera-hidden-ch", type=int, default=None,
+                        help="Tessera compressor hidden width used at training time. "
+                             "Defaults to training_params.json when available.")
+    parser.add_argument("--tessera-hidden-depth", type=int, default=None,
+                        help="Extra Tessera compressor hidden depth used at training time. "
+                             "Defaults to training_params.json when available, else 0.")
     parser.add_argument("--test-targets-dir", default=None,
                         help="Optional directory of label .tif files. When omitted, "
                              "runs label-free inference (competition test set).")
@@ -79,6 +89,32 @@ def parse_args():
                              "using pred > threshold. Default keeps raw sigmoid probs "
                              "(recommended — lets you sweep thresholds later).")
     return parser.parse_args()
+
+
+def resolve_tessera_model_kwargs(args, exp_dir):
+    cfg = {}
+    cfg_path = os.path.join(exp_dir, "training_params.json")
+    if os.path.exists(cfg_path):
+        with open(cfg_path, "r") as f:
+            cfg = json.load(f)
+
+    return {
+        "tessera_presence_ch": (
+            args.tessera_presence_ch
+            if args.tessera_presence_ch is not None
+            else cfg.get("tessera_presence_ch", 16)
+        ),
+        "tessera_hidden_ch": (
+            args.tessera_hidden_ch
+            if args.tessera_hidden_ch is not None
+            else cfg.get("tessera_hidden_ch", None)
+        ),
+        "tessera_hidden_depth": (
+            args.tessera_hidden_depth
+            if args.tessera_hidden_depth is not None
+            else cfg.get("tessera_hidden_depth", 0)
+        ),
+    }
 
 
 def resolve_inputs(args):
@@ -139,7 +175,13 @@ def main():
         test_ds = DatasetCls(inputs, patch_size=args.patch_size, is_train=False)
 
     sample_img, _, _ = test_ds[0]
-    model, selected_model = build_model(args.model_type, n_channels=sample_img.shape[0], n_classes=4)
+    tessera_kwargs = resolve_tessera_model_kwargs(args, exp_dir)
+    model, selected_model = build_model(
+        args.model_type,
+        n_channels=sample_img.shape[0],
+        n_classes=4,
+        **tessera_kwargs,
+    )
     model = model.to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()

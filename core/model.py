@@ -470,12 +470,11 @@ class MultiTaskPredictionHead(nn.Module):
             nn.Conv2d(hidden_ch, 3, 1),
         )
         if presence_extra_ch > 0:
-            self.presence_fusion_head = nn.Sequential(
-                ConvGNAct(hidden_ch + presence_extra_ch, hidden_ch, kernel_size=3),
-                nn.Conv2d(hidden_ch, 3, 1),
-            )
+            self.presence_delta_head = nn.Conv2d(presence_extra_ch, 3, 1)
+            nn.init.zeros_(self.presence_delta_head.weight)
+            nn.init.zeros_(self.presence_delta_head.bias)
         else:
-            self.presence_fusion_head = None
+            self.presence_delta_head = None
 
         # --- FiLM conditioning: soft fractions modulate height features ---
         self.film_scale = nn.Conv2d(3, hidden_ch, 1)
@@ -499,15 +498,17 @@ class MultiTaskPredictionHead(nn.Module):
         fraction_logits = self.fraction_head(x)
         fractions = torch.sigmoid(fraction_logits)
 
-        # Main presence classifier (submission channels 0-2). When an
-        # external edge feature is provided, it is allowed to affect only this
-        # IoU-facing branch; height below still gates with alpha-only logits.
+        # Main presence classifier (submission channels 0-2). When an external
+        # edge feature is provided, it learns only a zero-initialized residual
+        # logit correction on top of the alpha-only logits.
         alpha_presence_logits = self.presence_head(x)
         if presence_extra is not None:
-            if self.presence_fusion_head is None:
-                raise ValueError("presence_extra was provided but this head has no fusion branch")
-            presence_logits = self.presence_fusion_head(torch.cat([x, presence_extra], dim=1))
+            if self.presence_delta_head is None:
+                raise ValueError("presence_extra was provided but this head has no residual branch")
+            presence_delta_logits = self.presence_delta_head(presence_extra)
+            presence_logits = alpha_presence_logits + presence_delta_logits
         else:
+            presence_delta_logits = None
             presence_logits = alpha_presence_logits
         presence_prob = torch.sigmoid(presence_logits)
 
@@ -558,6 +559,7 @@ class MultiTaskPredictionHead(nn.Module):
             "presence_prob": presence_prob,
             "alpha_presence_logits": alpha_presence_logits,
             "alpha_presence_prob": height_presence_prob,
+            "presence_delta_logits": presence_delta_logits,
             "height_base": base_height,
             "height_building": building_height,
             "height_vegetation": vegetation_height,
@@ -565,33 +567,42 @@ class MultiTaskPredictionHead(nn.Module):
 
 
 class TesseraCompressionStem(nn.Module):
-    """Strongly compress Tessera before it can influence IoU logits only."""
+    """Strongly compress Tessera before it can influence IoU logits only.
 
-    def __init__(self, in_ch, out_ch=16):
+    ``out_ch`` is the interface width seen by the presence residual head.
+    ``hidden_ch`` and ``hidden_depth`` control extraction capacity without
+    widening that interface.
+    """
+
+    def __init__(self, in_ch, out_ch=16, hidden_ch=None, hidden_depth=0):
         super().__init__()
-        mid_ch = max(out_ch * 2, 32)
+        hidden_ch = hidden_ch or max(out_ch * 2, 32)
+        hidden_depth = max(0, int(hidden_depth))
         self.calib = ChannelCalibration(in_ch)
-        self.net = nn.Sequential(
-            ConvGNAct(in_ch, mid_ch, kernel_size=1, padding=0),
-            ConvGNAct(mid_ch, out_ch, kernel_size=3),
+        layers = [ConvGNAct(in_ch, hidden_ch, kernel_size=1, padding=0)]
+        layers.extend(ConvGNAct(hidden_ch, hidden_ch, kernel_size=3) for _ in range(hidden_depth))
+        layers.extend([
+            ConvGNAct(hidden_ch, out_ch, kernel_size=3),
             ConvGNAct(out_ch, out_ch, kernel_size=3),
-        )
+        ])
+        self.net = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.net(self.calib(x))
 
 
 class TesseraIoUFusionLightUNet(nn.Module):
-    """AlphaEarth LightUNet with Tessera compressed into the IoU branch only.
+    """AlphaEarth LightUNet with a Tessera residual IoU correction branch.
 
     Input layout is fixed by MultiPixelEmbeddingDataset when called as
     AlphaEarth primary + Tessera secondary:
       - channels [0:64] are AlphaEarth and drive the U-Net, fractions, and height
-      - remaining channels are Tessera and drive only fused presence logits
+      - remaining channels are Tessera and drive only residual presence logits
     """
 
     def __init__(self, n_channels, n_classes=4, alpha_channels=64,
-                 tessera_presence_ch=16):
+                 tessera_presence_ch=16, tessera_hidden_ch=None,
+                 tessera_hidden_depth=0):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TesseraIoUFusionLightUNet assumes 4 output channels")
@@ -606,7 +617,12 @@ class TesseraIoUFusionLightUNet(nn.Module):
 
         self.alpha_unet = LightUNet(alpha_channels, n_classes)
         self.alpha_unet.head = nn.Identity()
-        self.tessera_stem = TesseraCompressionStem(tessera_channels, tessera_presence_ch)
+        self.tessera_stem = TesseraCompressionStem(
+            tessera_channels,
+            out_ch=tessera_presence_ch,
+            hidden_ch=tessera_hidden_ch,
+            hidden_depth=tessera_hidden_depth,
+        )
         self.head = MultiTaskPredictionHead(
             in_ch=32,
             out_channels=n_classes,
@@ -846,7 +862,8 @@ def infer_model_type(n_channels):
     return "embedding_refiner"
 
 
-def build_model(model_type, n_channels, n_classes):
+def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
+                tessera_hidden_ch=None, tessera_hidden_depth=0):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -866,7 +883,13 @@ def build_model(model_type, n_channels, n_classes):
     if selected == "hrnet_w32":
         return HRNetEmbedding(n_channels=n_channels, n_classes=n_classes, width=32), selected
     if selected == "tessera_iou_fusion":
-        return TesseraIoUFusionLightUNet(n_channels=n_channels, n_classes=n_classes), selected
+        return TesseraIoUFusionLightUNet(
+            n_channels=n_channels,
+            n_classes=n_classes,
+            tessera_presence_ch=tessera_presence_ch,
+            tessera_hidden_ch=tessera_hidden_ch,
+            tessera_hidden_depth=tessera_hidden_depth,
+        ), selected
 
     raise ValueError(
         f"Unknown model_type '{model_type}'. "
