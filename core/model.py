@@ -70,7 +70,7 @@ class LightUNet(nn.Module):
 
         self.head = MultiTaskPredictionHead(in_ch=32, out_channels=n_classes)
 
-    def forward(self, x, return_aux=False):
+    def forward_features(self, x):
         x1 = self.inc(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
@@ -87,7 +87,10 @@ class LightUNet(nn.Module):
         x = self.up3(x)
         x = torch.cat([x1, x], dim=1)
         x = self.conv3(x)
+        return x
 
+    def forward(self, x, return_aux=False):
+        x = self.forward_features(x)
         return self.head(x, return_aux=return_aux)
 
 
@@ -434,12 +437,14 @@ class MultiTaskPredictionHead(nn.Module):
     natural decision boundary.
     """
 
-    def __init__(self, in_ch, out_channels=4, hidden_ch=None, drop=0.05):
+    def __init__(self, in_ch, out_channels=4, hidden_ch=None, drop=0.05,
+                 presence_extra_ch=0):
         super().__init__()
         if out_channels != 4:
             raise ValueError("MultiTaskPredictionHead assumes 4 output channels")
         hidden_ch = hidden_ch or min(160, max(64, in_ch // 2))
         self._hidden_ch = hidden_ch
+        self.presence_extra_ch = presence_extra_ch
 
         # --- Deeper shared trunk: 2 layers + residual ---
         self.shared = nn.Sequential(
@@ -464,6 +469,13 @@ class MultiTaskPredictionHead(nn.Module):
             ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
             nn.Conv2d(hidden_ch, 3, 1),
         )
+        if presence_extra_ch > 0:
+            self.presence_fusion_head = nn.Sequential(
+                ConvGNAct(hidden_ch + presence_extra_ch, hidden_ch, kernel_size=3),
+                nn.Conv2d(hidden_ch, 3, 1),
+            )
+        else:
+            self.presence_fusion_head = None
 
         # --- FiLM conditioning: soft fractions modulate height features ---
         self.film_scale = nn.Conv2d(3, hidden_ch, 1)
@@ -478,7 +490,7 @@ class MultiTaskPredictionHead(nn.Module):
         self.height_building_delta_proj = nn.Conv2d(hidden_ch, 1, 1)
         self.height_vegetation_delta_proj = nn.Conv2d(hidden_ch, 1, 1)
 
-    def forward(self, x, return_aux=False):
+    def forward(self, x, return_aux=False, presence_extra=None):
         # Shared trunk with residual
         x = self.shared(x)
         x = self.shared_act(x + self.shared_res(x))
@@ -487,8 +499,16 @@ class MultiTaskPredictionHead(nn.Module):
         fraction_logits = self.fraction_head(x)
         fractions = torch.sigmoid(fraction_logits)
 
-        # Main presence classifier (submission channels 0-2)
-        presence_logits = self.presence_head(x)
+        # Main presence classifier (submission channels 0-2). When an
+        # external edge feature is provided, it is allowed to affect only this
+        # IoU-facing branch; height below still gates with alpha-only logits.
+        alpha_presence_logits = self.presence_head(x)
+        if presence_extra is not None:
+            if self.presence_fusion_head is None:
+                raise ValueError("presence_extra was provided but this head has no fusion branch")
+            presence_logits = self.presence_fusion_head(torch.cat([x, presence_extra], dim=1))
+        else:
+            presence_logits = alpha_presence_logits
         presence_prob = torch.sigmoid(presence_logits)
 
         # FiLM conditioning uses soft fractions (fine-grained coverage signal)
@@ -514,8 +534,9 @@ class MultiTaskPredictionHead(nn.Module):
         # so each is reliable ONLY on that class's pixels. We therefore route
         # each pixel to its relevant specialist by presence, and fall back to
         # `base_height` on background pixels.
-        p_b = presence_prob[:, 0:1, :, :]
-        p_v = presence_prob[:, 1:2, :, :]
+        height_presence_prob = torch.sigmoid(alpha_presence_logits)
+        p_b = height_presence_prob[:, 0:1, :, :]
+        p_v = height_presence_prob[:, 1:2, :, :]
         p_fg = 1.0 - (1.0 - p_b) * (1.0 - p_v)           # P(any of {b,v} present)
         denom = p_b + p_v + 1e-6
         w_b = p_b / denom
@@ -535,10 +556,70 @@ class MultiTaskPredictionHead(nn.Module):
             "fractions": fractions,
             "presence_logits": presence_logits,
             "presence_prob": presence_prob,
+            "alpha_presence_logits": alpha_presence_logits,
+            "alpha_presence_prob": height_presence_prob,
             "height_base": base_height,
             "height_building": building_height,
             "height_vegetation": vegetation_height,
         }
+
+
+class TesseraCompressionStem(nn.Module):
+    """Strongly compress Tessera before it can influence IoU logits only."""
+
+    def __init__(self, in_ch, out_ch=16):
+        super().__init__()
+        mid_ch = max(out_ch * 2, 32)
+        self.calib = ChannelCalibration(in_ch)
+        self.net = nn.Sequential(
+            ConvGNAct(in_ch, mid_ch, kernel_size=1, padding=0),
+            ConvGNAct(mid_ch, out_ch, kernel_size=3),
+            ConvGNAct(out_ch, out_ch, kernel_size=3),
+        )
+
+    def forward(self, x):
+        return self.net(self.calib(x))
+
+
+class TesseraIoUFusionLightUNet(nn.Module):
+    """AlphaEarth LightUNet with Tessera compressed into the IoU branch only.
+
+    Input layout is fixed by MultiPixelEmbeddingDataset when called as
+    AlphaEarth primary + Tessera secondary:
+      - channels [0:64] are AlphaEarth and drive the U-Net, fractions, and height
+      - remaining channels are Tessera and drive only fused presence logits
+    """
+
+    def __init__(self, n_channels, n_classes=4, alpha_channels=64,
+                 tessera_presence_ch=16):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("TesseraIoUFusionLightUNet assumes 4 output channels")
+        if n_channels <= alpha_channels:
+            raise ValueError(
+                "TesseraIoUFusionLightUNet expects concatenated AlphaEarth+Tessera "
+                f"input with >{alpha_channels} channels, got {n_channels}"
+            )
+        self.supports_aux_outputs = True
+        self.alpha_channels = alpha_channels
+        tessera_channels = n_channels - alpha_channels
+
+        self.alpha_unet = LightUNet(alpha_channels, n_classes)
+        self.alpha_unet.head = nn.Identity()
+        self.tessera_stem = TesseraCompressionStem(tessera_channels, tessera_presence_ch)
+        self.head = MultiTaskPredictionHead(
+            in_ch=32,
+            out_channels=n_classes,
+            presence_extra_ch=tessera_presence_ch,
+        )
+
+    def forward(self, x, return_aux=False):
+        alpha = x[:, :self.alpha_channels, :, :]
+        tessera = x[:, self.alpha_channels:, :, :]
+
+        alpha_feat = self.alpha_unet.forward_features(alpha)
+        tessera_feat = self.tessera_stem(tessera)
+        return self.head(alpha_feat, return_aux=return_aux, presence_extra=tessera_feat)
 
 
 class EmbeddingRefiner(nn.Module):
@@ -784,8 +865,11 @@ def build_model(model_type, n_channels, n_classes):
         return HRNetEmbedding(n_channels=n_channels, n_classes=n_classes, width=18), selected
     if selected == "hrnet_w32":
         return HRNetEmbedding(n_channels=n_channels, n_classes=n_classes, width=32), selected
+    if selected == "tessera_iou_fusion":
+        return TesseraIoUFusionLightUNet(n_channels=n_channels, n_classes=n_classes), selected
 
     raise ValueError(
         f"Unknown model_type '{model_type}'. "
-        "Use one of: auto, lightunet, decoder_residual, token_neck, embedding_refiner, hrnet_w18, hrnet_w32"
+        "Use one of: auto, lightunet, decoder_residual, token_neck, embedding_refiner, "
+        "hrnet_w18, hrnet_w32, tessera_iou_fusion"
     )

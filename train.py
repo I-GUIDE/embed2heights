@@ -11,7 +11,6 @@ import json
 import random
 import argparse
 import numpy as np
-import matplotlib.pyplot as plt
 import torch
 import torch.optim as optim
 import rasterio
@@ -21,8 +20,8 @@ from tqdm.auto import tqdm
 
 from core.model import build_model
 from core.dataset import (
-    find_file_pairs, save_split, load_split,
-    pick_dataset_class,
+    find_file_pairs, find_multisource_file_pairs, save_split, load_split,
+    pick_dataset_class, MultiPixelEmbeddingDataset,
 )
 from core.losses import ImprovedCompositeLoss
 
@@ -33,7 +32,7 @@ DEFAULT_TRAIN_TAR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "data", "trai
 
 MODEL_CHOICES = [
     "auto", "lightunet", "decoder_residual", "token_neck", "embedding_refiner",
-    "hrnet_w18", "hrnet_w32",
+    "hrnet_w18", "hrnet_w32", "tessera_iou_fusion",
 ]
 
 # Defaults — every one is overridable from the CLI.
@@ -99,6 +98,9 @@ def parse_args():
     p.add_argument("--model-type",           default=DEFAULTS["model_type"], choices=MODEL_CHOICES)
     p.add_argument("--output-dir",           default=DEFAULTS["output_dir"])
     p.add_argument("--train-embeddings-dir", default=DEFAULT_TRAIN_EMB)
+    p.add_argument("--secondary-train-embeddings-dir", default=None,
+                   help="Optional second pixel-aligned embedding dir to concatenate with "
+                        "--train-embeddings-dir, e.g. Tessera with AlphaEarth.")
     p.add_argument("--train-targets-dir",    default=DEFAULT_TRAIN_TAR)
     p.add_argument("--experiment-name",      default=DEFAULTS["experiment_name"])
     p.add_argument("--batch-size",     type=int,   default=DEFAULTS["batch_size"])
@@ -120,11 +122,19 @@ def parse_args():
 
 
 def make_dataloaders(args):
-    all_pairs = find_file_pairs(args.train_embeddings_dir, args.train_targets_dir)
+    if args.secondary_train_embeddings_dir:
+        all_pairs = find_multisource_file_pairs(
+            args.train_embeddings_dir,
+            args.secondary_train_embeddings_dir,
+            args.train_targets_dir,
+        )
+    else:
+        all_pairs = find_file_pairs(args.train_embeddings_dir, args.train_targets_dir)
     if not all_pairs:
         raise ValueError(
             f"No (embedding, label) pairs found.\n"
             f"  train_embeddings_dir='{args.train_embeddings_dir}'\n"
+            f"  secondary_train_embeddings_dir='{args.secondary_train_embeddings_dir}'\n"
             f"  train_targets_dir='{args.train_targets_dir}'\n"
             "Check filename conventions and directory paths."
         )
@@ -140,8 +150,11 @@ def make_dataloaders(args):
 
     with rasterio.open(train_pairs[0][0]) as src:
         n_channels = src.count
+    if args.secondary_train_embeddings_dir:
+        with rasterio.open(train_pairs[0][1]) as src:
+            n_channels += src.count
 
-    DatasetCls = pick_dataset_class(args.model_type, n_channels)
+    DatasetCls = MultiPixelEmbeddingDataset if args.secondary_train_embeddings_dir else pick_dataset_class(args.model_type, n_channels)
     if DatasetCls.__name__ == "LatentTokenDataset":
         train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, scale_factor=16, is_train=True)
         val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, scale_factor=16, is_train=False)
@@ -178,6 +191,7 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "num_workers":     args.num_workers,
         "seed":            args.seed,
         "train_embeddings_dir": args.train_embeddings_dir,
+        "secondary_train_embeddings_dir": args.secondary_train_embeddings_dir,
         "train_targets_dir":    args.train_targets_dir,
         "val_split":       DEFAULTS["val_split"],
         "device":          str(device),
@@ -211,6 +225,12 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
                 outputs = forward_for_training(model, imgs)
                 loss, loss_components = criterion(outputs, targets, masks)
                 step_loss = loss / grad_accum_steps if train else loss
+
+            if not torch.isfinite(loss):
+                print(f"\nWARN: non-finite loss at step {step}; skipping batch.")
+                if train:
+                    optimizer.zero_grad(set_to_none=True)
+                continue
 
             if train:
                 scaler.scale(step_loss).backward()
@@ -252,6 +272,8 @@ def write_history_record(path, record):
 
 
 def plot_loss_curve(train_losses, val_losses, out_path, experiment_name):
+    import matplotlib.pyplot as plt
+
     plt.figure()
     plt.plot(train_losses, label="Train Loss")
     plt.plot(val_losses,   label="Validation Loss")

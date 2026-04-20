@@ -265,8 +265,18 @@ class ImprovedCompositeLoss(nn.Module):
         aux_height_vegetation_loss = zero
         if aux_outputs is not None and "presence_logits" in aux_outputs:
             presence_target = (targets[:, :3, :, :] > 0).float()
+            presence_logits = torch.where(
+                lc_mask.bool(),
+                aux_outputs["presence_logits"],
+                torch.zeros_like(aux_outputs["presence_logits"]),
+            )
+            presence_target = torch.where(
+                lc_mask.bool(),
+                presence_target,
+                torch.zeros_like(presence_target),
+            )
             presence_loss = F.binary_cross_entropy_with_logits(
-                aux_outputs["presence_logits"], presence_target, reduction="none"
+                presence_logits, presence_target, reduction="none"
             )
             presence_loss = torch.sum(presence_loss * lc_mask) / (torch.sum(lc_mask) + 1e-6)
 

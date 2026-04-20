@@ -1,0 +1,12 @@
+{
+  "inputs": {
+    "alpha_iou_height": "runs/lightunet_v35head/predictions",
+    "tessera_iou": "runs/alphaearth_tessera_iou_fusion/predictions"
+  },
+  "channels": {
+    "0": {"tessera_iou": 1.0},
+    "1": {"tessera_iou": 1.0},
+    "2": {"tessera_iou": 1.0},
+    "3": {"alpha_iou_height": 1.0}
+  }
+}

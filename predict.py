@@ -17,9 +17,12 @@ from core.model import build_model
 from core.dataset import (
     find_file_pairs,
     find_embedding_files,
+    find_multisource_file_pairs,
+    find_multisource_embedding_files,
     normalize_core_id,
     submission_id,
     pick_dataset_class,
+    MultiPixelEmbeddingDataset,
     HEIGHT_NORM_CONSTANT,
 )
 
@@ -35,7 +38,7 @@ DEFAULTS = {
 
 MODEL_CHOICES = [
     "auto", "lightunet", "decoder", "decoder_residual", "token_neck",
-    "embedding_refiner", "hrnet_w18", "hrnet_w32",
+    "embedding_refiner", "hrnet_w18", "hrnet_w32", "tessera_iou_fusion",
 ]
 
 
@@ -58,6 +61,9 @@ def parse_args():
                         help="Path to the .pth checkpoint. Defaults to <base-dir>/<experiment-name>/model_best.pth.")
     parser.add_argument("--test-embeddings-dir", required=True,
                         help="Directory containing embedding .tif files.")
+    parser.add_argument("--secondary-test-embeddings-dir", default=None,
+                        help="Optional second pixel-aligned embedding dir to concatenate with "
+                             "--test-embeddings-dir, e.g. Tessera with AlphaEarth.")
     parser.add_argument("--test-targets-dir", default=None,
                         help="Optional directory of label .tif files. When omitted, "
                              "runs label-free inference (competition test set).")
@@ -77,6 +83,24 @@ def parse_args():
 
 def resolve_inputs(args):
     """Return a list of embedding paths (label-free) or (emb, label) tuples."""
+    if args.secondary_test_embeddings_dir:
+        if args.test_targets_dir:
+            pairs = find_multisource_file_pairs(
+                args.test_embeddings_dir,
+                args.secondary_test_embeddings_dir,
+                args.test_targets_dir,
+            )
+            if not pairs:
+                raise RuntimeError("No matching multi-source file pairs found. Check embedding and target dirs.")
+            return pairs
+        pairs = find_multisource_embedding_files(
+            args.test_embeddings_dir,
+            args.secondary_test_embeddings_dir,
+        )
+        if not pairs:
+            raise RuntimeError("No matching multi-source .tif files found. Check embedding dirs.")
+        return pairs
+
     if args.test_targets_dir:
         pairs = find_file_pairs(args.test_embeddings_dir, args.test_targets_dir)
         if not pairs:
@@ -104,8 +128,11 @@ def main():
     sample_emb_path = inputs[0][0] if isinstance(inputs[0], tuple) else inputs[0]
     with rasterio.open(sample_emb_path) as src:
         n_channels = src.count
+    if args.secondary_test_embeddings_dir:
+        with rasterio.open(inputs[0][1]) as src:
+            n_channels += src.count
 
-    DatasetCls = pick_dataset_class(args.model_type, n_channels)
+    DatasetCls = MultiPixelEmbeddingDataset if args.secondary_test_embeddings_dir else pick_dataset_class(args.model_type, n_channels)
     if DatasetCls.__name__ == "LatentTokenDataset":
         test_ds = DatasetCls(inputs, patch_size=args.patch_size, scale_factor=16, is_train=False)
     else:

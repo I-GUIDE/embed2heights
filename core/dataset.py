@@ -11,12 +11,18 @@ HEIGHT_NORM_CONSTANT = 30.0
 
 # Backbones that consume pixel-aligned 256x256 embeddings. Everything else is
 # treated as 16x16 ViT tokens and routed through the upsampling decoder.
-PIXEL_MODEL_TYPES = ("lightunet", "embedding_refiner", "hrnet_w18", "hrnet_w32")
+PIXEL_MODEL_TYPES = ("lightunet", "embedding_refiner", "hrnet_w18", "hrnet_w32", "tessera_iou_fusion")
 TOKEN_MODEL_TYPES = ("decoder", "decoder_residual")
 
 _EMB_PREFIXES = ("gee_emb_", "tessera_emb_", "emb_", "s2_", "s1_")
 _EMB_SUFFIXES = ("_embedding", "_embeddings", "_quantized", "_merged")
 _YEAR_RE = re.compile(r"_\d{4}$")
+
+
+def clean_raster_array(array):
+    """Convert raster data to finite float32 values."""
+    array = array.astype(np.float32, copy=False)
+    return np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def _strip_prefixes(base, prefixes):
@@ -112,11 +118,48 @@ def find_embedding_files(emb_dir):
     return emb_files
 
 
+def _index_embedding_dir(emb_dir):
+    files = find_embedding_files(emb_dir)
+    return {normalize_core_id(path): path for path in files}
+
+
+def find_multisource_file_pairs(primary_emb_dir, secondary_emb_dir, tar_dir):
+    """
+    Match two pixel-aligned embedding sources and labels by normalized core id.
+
+    Returns tuples of (primary_embedding, secondary_embedding, label). The
+    primary path is used for split keys and output ids, so pass AlphaEarth as
+    primary when building AlphaEarth+Tessera experiments.
+    """
+    primary_files = _index_embedding_dir(primary_emb_dir)
+    secondary_files = _index_embedding_dir(secondary_emb_dir)
+    label_files = {
+        normalize_core_id(path): path
+        for path in glob.glob(os.path.join(tar_dir, "**", "label_*.tif"), recursive=True)
+    }
+
+    common_ids = sorted(set(primary_files) & set(secondary_files) & set(label_files))
+    return [(primary_files[cid], secondary_files[cid], label_files[cid]) for cid in common_ids]
+
+
+def find_multisource_embedding_files(primary_emb_dir, secondary_emb_dir):
+    """
+    Match two label-free embedding dirs by normalized core id.
+
+    Returns tuples of (primary_embedding, secondary_embedding). The primary
+    path is used for leaderboard submission ids.
+    """
+    primary_files = _index_embedding_dir(primary_emb_dir)
+    secondary_files = _index_embedding_dir(secondary_emb_dir)
+    common_ids = sorted(set(primary_files) & set(secondary_files))
+    return [(primary_files[cid], secondary_files[cid]) for cid in common_ids]
+
+
 def save_split(split_path, train_pairs, val_pairs):
     """Save train/val split to a JSON file using normalized core IDs."""
     data = {
-        "train": [normalize_core_id(e) for e, _ in train_pairs],
-        "val": [normalize_core_id(e) for e, _ in val_pairs],
+        "train": [normalize_core_id(pair[0]) for pair in train_pairs],
+        "val": [normalize_core_id(pair[0]) for pair in val_pairs],
     }
     with open(split_path, "w") as f:
         json.dump(data, f, indent=2)
@@ -168,13 +211,11 @@ class PixelEmbeddingDataset(Dataset):
         emb_path, tar_path = self.file_pairs[idx]
 
         with rasterio.open(emb_path) as src:
-            image = src.read().astype(np.float32)
-        image = np.nan_to_num(image)
+            image = clean_raster_array(src.read())
 
         if tar_path is not None:
             with rasterio.open(tar_path) as src:
-                target = src.read().astype(np.float32)
-            raw_target = np.nan_to_num(target)
+                raw_target = clean_raster_array(src.read())
             # Global validity mask: exclude pixels where all 4 bands are zero (nodata)
             global_valid = ~np.all(raw_target == 0, axis=0)  # (H, W) bool
             # nDSM-specific mask: additionally exclude pixels where nDSM==0
@@ -214,6 +255,82 @@ class PixelEmbeddingDataset(Dataset):
 
         return torch.from_numpy(image), torch.from_numpy(target), torch.from_numpy(valid_mask)
 
+
+class MultiPixelEmbeddingDataset(Dataset):
+    """
+    For concatenating two pixel-aligned embedding sources, e.g. AlphaEarth
+    64ch + Tessera 128ch -> 192ch at 256x256.
+
+    file_pairs may contain:
+      - (primary_emb_path, secondary_emb_path, label_path)
+      - (primary_emb_path, secondary_emb_path) for label-free inference
+    """
+    def __init__(self, file_pairs, patch_size=128, is_train=True):
+        self.patch_size = patch_size
+        self.is_train = is_train
+        self.file_pairs = file_pairs
+
+    def __len__(self):
+        return len(self.file_pairs)
+
+    def __getitem__(self, idx):
+        pair = self.file_pairs[idx]
+        if len(pair) == 3:
+            primary_path, secondary_path, tar_path = pair
+        elif len(pair) == 2:
+            primary_path, secondary_path = pair
+            tar_path = None
+        else:
+            raise ValueError("MultiPixelEmbeddingDataset expects 2- or 3-item tuples")
+
+        with rasterio.open(primary_path) as src:
+            primary = clean_raster_array(src.read())
+        with rasterio.open(secondary_path) as src:
+            secondary = clean_raster_array(src.read())
+
+        if primary.shape[1:] != secondary.shape[1:]:
+            raise ValueError(
+                f"Embedding shapes do not align for {primary_path} and {secondary_path}: "
+                f"{primary.shape[1:]} vs {secondary.shape[1:]}"
+            )
+        image = np.concatenate([primary, secondary], axis=0)
+
+        if tar_path is not None:
+            with rasterio.open(tar_path) as src:
+                raw_target = clean_raster_array(src.read())
+            global_valid = ~np.all(raw_target == 0, axis=0)
+            has_landcover = (raw_target[0] > 0) | (raw_target[1] > 0) | (raw_target[2] > 0)
+            ndsm_hole = (raw_target[3] == 0) & has_landcover
+            height_valid = global_valid & ~ndsm_hole
+            valid_mask = np.stack([global_valid, height_valid], axis=0).astype(np.float32)
+            target = raw_target
+            target[3, :, :] = np.maximum(target[3, :, :], 0.0) / HEIGHT_NORM_CONSTANT
+        else:
+            target = np.zeros((4, image.shape[1], image.shape[2]), dtype=np.float32)
+            valid_mask = np.ones((2, image.shape[1], image.shape[2]), dtype=np.float32)
+
+        _, h, w = image.shape
+        if h < self.patch_size or w < self.patch_size:
+            pad_h = max(0, self.patch_size - h)
+            pad_w = max(0, self.patch_size - w)
+            image = np.pad(image, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+            target = np.pad(target, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+            valid_mask = np.pad(valid_mask, ((0, 0), (0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
+            h, w = image.shape[1], image.shape[2]
+
+        if self.is_train:
+            top = np.random.randint(0, h - self.patch_size + 1)
+            left = np.random.randint(0, w - self.patch_size + 1)
+        else:
+            top = (h - self.patch_size) // 2
+            left = (w - self.patch_size) // 2
+
+        image = image[:, top:top + self.patch_size, left:left + self.patch_size]
+        target = target[:, top:top + self.patch_size, left:left + self.patch_size]
+        valid_mask = valid_mask[:, top:top + self.patch_size, left:left + self.patch_size]
+
+        return torch.from_numpy(image), torch.from_numpy(target), torch.from_numpy(valid_mask)
+
 # ---------------------------------------------------------
 # DATASET 2: Latent Token-Based (TerraMind, Thor)
 # Upscaled Spatial Resolution (e.g., 16x16 -> 256x256)
@@ -240,15 +357,13 @@ class LatentTokenDataset(Dataset):
         emb_path, tar_path = self.file_pairs[idx]
 
         with rasterio.open(emb_path) as src:
-            image = src.read().astype(np.float32)
-        image = np.nan_to_num(image)
+            image = clean_raster_array(src.read())
 
         emb_patch_size = self.patch_size // self.scale_factor
 
         if tar_path is not None:
             with rasterio.open(tar_path) as src:
-                target = src.read().astype(np.float32)
-            raw_target = np.nan_to_num(target)
+                raw_target = clean_raster_array(src.read())
             global_valid = ~np.all(raw_target == 0, axis=0)
             has_landcover = (raw_target[0] > 0) | (raw_target[1] > 0) | (raw_target[2] > 0)
             ndsm_hole = (raw_target[3] == 0) & has_landcover

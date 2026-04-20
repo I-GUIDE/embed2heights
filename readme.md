@@ -70,6 +70,23 @@ python train.py \
     --epochs 30
 ```
 
+To test whether Tessera's pixel-aligned boundary signal helps AlphaEarth IoU
+without letting weak Tessera features pollute height regression, use the
+Tessera-IoU fusion model. AlphaEarth drives the LightUNet, fraction heads, and
+height heads; Tessera is compressed from 128ch to 16ch and only feeds the
+presence/IoU logits:
+
+```bash
+python train.py \
+    --model-type tessera_iou_fusion \
+    --train-embeddings-dir ../data/train/alphaearth_emb \
+    --secondary-train-embeddings-dir ../data/train/tessera_emb \
+    --train-targets-dir ../data/train/labels \
+    --experiment-name alphaearth_tessera_iou_fusion \
+    --split-file splits/split.json \
+    --epochs 30
+```
+
 Artifacts go to `runs/<experiment_name>/`: `model_best.pth`, `model_last.pth`, `loss_curve.png`, `training_params.json`.
 
 There is **no multi-baseline driver script** — launch a shell loop or slurm array to sweep over multiple backbones/sources.
@@ -94,6 +111,18 @@ python predict.py \
     --model-type           hrnet_w18 \
     --test-embeddings-dir  ../data/test/alphaearth_test_emb \
     --predictions-dir      submission/alphaearth_hrnet_w18
+```
+
+For the AlphaEarth+Tessera fusion model, pass the matching secondary directory
+at inference:
+
+```bash
+python predict.py \
+    --experiment-name alphaearth_tessera_iou_fusion \
+    --model-type tessera_iou_fusion \
+    --test-embeddings-dir ../data/train/alphaearth_emb \
+    --secondary-test-embeddings-dir ../data/train/tessera_emb \
+    --test-targets-dir ../data/train/labels
 ```
 
 Predictions are `(4, 256, 256)` float32 arrays — channels: `[building%, veg%, water%, height_m]`.
@@ -123,10 +152,15 @@ The metric formulas were reverse-engineered by the 2026-04-17 dummy-probe submis
 | `embedding_refiner`  | Full-resolution ConvNeXt blocks + ASPP, multi-head     | Pixel-aligned 256x256       |
 | `hrnet_w18`          | HRNet-style multi-resolution (width 18), multi-head    | Pixel-aligned 256x256       |
 | `hrnet_w32`          | Same as above, width 32                                | Pixel-aligned 256x256       |
+| `tessera_iou_fusion` | AlphaEarth LightUNet + compressed Tessera IoU branch   | AlphaEarth+Tessera concat   |
 | `decoder_residual`   | `EfficientDecoder256Fast` — bottleneck + 4× upsample  | ViT tokens 16x16 (768ch)    |
 | `auto`               | Pick by input channels (<512 → pixel, else token)     | Any                         |
 
 `decoder` is accepted as an alias for `decoder_residual`. Pixel-aligned backbones (all the AlphaEarth / Tessera options) share a common `MultiTaskPredictionHead` with a fraction head, a fraction-derived presence head, and a fraction-gated softplus height head.
+When `--secondary-*-embeddings-dir` is set, the two pixel-aligned sources are
+concatenated channel-wise before the selected model sees them. With
+`tessera_iou_fusion`, the model explicitly splits this tensor as AlphaEarth
+64ch + Tessera 128ch and routes Tessera only to the presence/IoU branch.
 
 ## Loss
 
@@ -169,19 +203,3 @@ Most of these are overridable from the CLI.
 Composite score: `Σ iou_i × w_i + Σ max(0, 1 − RMSE_i / X_i) × w_i`, with `X_building = 3.0m` and `X_vegetation = 5.0m`.
 
 See [logs/METRIC_PROBE_REPORT.md](logs/METRIC_PROBE_REPORT.md) for the full derivation.
-
-## Baseline comparison across embedding sources (v35 head, 2026-04-19)
-
-Same head (`MultiTaskPredictionHead` v35), same train/val split (`splits/split.json`), 30 epochs, defaults from `train.py`. Pixel-aligned embeddings use `lightunet`; 16×16 ViT-token embeddings use `decoder_residual`. Scored on the val split with `evaluate.py --val-only` (default `pred > 0.5`, `label > 0`).
-
-| Experiment                  | Backbone           | iou_bld | iou_tree | iou_wat | RMSE_bH | RMSE_vH | Score  |
-|-----------------------------|--------------------|---------|----------|---------|---------|---------|--------|
-| `baseline_v35_alphaearth`   | `lightunet`        | 0.3854  | 0.7391   | 0.4191  | 1.9528  | 3.5552  | 0.6801 |
-| `baseline_v35_terramind_s1` | `decoder_residual` | 0.0320  | 0.4944   | 0.1146  | 2.9246  | 7.2109  | 0.4769 |
-| `baseline_v35_terramind_s2` | `decoder_residual` | 0.0219  | 0.4767   | 0.1312  | 3.0030  | 6.9190  | 0.4755 |
-| `baseline_v35_thor_s1`      | `decoder_residual` | 0.0160  | 0.4816   | 0.1225  | 3.1505  | 8.1318  | 0.4641 |
-| `baseline_v35_tessera`      | `lightunet`        | 0.0123  | 0.4622   | 0.1062  | 2.5806  | 8.0995  | 0.4628 |
-| `baseline_v35_thor_s2`      | `decoder_residual` | 0.0184  | 0.4918   | 0.0229  | 3.2570  | 6.7905  | 0.4594 |
-
-AlphaEarth dominates every sub-metric — unsurprising, since it is already a pixel-aligned GFM. The ViT-token sources (TerraMind S1/S2, THOR S1/S2) cluster tightly around 0.46–0.48 and are nearly indistinguishable at this head/decoder budget; building IoU in particular collapses (<4%), suggesting the 16×16 → 256×256 decoder is the bottleneck for sharp boundary classes rather than the embedding itself. Tessera — pixel-aligned at 128ch and trained with the same `lightunet` head as AlphaEarth — still lands in the same 0.46 band (building IoU 1.2%), which isolates the gap to the embedding itself rather than to the pixel-vs-token decoder choice.
-
