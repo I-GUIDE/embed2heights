@@ -146,6 +146,33 @@ def parse_args():
     p.add_argument("--fraction-mae-weight", type=float,
                    default=DEFAULTS["fraction_mae_weight"],
                    help="Weak fraction MAE weight in --loss-preset presence_centered.")
+    p.add_argument("--height-loss-kind", default="l1",
+                   choices=["l1", "huber", "mse"],
+                   help="Regression loss used for height_boost and aux class-height "
+                        "supervision. Default l1 matches legacy behavior.")
+    p.add_argument("--huber-delta", type=float, default=1.0,
+                   help="Transition point for --height-loss-kind huber.")
+    p.add_argument("--veg-height-boost", type=float, default=0.0,
+                   help="Extra per-pixel weight on vegetation-positive pixels inside "
+                        "the height_boost term. 0.0 = legacy (no veg boost).")
+    p.add_argument("--iou-loss-kind", default="tversky",
+                   choices=["tversky", "focal"],
+                   help="Auxiliary IoU loss form for the presence head under "
+                        "--loss-preset presence_centered. 'focal' replaces the "
+                        "per-class Tversky with sigmoid focal BCE.")
+    p.add_argument("--focal-gamma", type=float, default=2.0,
+                   help="Focusing parameter for --iou-loss-kind focal.")
+    p.add_argument("--focal-alpha", type=float, default=0.25,
+                   help="Positive-class weight for --iou-loss-kind focal.")
+    p.add_argument("--height-specialist-depth", type=int, default=0,
+                   help="Extra ConvGNAct layers prepended to the per-class height "
+                        "specialist projections (building/vegetation). 0 = legacy 1x1 "
+                        "projection only.")
+    p.add_argument("--structure-weight", type=float, default=None,
+                   help="Override lambdas[3] (the weight on height_boost, and Tversky "
+                        "under the 'current' preset). Defaults to DEFAULTS['lambdas'][3] "
+                        "when unset. Useful when switching height loss kind (e.g. MSE "
+                        "changes the magnitude/gradient profile of height_boost).")
     p.add_argument("--seed",           type=int, default=DEFAULTS["seed"])
     p.add_argument("--split-file",     default=None,
                    help="Path to a JSON split file. Loaded if present, else a new split is saved there.")
@@ -155,13 +182,17 @@ def parse_args():
 def effective_loss_lambdas(args):
     """Return the lambda vector actually used by the selected loss preset."""
     selected = resolve_loss_preset(args)
+    structure_w = (args.structure_weight
+                   if args.structure_weight is not None
+                   else DEFAULTS["lambdas"][3])
     if selected == "no_ssim_grad":
-        return [DEFAULTS["lambdas"][0], 0.0, 0.0, DEFAULTS["lambdas"][3]]
+        return [DEFAULTS["lambdas"][0], 0.0, 0.0, structure_w]
     if selected == "presence_centered":
         # Structure weight is still used for height_boost. Fraction Tversky,
         # SSIM, and gradient are disabled inside ImprovedCompositeLoss.
-        return [DEFAULTS["lambdas"][0], 0.0, 0.0, DEFAULTS["lambdas"][3]]
-    return DEFAULTS["lambdas"]
+        return [DEFAULTS["lambdas"][0], 0.0, 0.0, structure_w]
+    return [DEFAULTS["lambdas"][0], DEFAULTS["lambdas"][1],
+            DEFAULTS["lambdas"][2], structure_w]
 
 
 def resolve_loss_preset(args):
@@ -265,6 +296,13 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "tessera_presence_ch": args.tessera_presence_ch,
         "tessera_hidden_ch":   args.tessera_hidden_ch,
         "tessera_hidden_depth": args.tessera_hidden_depth,
+        "height_specialist_depth": args.height_specialist_depth,
+        "height_loss_kind":    args.height_loss_kind,
+        "huber_delta":         args.huber_delta,
+        "veg_height_boost":    args.veg_height_boost,
+        "iou_loss_kind":       args.iou_loss_kind,
+        "focal_gamma":         args.focal_gamma,
+        "focal_alpha":         args.focal_alpha,
         "train_targets_dir":    args.train_targets_dir,
         "val_split":       DEFAULTS["val_split"],
         "device":          str(device),
@@ -392,6 +430,7 @@ def main():
         tessera_presence_ch=args.tessera_presence_ch,
         tessera_hidden_ch=args.tessera_hidden_ch,
         tessera_hidden_depth=args.tessera_hidden_depth,
+        height_specialist_depth=args.height_specialist_depth,
     )
     model = model.to(device)
     print(f"Using model: {selected_model} (input channels={n_channels})")
@@ -407,6 +446,12 @@ def main():
         loss_preset=resolved_loss_preset,
         presence_tversky_weight=args.presence_tversky_weight,
         fraction_mae_weight=args.fraction_mae_weight,
+        height_loss_kind=args.height_loss_kind,
+        huber_delta=args.huber_delta,
+        veg_height_boost=args.veg_height_boost,
+        iou_loss_kind=args.iou_loss_kind,
+        focal_gamma=args.focal_gamma,
+        focal_alpha=args.focal_alpha,
     ).to(device)
     print(
         "Using loss: "
@@ -414,7 +459,13 @@ def main():
         f"lambdas={loss_lambdas}, "
         f"aux_weight={args.aux_weight}, "
         f"presence_tversky_weight={args.presence_tversky_weight}, "
-        f"fraction_mae_weight={args.fraction_mae_weight}"
+        f"fraction_mae_weight={args.fraction_mae_weight}, "
+        f"height_loss_kind={args.height_loss_kind}, "
+        f"huber_delta={args.huber_delta}, "
+        f"veg_height_boost={args.veg_height_boost}, "
+        f"iou_loss_kind={args.iou_loss_kind}, "
+        f"focal_gamma={args.focal_gamma}, "
+        f"focal_alpha={args.focal_alpha}"
     )
 
     print(f"Starting training on {device}...")

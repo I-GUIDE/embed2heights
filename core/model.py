@@ -438,13 +438,14 @@ class MultiTaskPredictionHead(nn.Module):
     """
 
     def __init__(self, in_ch, out_channels=4, hidden_ch=None, drop=0.05,
-                 presence_extra_ch=0):
+                 presence_extra_ch=0, height_specialist_depth=0):
         super().__init__()
         if out_channels != 4:
             raise ValueError("MultiTaskPredictionHead assumes 4 output channels")
         hidden_ch = hidden_ch or min(160, max(64, in_ch // 2))
         self._hidden_ch = hidden_ch
         self.presence_extra_ch = presence_extra_ch
+        self.height_specialist_depth = int(height_specialist_depth)
 
         # --- Deeper shared trunk: 2 layers + residual ---
         self.shared = nn.Sequential(
@@ -485,9 +486,17 @@ class MultiTaskPredictionHead(nn.Module):
             ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
             ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
         )
+        def _specialist_head(depth):
+            # depth=0 preserves the original single 1x1 projection.
+            if depth <= 0:
+                return nn.Conv2d(hidden_ch, 1, 1)
+            layers = [ConvGNAct(hidden_ch, hidden_ch, kernel_size=3) for _ in range(depth)]
+            layers.append(nn.Conv2d(hidden_ch, 1, 1))
+            return nn.Sequential(*layers)
+
         self.height_base_proj = nn.Conv2d(hidden_ch, 1, 1)
-        self.height_building_delta_proj = nn.Conv2d(hidden_ch, 1, 1)
-        self.height_vegetation_delta_proj = nn.Conv2d(hidden_ch, 1, 1)
+        self.height_building_delta_proj = _specialist_head(self.height_specialist_depth)
+        self.height_vegetation_delta_proj = _specialist_head(self.height_specialist_depth)
 
     def forward(self, x, return_aux=False, presence_extra=None):
         # Shared trunk with residual
@@ -602,7 +611,7 @@ class TesseraIoUFusionLightUNet(nn.Module):
 
     def __init__(self, n_channels, n_classes=4, alpha_channels=64,
                  tessera_presence_ch=16, tessera_hidden_ch=None,
-                 tessera_hidden_depth=0):
+                 tessera_hidden_depth=0, height_specialist_depth=0):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TesseraIoUFusionLightUNet assumes 4 output channels")
@@ -627,6 +636,7 @@ class TesseraIoUFusionLightUNet(nn.Module):
             in_ch=32,
             out_channels=n_classes,
             presence_extra_ch=tessera_presence_ch,
+            height_specialist_depth=height_specialist_depth,
         )
 
     def forward(self, x, return_aux=False):
@@ -863,7 +873,8 @@ def infer_model_type(n_channels):
 
 
 def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
-                tessera_hidden_ch=None, tessera_hidden_depth=0):
+                tessera_hidden_ch=None, tessera_hidden_depth=0,
+                height_specialist_depth=0):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -889,6 +900,7 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
             tessera_presence_ch=tessera_presence_ch,
             tessera_hidden_ch=tessera_hidden_ch,
             tessera_hidden_depth=tessera_hidden_depth,
+            height_specialist_depth=height_specialist_depth,
         ), selected
 
     raise ValueError(

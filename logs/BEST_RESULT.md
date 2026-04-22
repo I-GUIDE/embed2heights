@@ -2,7 +2,8 @@
 # 🏆 Best Strategy Board
 
 > Pinned tracker for the current best strategy combo on the ESA Embed2Heights leaderboard.
-> **Last updated:** 2026-04-20 · **Current best score:** `0.4437` raw / `0.4491` threshold-swept (val, single model under leaderboard-correct metric) · **Submitted:** `—`
+> **Last updated:** 2026-04-22 · **Current best val score:** `0.4692` (5-way mean ensemble `ECCpDB`, tuned thresholds) · **Current best public score:** `0.4209` (binarized ECCpDB zip, submitted 2026-04-22) · See [ENSEMBLE_ECCpDB_REPORT.md](ENSEMBLE_ECCpDB_REPORT.md)
+> **Previous single-model champion:** `alphaearth_tessera_iou_fusion_C_presence_centered` at val `0.4437` raw / `0.4491` threshold-swept. Retained below as per-dimension reference.
 >
 > **Scoring:** Leaderboard composite with per-class RMSE ceilings `X_bld=3.0m`, `X_veg=5.0m`, positive-only per-image IoU at `label > 0`, per-image RMSE on GT-positive pixels. See [METRIC_PROBE_REPORT.md](METRIC_PROBE_REPORT.md). Earlier entries in the 0.74–0.77 range used the pre-probe metric and are **not comparable** to current numbers.
 

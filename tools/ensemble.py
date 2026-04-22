@@ -50,7 +50,7 @@ from tqdm.auto import tqdm
 SCRIPT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from core.dataset import normalize_core_id  # noqa: E402
+from core.dataset import normalize_core_id, submission_id  # noqa: E402
 
 
 def index_dir(pred_dir):
@@ -59,6 +59,17 @@ def index_dir(pred_dir):
     if not files:
         raise FileNotFoundError(f"No .npy files in {pred_dir}")
     return {normalize_core_id(p): p for p in files}
+
+
+def build_output_names(indexed_dirs, ids):
+    """Map matching core_id -> output file stem, preserving the submission
+    year suffix (e.g. `3001_BE_2023`) when the source filenames carry one.
+
+    Matching across dirs happens on the year-stripped core_id (so val outputs
+    can be joined with labels), but the written filename should reuse the
+    year-bearing stem when available — the leaderboard rejects stripped ids."""
+    ref = next(iter(indexed_dirs.values()))
+    return {cid: submission_id(ref[cid]) for cid in ids}
 
 
 def common_ids(indexed_dirs):
@@ -80,15 +91,17 @@ def common_ids(indexed_dirs):
 
 
 def blend_mean(indexed_dirs, ids, output_dir):
+    out_names = build_output_names(indexed_dirs, ids)
     for cid in tqdm(ids, desc="Blending (mean)"):
         arrs = [np.load(indexed_dirs[name][cid]).astype(np.float32) for name in indexed_dirs]
         out = np.mean(arrs, axis=0).astype(np.float32)
         out[:3] = np.clip(out[:3], 0.0, 1.0)
         out[3]  = np.maximum(out[3], 0.0)
-        np.save(output_dir / f"{cid}.npy", out)
+        np.save(output_dir / f"{out_names[cid]}.npy", out)
 
 
 def blend_weighted(indexed_dirs, channel_weights, ids, output_dir):
+    out_names = build_output_names(indexed_dirs, ids)
     for cid in tqdm(ids, desc="Blending (weighted_channels)"):
         loaded = {name: np.load(p[cid]).astype(np.float32) for name, p in indexed_dirs.items()}
         shape  = next(iter(loaded.values())).shape
@@ -102,7 +115,7 @@ def blend_weighted(indexed_dirs, channel_weights, ids, output_dir):
                 out[ch] += loaded[name][ch] * (w / total)
         out[:3] = np.clip(out[:3], 0.0, 1.0)
         out[3]  = np.maximum(out[3], 0.0)
-        np.save(output_dir / f"{cid}.npy", out)
+        np.save(output_dir / f"{out_names[cid]}.npy", out)
 
 
 def cmd_mean(args):

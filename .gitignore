@@ -43,3 +43,4 @@ submission/
 run.sbatch
 configs/
 *.sbatch
+*.out

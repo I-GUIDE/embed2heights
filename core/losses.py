@@ -143,12 +143,20 @@ class ImprovedCompositeLoss(nn.Module):
 
     def __init__(self, lambdas=[1.0, 0.5, 0.5, 2.0], bg_weight=0.05,
                  aux_weight=0.25, loss_preset="current",
-                 presence_tversky_weight=1.0, fraction_mae_weight=0.1):
+                 presence_tversky_weight=1.0, fraction_mae_weight=0.1,
+                 height_loss_kind="l1", huber_delta=1.0,
+                 veg_height_boost=0.0,
+                 iou_loss_kind="tversky",
+                 focal_gamma=2.0, focal_alpha=0.25):
         super().__init__()
         if loss_preset not in {"current", "no_ssim_grad", "presence_centered"}:
             raise ValueError(
                 "loss_preset must be one of: current, no_ssim_grad, presence_centered"
             )
+        if height_loss_kind not in {"l1", "huber", "mse"}:
+            raise ValueError("height_loss_kind must be one of: l1, huber, mse")
+        if iou_loss_kind not in {"tversky", "focal"}:
+            raise ValueError("iou_loss_kind must be one of: tversky, focal")
         self.loss_preset = loss_preset
         self.ssim = SSIMLoss(window_size=11)
         self.gdl = GradientDifferenceLoss()
@@ -166,9 +174,44 @@ class ImprovedCompositeLoss(nn.Module):
         self.presence_tversky_weight = presence_tversky_weight
         self.fraction_mae_weight = fraction_mae_weight
 
+        self.height_loss_kind = height_loss_kind
+        self.huber_delta = float(huber_delta)
+        self.veg_height_boost = float(veg_height_boost)
+        self.iou_loss_kind = iou_loss_kind
+        self.focal_gamma = float(focal_gamma)
+        self.focal_alpha = float(focal_alpha)
+
         # Height is now normalized, so we weight all 4 channels equally in base MAE
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
         self.fraction_mae_weights = torch.tensor([1.0, 1.0, 1.0]).float()
+
+    def _height_err(self, pred, target):
+        """Elementwise height error under the configured regression loss.
+
+        Returns a tensor with the same shape as pred/target containing per-pixel
+        loss values (no reduction, no masking — callers handle those).
+        """
+        diff = pred - target
+        if self.height_loss_kind == "l1":
+            return torch.abs(diff)
+        if self.height_loss_kind == "mse":
+            return diff * diff
+        abs_diff = torch.abs(diff)
+        delta = self.huber_delta
+        quadratic = 0.5 * diff * diff / delta
+        linear = abs_diff - 0.5 * delta
+        return torch.where(abs_diff <= delta, quadratic, linear)
+
+    def _focal_bce_loss(self, logits, target, mask):
+        """Sigmoid-focal BCE, masked; scalar mean over valid pixels."""
+        bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+        p = torch.sigmoid(logits)
+        p_t = target * p + (1.0 - target) * (1.0 - p)
+        alpha_t = target * self.focal_alpha + (1.0 - target) * (1.0 - self.focal_alpha)
+        focal_weight = alpha_t * (1.0 - p_t).clamp_min(1e-6).pow(self.focal_gamma)
+        loss = focal_weight * bce
+        denom = torch.sum(mask) + 1e-6
+        return torch.sum(loss * mask) / denom
 
     def forward(self, preds, targets, valid_mask=None):
         """
@@ -263,10 +306,13 @@ class ImprovedCompositeLoss(nn.Module):
         # --- 4. Height-Aware Building Masking with nDSM-specific mask ---
         # Use height_mask: excludes both global nodata AND nDSM holes
         build_presence_mask = (targets[:, 0, :, :] > 0.1).float() * height_1ch
-        height_err = torch.abs(preds[:, 3, :, :] - targets[:, 3, :, :]) * height_1ch
+        veg_presence_mask = (targets[:, 1, :, :] > 0.1).float() * height_1ch
+        height_err = self._height_err(preds[:, 3, :, :], targets[:, 3, :, :]) * height_1ch
 
         height_valid_count = torch.sum(height_1ch) + 1e-6
-        loss_height_boost = torch.sum(height_err * (1.0 + 5.0 * build_presence_mask)) / height_valid_count
+        per_pixel_weight = (1.0 + 5.0 * build_presence_mask
+                            + self.veg_height_boost * veg_presence_mask)
+        loss_height_boost = torch.sum(height_err * per_pixel_weight) / height_valid_count
 
         # --- Combine Total Loss ---
         if self.loss_preset == "presence_centered":
@@ -308,23 +354,32 @@ class ImprovedCompositeLoss(nn.Module):
 
             presence_loss = masked_presence_bce(aux_outputs["presence_logits"])
             if self.loss_preset == "presence_centered":
-                presence_prob = torch.sigmoid(aux_outputs["presence_logits"])
-                p_build = self.tversky(
-                    presence_prob[:, 0, :, :],
-                    presence_target[:, 0, :, :],
-                    valid_mask=gm_bool,
-                )
-                p_veg = self.tversky(
-                    presence_prob[:, 1, :, :],
-                    presence_target[:, 1, :, :],
-                    valid_mask=gm_bool,
-                )
-                p_water = self.tversky(
-                    presence_prob[:, 2, :, :],
-                    presence_target[:, 2, :, :],
-                    valid_mask=gm_bool,
-                )
-                presence_tversky_loss = (p_build + p_veg + p_water) / 3.0
+                if self.iou_loss_kind == "focal":
+                    # Reuses the presence_tversky slot: the same weight knob
+                    # (`presence_tversky_weight`) applies — it is effectively
+                    # the "IoU-oriented auxiliary term" weight.
+                    presence_logits = aux_outputs["presence_logits"]
+                    presence_tversky_loss = self._focal_bce_loss(
+                        presence_logits, presence_target, lc_mask
+                    )
+                else:
+                    presence_prob = torch.sigmoid(aux_outputs["presence_logits"])
+                    p_build = self.tversky(
+                        presence_prob[:, 0, :, :],
+                        presence_target[:, 0, :, :],
+                        valid_mask=gm_bool,
+                    )
+                    p_veg = self.tversky(
+                        presence_prob[:, 1, :, :],
+                        presence_target[:, 1, :, :],
+                        valid_mask=gm_bool,
+                    )
+                    p_water = self.tversky(
+                        presence_prob[:, 2, :, :],
+                        presence_target[:, 2, :, :],
+                        valid_mask=gm_bool,
+                    )
+                    presence_tversky_loss = (p_build + p_veg + p_water) / 3.0
 
             target_height = targets[:, 3:4, :, :]
             # Aux class-height supervision matches the leaderboard RMSE pixel
@@ -332,15 +387,16 @@ class ImprovedCompositeLoss(nn.Module):
             bld_height_mask = (targets[:, 0:1, :, :] > 0).float() * height_mask
             veg_height_mask = (targets[:, 1:2, :, :] > 0).float() * height_mask
 
-            def masked_l1(pred, target, mask):
-                return torch.sum(torch.abs(pred - target) * mask) / (torch.sum(mask) + 1e-6)
+            def masked_height(pred, target, mask):
+                err = self._height_err(pred, target)
+                return torch.sum(err * mask) / (torch.sum(mask) + 1e-6)
 
             if "height_building" in aux_outputs:
-                aux_height_building_loss = masked_l1(
+                aux_height_building_loss = masked_height(
                     aux_outputs["height_building"], target_height, bld_height_mask
                 )
             if "height_vegetation" in aux_outputs:
-                aux_height_vegetation_loss = masked_l1(
+                aux_height_vegetation_loss = masked_height(
                     aux_outputs["height_vegetation"], target_height, veg_height_mask
                 )
 

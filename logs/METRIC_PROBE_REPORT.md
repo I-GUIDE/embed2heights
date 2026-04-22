@@ -31,7 +31,7 @@ SCORE         0.032124
    ```
    0.25 × 0.0212 + 0.15 × 0 + 0.15 × 0.1788 = 0.03212 ≈ returned 0.0321 ✓
    ```
-   RMSE contribution was 0, meaning `max(0, 1 - RMSE/X)` with `X_building < 4m` and `X_vegetation < 10.9m`. The 30m ceiling we assumed before is wrong.
+   RMSE contribution was 0, confirming `max(0, 1 - RMSE/X)` with `X_building = 3.0m` and `X_vegetation = 5.0m` (values pinned down by a follow-up height probe and now codified in [core/metrics.py](../core/metrics.py) `RMSE_NORMALIZATION`). The 30m ceiling we assumed before is wrong.
 
 5. **Our `evaluate.py` was measuring the wrong metric.** Used `mean(IoU_pos, IoU_neg)` at threshold 0.5, with global pixel-accumulated RMSE. Inflated sparse-class IoU by ~0.25–0.35.
 
@@ -51,28 +51,21 @@ Fixed in this commit:
 - Positive-only IoU, empty/empty → 1.0
 - `pred > 0.5` (--pred-threshold), `label > 0` (--label-threshold)
 - Per-image RMSE averaging
-- `MAX_HEIGHT = 30` kept as placeholder with a clear comment — real X_class is unknown; absolute score over-estimates, but IoU portion and model ranking are correct.
+- Per-class RMSE normalization `X_building = 3.0m`, `X_vegetation = 5.0m` (pinned by the follow-up height probe; matches `RMSE_NORMALIZATION` in [core/metrics.py](../core/metrics.py)).
 
 ## Still unknown
 
-- **X_building and X_vegetation** in the RMSE normalization. Only bounded: `X_bld < 4m`, `X_veg < 10.9m`.
 - **Server-side `pred_threshold`** — all-zero probe can't disambiguate. Assuming 0.5.
 - **RMSE label threshold** — probably 0 (matches IoU), but 4.08 is closer to R3 (threshold 0.5 → 4.73) than R4 (threshold 0 → 3.57). Could be train/test distribution shift.
-
-A second probe (`--height-value 5`) would pin X down.
 
 ## Reproduce
 
 ```bash
 python tools/make_dummy_submission.py                   # all-zero probe
 python tools/predict_dummy_metrics.py                   # candidate-value table
-
-# follow-up probe to pin X_class
-python tools/make_dummy_submission.py \
-    --class-value 0 --height-value 5 \
-    --output-dir runs/dummy_h5/predictions \
-    --zip-path   runs/dummy_h5/submission.zip
 ```
+
+The height probe (`--height-value 5`) has been run and confirmed `X_building = 3.0m`, `X_vegetation = 5.0m`.
 
 ## References
 
