@@ -142,8 +142,14 @@ class ImprovedCompositeLoss(nn.Module):
     """
 
     def __init__(self, lambdas=[1.0, 0.5, 0.5, 2.0], bg_weight=0.05,
-                 aux_weight=0.25):
+                 aux_weight=0.25, loss_preset="current",
+                 presence_tversky_weight=1.0, fraction_mae_weight=0.1):
         super().__init__()
+        if loss_preset not in {"current", "no_ssim_grad", "presence_centered"}:
+            raise ValueError(
+                "loss_preset must be one of: current, no_ssim_grad, presence_centered"
+            )
+        self.loss_preset = loss_preset
         self.ssim = SSIMLoss(window_size=11)
         self.gdl = GradientDifferenceLoss()
 
@@ -151,15 +157,18 @@ class ImprovedCompositeLoss(nn.Module):
         self.tversky = TverskyLoss(alpha=0.3, beta=0.7)
 
         self.w_mae = lambdas[0]
-        self.w_ssim = lambdas[1]
-        self.w_grad = lambdas[2]
+        self.w_ssim = 0.0 if loss_preset in {"no_ssim_grad", "presence_centered"} else lambdas[1]
+        self.w_grad = 0.0 if loss_preset in {"no_ssim_grad", "presence_centered"} else lambdas[2]
         self.w_structure = lambdas[3]  # Represents both Tversky and Building-Height weights
 
         self.bg_weight = bg_weight
         self.aux_weight = aux_weight
+        self.presence_tversky_weight = presence_tversky_weight
+        self.fraction_mae_weight = fraction_mae_weight
 
         # Height is now normalized, so we weight all 4 channels equally in base MAE
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
+        self.fraction_mae_weights = torch.tensor([1.0, 1.0, 1.0]).float()
 
     def forward(self, preds, targets, valid_mask=None):
         """
@@ -177,6 +186,7 @@ class ImprovedCompositeLoss(nn.Module):
 
         device = preds.device
         mae_weights = self.mae_weights.to(device)
+        fraction_mae_weights = self.fraction_mae_weights.to(device)
 
         # Default: all pixels valid (backward compatible)
         if valid_mask is None:
@@ -203,19 +213,27 @@ class ImprovedCompositeLoss(nn.Module):
 
         reg_pred = torch.cat([class_pred, preds[:, 3:4, :, :]], dim=1)  # (B, 4, H, W) for MAE
 
+        def split_fg_bg_mae(pred, target, mask, weights):
+            abs_err = torch.abs(pred - target)
+            fg_mask = (target > 0).float() * mask
+            bg_mask = (1.0 - (target > 0).float()) * mask
+
+            fg_sum = torch.sum(fg_mask, dim=(0, 2, 3)) + 1e-6
+            bg_sum = torch.sum(bg_mask, dim=(0, 2, 3)) + 1e-6
+
+            mae_fg = torch.sum(abs_err * fg_mask, dim=(0, 2, 3)) / fg_sum
+            mae_bg = torch.sum(abs_err * bg_mask, dim=(0, 2, 3)) / bg_sum
+            mae_per_channel = mae_fg + (self.bg_weight * mae_bg)
+            return torch.sum(mae_per_channel * weights)
+
         # --- 1. Base MAE (Foreground / Background Split) with nodata masking ---
-        abs_err = torch.abs(reg_pred - targets)
-        fg_mask = (targets > 0).float() * ch_mask
-        bg_mask = (1.0 - (targets > 0).float()) * ch_mask
-
-        fg_sum = torch.sum(fg_mask, dim=(0, 2, 3)) + 1e-6
-        bg_sum = torch.sum(bg_mask, dim=(0, 2, 3)) + 1e-6
-
-        mae_fg = torch.sum(abs_err * fg_mask, dim=(0, 2, 3)) / fg_sum
-        mae_bg = torch.sum(abs_err * bg_mask, dim=(0, 2, 3)) / bg_sum
-
-        mae_per_channel = mae_fg + (self.bg_weight * mae_bg)
-        loss_mae = torch.sum(mae_per_channel * mae_weights)
+        loss_mae = split_fg_bg_mae(reg_pred, targets, ch_mask, mae_weights)
+        loss_fraction_mae = split_fg_bg_mae(
+            class_pred,
+            targets[:, :3, :, :],
+            global_mask.expand(-1, 3, -1, -1),
+            fraction_mae_weights,
+        )
 
         # --- 2. Structural & Gradient Loss on Land Cover Only ---
         # Zero out predictions at nodata pixels so they match targets (no spurious loss)
@@ -223,21 +241,24 @@ class ImprovedCompositeLoss(nn.Module):
         lc_pred = class_pred * lc_mask
         lc_target = targets[:, :3, :, :] * lc_mask
 
-        loss_ssim = self.ssim(lc_pred, lc_target)
-        loss_grad = self.gdl(lc_pred, lc_target)
+        zero = torch.zeros((), device=device, dtype=preds.dtype)
+        loss_ssim = self.ssim(lc_pred, lc_target) if self.w_ssim != 0 else zero
+        loss_grad = self.gdl(lc_pred, lc_target) if self.w_grad != 0 else zero
 
         # --- 3. Multi-Class Tversky Loss on the auxiliary soft fractions ---
         # Pass the mask explicitly so invalid pixels are excluded from TP/FP/FN
         # (no dilution from zero-filled nodata regions).
         gm_bool = global_1ch.bool()
-        t_build = self.tversky(torch.relu(class_pred[:, 0, :, :]),
-                               targets[:, 0, :, :], valid_mask=gm_bool)
-        t_veg = self.tversky(torch.relu(class_pred[:, 1, :, :]),
-                             targets[:, 1, :, :], valid_mask=gm_bool)
-        t_water = self.tversky(torch.relu(class_pred[:, 2, :, :]),
-                               targets[:, 2, :, :], valid_mask=gm_bool)
-
-        loss_tversky = (t_build + t_veg + t_water) / 3.0
+        if self.loss_preset == "presence_centered":
+            loss_tversky = zero
+        else:
+            t_build = self.tversky(torch.relu(class_pred[:, 0, :, :]),
+                                   targets[:, 0, :, :], valid_mask=gm_bool)
+            t_veg = self.tversky(torch.relu(class_pred[:, 1, :, :]),
+                                 targets[:, 1, :, :], valid_mask=gm_bool)
+            t_water = self.tversky(torch.relu(class_pred[:, 2, :, :]),
+                                   targets[:, 2, :, :], valid_mask=gm_bool)
+            loss_tversky = (t_build + t_veg + t_water) / 3.0
 
         # --- 4. Height-Aware Building Masking with nDSM-specific mask ---
         # Use height_mask: excludes both global nodata AND nDSM holes
@@ -248,7 +269,10 @@ class ImprovedCompositeLoss(nn.Module):
         loss_height_boost = torch.sum(height_err * (1.0 + 5.0 * build_presence_mask)) / height_valid_count
 
         # --- Combine Total Loss ---
-        weighted_mae = self.w_mae * loss_mae
+        if self.loss_preset == "presence_centered":
+            weighted_mae = self.fraction_mae_weight * loss_fraction_mae
+        else:
+            weighted_mae = self.w_mae * loss_mae
         weighted_ssim = self.w_ssim * loss_ssim
         weighted_grad = self.w_grad * loss_grad
         weighted_tversky = self.w_structure * loss_tversky
@@ -259,8 +283,8 @@ class ImprovedCompositeLoss(nn.Module):
         # --- 5. Auxiliary supervision for the dual-head model ---
         # Presence target is `label > 0` (matches the leaderboard's IoU
         # binarization — see logs/METRIC_PROBE_REPORT.md). Previously 0.5.
-        zero = torch.zeros((), device=device, dtype=preds.dtype)
         presence_loss = zero
+        presence_tversky_loss = zero
         aux_height_building_loss = zero
         aux_height_vegetation_loss = zero
         if aux_outputs is not None and "presence_logits" in aux_outputs:
@@ -283,6 +307,24 @@ class ImprovedCompositeLoss(nn.Module):
                 return torch.sum(loss * lc_mask) / (torch.sum(lc_mask) + 1e-6)
 
             presence_loss = masked_presence_bce(aux_outputs["presence_logits"])
+            if self.loss_preset == "presence_centered":
+                presence_prob = torch.sigmoid(aux_outputs["presence_logits"])
+                p_build = self.tversky(
+                    presence_prob[:, 0, :, :],
+                    presence_target[:, 0, :, :],
+                    valid_mask=gm_bool,
+                )
+                p_veg = self.tversky(
+                    presence_prob[:, 1, :, :],
+                    presence_target[:, 1, :, :],
+                    valid_mask=gm_bool,
+                )
+                p_water = self.tversky(
+                    presence_prob[:, 2, :, :],
+                    presence_target[:, 2, :, :],
+                    valid_mask=gm_bool,
+                )
+                presence_tversky_loss = (p_build + p_veg + p_water) / 3.0
 
             target_height = targets[:, 3:4, :, :]
             # Aux class-height supervision matches the leaderboard RMSE pixel
@@ -304,16 +346,18 @@ class ImprovedCompositeLoss(nn.Module):
 
             total_loss = total_loss + self.aux_weight * (
                 presence_loss + aux_height_building_loss + aux_height_vegetation_loss
-            )
+            ) + self.presence_tversky_weight * presence_tversky_loss
 
         aux_height_loss = aux_height_building_loss + aux_height_vegetation_loss
         components = {
             "mae": loss_mae,
+            "fraction_mae": loss_fraction_mae,
             "ssim": loss_ssim,
             "grad": loss_grad,
             "tversky": loss_tversky,
             "height_boost": loss_height_boost,
             "presence_bce": presence_loss,
+            "presence_tversky": presence_tversky_loss,
             "aux_height_building": aux_height_building_loss,
             "aux_height_vegetation": aux_height_vegetation_loss,
             "aux_height": aux_height_loss,
@@ -323,6 +367,7 @@ class ImprovedCompositeLoss(nn.Module):
             "weighted_tversky": weighted_tversky,
             "weighted_height_boost": weighted_height_boost,
             "weighted_presence_bce": self.aux_weight * presence_loss,
+            "weighted_presence_tversky": self.presence_tversky_weight * presence_tversky_loss,
             "weighted_aux_height": self.aux_weight * aux_height_loss,
         }
         return total_loss, components

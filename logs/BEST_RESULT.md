@@ -2,7 +2,7 @@
 # 🏆 Best Strategy Board
 
 > Pinned tracker for the current best strategy combo on the ESA Embed2Heights leaderboard.
-> **Last updated:** 2026-04-19 · **Current best score:** `0.4213` (val, single model under leaderboard-correct metric) · **Submitted:** `—`
+> **Last updated:** 2026-04-20 · **Current best score:** `0.4437` raw / `0.4491` threshold-swept (val, single model under leaderboard-correct metric) · **Submitted:** `—`
 >
 > **Scoring:** Leaderboard composite with per-class RMSE ceilings `X_bld=3.0m`, `X_veg=5.0m`, positive-only per-image IoU at `label > 0`, per-image RMSE on GT-positive pixels. See [METRIC_PROBE_REPORT.md](METRIC_PROBE_REPORT.md). Earlier entries in the 0.74–0.77 range used the pre-probe metric and are **not comparable** to current numbers.
 
@@ -10,26 +10,28 @@
 
 | Dim | Choice | Rationale |
 |---|---|---|
-| **Data & Target** | AlphaEarth 64ch, no-data mask, fixed 80/20 split (`splits/split.json`) | Pixel-aligned, strongest single source |
-| **Model** | **LightUNet** backbone (2.38M params) | Beats HRNet-W18 by +0.0216 under current metric; see [ALPHAEARTH_BACKBONE_REPORT.md](ALPHAEARTH_BACKBONE_REPORT.md) |
+| **Data & Target** | AlphaEarth 64ch + Tessera 128ch, no-data mask, fixed 80/20 split (`splits/split.json`) | AlphaEarth remains primary; Tessera is constrained to presence-logit residual correction |
+| **Model** | **AlphaEarth LightUNet + Tessera residual IoU branch** | C loss makes Tessera useful as a constrained presence-logit residual; +0.0224 raw over old AlphaEarth-only champion |
 | **Head** | **v35head** (presence + base + Δ_b / Δ_v, softplus; fraction head aux only) | Best-measured head on LightUNet; see [ALPHAEARTH_HEAD_REPORT.md](ALPHAEARTH_HEAD_REPORT.md), [HEAD_ARCHITECTURE_NOTES.md](HEAD_ARCHITECTURE_NOTES.md) |
-| **Loss** | `ImprovedCompositeLoss` (MAE 1.0 + SSIM 0.5 + Grad 0.5 + Tversky 2.0 + height boost) + aux weight `1.0` | Tversky handles class imbalance; aux trains fraction/presence/height auxiliaries |
+| **Loss** | `presence_centered`: presence BCE + presence Tversky + height boost + aux height + weak fraction MAE | Aligns segmentation supervision with submitted presence logits, so Tessera residual branch receives IoU-aligned gradients |
 | **Height Activation** | `softplus` on base and per-class deltas | Smooth negative-half gradient is load-bearing for RMSE_bH (ablation in head notes) |
-| **Fusion** | Single source (no fusion yet) | AlphaEarth-only backbone still being squeezed |
-| **Post & Ensemble** | Raw predictions, threshold 0.5 | Threshold sweep and ensemble TBD under new metric |
+| **Fusion** | AlphaEarth primary + compressed Tessera residual presence branch | Tessera does not enter height; it only corrects presence / IoU logits |
+| **Post & Ensemble** | Raw threshold 0.5; best val sweep `(bld=0.600, veg=0.490, wat=0.940)` | Threshold sweep lifts score from `0.4437` to `0.4491` by recovering water IoU |
 
-**Run:** `runs/lightunet_v35head/model_best.pth`  ·  config: bs=32, lr=2e-4, aux=1.0, 30 epochs, seed 42
+**Run:** `runs/alphaearth_tessera_iou_fusion_C_presence_centered/model_best.pth`  ·  config: bs=32, lr=2e-4, aux=1.0, 30 epochs, seed 42, `loss_preset=presence_centered`
 
 **Score breakdown (val, 405 samples):**
 
 | Metric | Value (local) | Value (submission) |
 |---|---:|---:|
-| iou_buildings | `0.3983` | — |
-| iou_trees | `0.7416` | — |
-| iou_water | `0.4151` | — |
-| RMSE_building_height | `1.9154 m` | — |
-| RMSE_vegetation_height | `3.5532 m` | — |
-| **Weighted score** | **`0.4213`** | — |
+| iou_buildings | `0.4813` | — |
+| iou_trees | `0.7579` | — |
+| iou_water | `0.4070` | — |
+| RMSE_building_height | `1.9195 m` | — |
+| RMSE_vegetation_height | `3.5336 m` | — |
+| **Weighted score** | **`0.4437`** | — |
+
+Threshold-swept val score: `0.4491` with thresholds `(0.600, 0.490, 0.940)`.
 
 ---
 
@@ -38,38 +40,43 @@
 Best known option for each axis.
 
 ### Data & Target
-- [x] **AlphaEarth** — current champion input, best val 0.4213
+- [x] **AlphaEarth + Tessera residual** — current champion input pair, best val 0.4437 raw / 0.4491 threshold-swept
+- [x] AlphaEarth — former champion single source, best val 0.4213
 - [ ] TerraMind S2 — trails significantly under new metric (see eval table)
 - [ ] *idea:* height-tail weighting / oversampling for rare >30m pixels
 - [ ] *idea:* stratified split by building density
 
 ### Backbone (head fixed at v35head)
-- [x] **LightUNet** — champion, val 0.4213
+- [x] **AlphaEarth LightUNet + Tessera residual branch** — current champion, val 0.4437 raw / 0.4491 threshold-swept
+- [x] LightUNet — former AlphaEarth-only champion, val 0.4213
 - [x] HRNet-W18 — val 0.3997 (−0.0216)
 - [ ] EmbeddingRefiner + v35head — **not yet run**; cheapest missing cell
 - [ ] *idea:* HRNet-W32 retuning (lower LR / warmup / stochastic depth)
 - [ ] *idea:* unified-hyperparameter backbone rerun for pure architecture delta
 
 ### Head (backbone fixed at LightUNet)
-- [x] **v35head** — champion, val 0.4213 (presence / base+Δ / softplus)
+- [x] **v35head / MultiTaskPredictionHead** — champion head family (presence / base+Δ / softplus)
 - [x] v3head — val 0.4194 (inside 0.006 noise floor; essentially tied)
 - [x] softplus (v1/old) — val 0.3861
 - [x] v2head — val 0.3731
 - [ ] *todo:* multi-seed v35head vs v3head (≥3 seeds) to pick a definitive head
 
 ### Loss
-- [x] **Composite(MAE + SSIM + Grad + Tversky) + aux heads** — current
+- [x] **presence_centered** — current fusion champion; direct presence BCE/Tversky is better than fraction-centered structure losses
+- [x] Composite(MAE + SSIM + Grad + Tversky) + aux heads — former AlphaEarth-only champion loss
 - [x] **Softplus on height projections** — confirmed load-bearing by nobase/hybrid ablation
 - [ ] *idea:* focal-Tversky, scale-aware height loss
 - [ ] *idea:* log-height auxiliary loss / tail-weighted loss above 30m
 
 ### Fusion
+- [x] AlphaEarth + Tessera residual IoU — current champion
+- [ ] *running:* C loss + larger Tessera stem capacity (`ch16_h64d1`, `ch16_h96d2`)
 - [ ] *idea:* concat AlphaEarth + TerraMind S2 (early)
 - [ ] *idea:* cross-attn between pixel and ViT-token streams
 - [ ] *idea:* late ensemble of LightUNet+v35head and LightUNet+v3head
 
 ### Post & Ensemble
-- [ ] *todo:* re-run `tools/sweep_thresholds.py` under new metric on the top heads
+- [x] `tools/sweep_thresholds.py` on C fusion: raw 0.4437 -> threshold-swept 0.4491
 - [ ] *idea:* TTA (flip / rot) on v35head checkpoints
 - [ ] *idea:* building-mask-gated height regression
 
@@ -79,6 +86,9 @@ Best known option for each axis.
 
 | Date | Run | Δ vs Champion | Score | Notes |
 |---|---|---|---|---|
+| 2026-04-20 | `alphaearth_tessera_iou_fusion_C_presence_centered` | champion | **0.4437** raw / **0.4491** threshold-swept | Presence-centered loss; building IoU 0.4813 at 0.5. |
+| 2026-04-20 | `alphaearth_tessera_iou_residual` | −0.0101 raw | 0.4336 | Previous best fusion; old fraction-centered loss. |
+| 2026-04-20 | `alphaearth_tessera_iou_fusion_B_no_ssim_grad` | −0.0129 raw | 0.4308 | Removing SSIM/Grad alone helped less than moving Tversky to presence. |
 | 2026-04-19 | `lightunet_v35head` | champion | **0.4213** | LightUNet + v35head on AlphaEarth. |
 | 2026-04-19 | `lightunet_alphaearth_v3head` | −0.0019 | 0.4194 | Inside 0.006 noise floor; essentially tied with v35head. |
 | 2026-04-19 | `baseline_v35_alphaearth` | −0.0062 | 0.4151 | Identical config to `lightunet_v35head` except `num_workers`; gives noise-floor estimate. |

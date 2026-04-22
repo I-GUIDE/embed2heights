@@ -42,3 +42,4 @@ submission/
 .codex
 run.sbatch
 configs/
+*.sbatch

@@ -34,6 +34,7 @@ MODEL_CHOICES = [
     "auto", "lightunet", "decoder_residual", "token_neck", "embedding_refiner",
     "hrnet_w18", "hrnet_w32", "tessera_iou_fusion",
 ]
+LOSS_PRESET_CHOICES = ["auto", "current", "no_ssim_grad", "presence_centered"]
 
 # Defaults — every one is overridable from the CLI.
 DEFAULTS = {
@@ -46,6 +47,9 @@ DEFAULTS = {
     "weight_decay":    1e-4,
     "val_split":       0.2,
     "lambdas":         [1.0, 0.5, 0.5, 2.0],   # [MAE, SSIM, Gradient, Tversky]
+    "loss_preset":     "auto",
+    "presence_tversky_weight": 1.0,
+    "fraction_mae_weight": 0.1,
     # Presence head is now the submission output for land-cover channels,
     # so its BCE supervision is primary, not auxiliary. Bumped from 0.25.
     "aux_weight":      1.0,
@@ -60,11 +64,13 @@ DEFAULTS = {
 
 RAW_COMPONENTS = (
     "mae",
+    "fraction_mae",
     "ssim",
     "grad",
     "tversky",
     "height_boost",
     "presence_bce",
+    "presence_tversky",
     "aux_height_building",
     "aux_height_vegetation",
 )
@@ -76,6 +82,7 @@ WEIGHTED_COMPONENTS = (
     "weighted_tversky",
     "weighted_height_boost",
     "weighted_presence_bce",
+    "weighted_presence_tversky",
     "weighted_aux_height",
 )
 
@@ -126,10 +133,43 @@ def parse_args():
                    help="Batches prefetched per DataLoader worker when num_workers > 0.")
     p.add_argument("--aux-weight",     type=float, default=DEFAULTS["aux_weight"],
                    help="Weight for auxiliary multi-head supervision.")
+    p.add_argument("--loss-preset", default=DEFAULTS["loss_preset"], choices=LOSS_PRESET_CHOICES,
+                   help=(
+                       "Loss recipe. auto = presence_centered for tessera_iou_fusion and "
+                       "current otherwise; current = existing loss; no_ssim_grad = current "
+                       "with SSIM/gradient weights zeroed; presence_centered = presence BCE "
+                       "+ presence Tversky + height losses + weak fraction MAE."
+                   ))
+    p.add_argument("--presence-tversky-weight", type=float,
+                   default=DEFAULTS["presence_tversky_weight"],
+                   help="Weight for presence Tversky in --loss-preset presence_centered.")
+    p.add_argument("--fraction-mae-weight", type=float,
+                   default=DEFAULTS["fraction_mae_weight"],
+                   help="Weak fraction MAE weight in --loss-preset presence_centered.")
     p.add_argument("--seed",           type=int, default=DEFAULTS["seed"])
     p.add_argument("--split-file",     default=None,
                    help="Path to a JSON split file. Loaded if present, else a new split is saved there.")
     return p.parse_args()
+
+
+def effective_loss_lambdas(args):
+    """Return the lambda vector actually used by the selected loss preset."""
+    selected = resolve_loss_preset(args)
+    if selected == "no_ssim_grad":
+        return [DEFAULTS["lambdas"][0], 0.0, 0.0, DEFAULTS["lambdas"][3]]
+    if selected == "presence_centered":
+        # Structure weight is still used for height_boost. Fraction Tversky,
+        # SSIM, and gradient are disabled inside ImprovedCompositeLoss.
+        return [DEFAULTS["lambdas"][0], 0.0, 0.0, DEFAULTS["lambdas"][3]]
+    return DEFAULTS["lambdas"]
+
+
+def resolve_loss_preset(args):
+    if args.loss_preset != "auto":
+        return args.loss_preset
+    if args.model_type.lower() == "tessera_iou_fusion":
+        return "presence_centered"
+    return "current"
 
 
 def make_dataloaders(args, device):
@@ -195,6 +235,8 @@ def forward_for_training(model, imgs):
 
 def save_experiment_config(exp_dir, args, device, use_amp):
     os.makedirs(exp_dir, exist_ok=True)
+    resolved_loss_preset = resolve_loss_preset(args)
+    loss_lambdas = effective_loss_lambdas(args)
     cfg = {
         "experiment_name": args.experiment_name,
         "model_type":      args.model_type,
@@ -204,8 +246,12 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "epochs":          args.epochs,
         "lr":              args.lr,
         "weight_decay":    args.weight_decay,
-        "loss_lambdas":    DEFAULTS["lambdas"],
+        "loss_preset":     resolved_loss_preset,
+        "requested_loss_preset": args.loss_preset,
+        "loss_lambdas":    loss_lambdas,
         "aux_weight":      args.aux_weight,
+        "presence_tversky_weight": args.presence_tversky_weight,
+        "fraction_mae_weight": args.fraction_mae_weight,
         "amp":             use_amp,
         "grad_accum":      args.grad_accum_steps,
         "num_workers":     args.num_workers,
@@ -302,7 +348,11 @@ def write_history_record(path, record):
 
 
 def plot_loss_curve(train_losses, val_losses, out_path, experiment_name):
-    import matplotlib.pyplot as plt
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"WARN: matplotlib unavailable; skipping loss curve: {exc}")
+        return
 
     plt.figure()
     plt.plot(train_losses, label="Train Loss")
@@ -349,7 +399,23 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
-    criterion = ImprovedCompositeLoss(lambdas=DEFAULTS["lambdas"], aux_weight=args.aux_weight).to(device)
+    resolved_loss_preset = resolve_loss_preset(args)
+    loss_lambdas = effective_loss_lambdas(args)
+    criterion = ImprovedCompositeLoss(
+        lambdas=loss_lambdas,
+        aux_weight=args.aux_weight,
+        loss_preset=resolved_loss_preset,
+        presence_tversky_weight=args.presence_tversky_weight,
+        fraction_mae_weight=args.fraction_mae_weight,
+    ).to(device)
+    print(
+        "Using loss: "
+        f"preset={resolved_loss_preset} (requested={args.loss_preset}), "
+        f"lambdas={loss_lambdas}, "
+        f"aux_weight={args.aux_weight}, "
+        f"presence_tversky_weight={args.presence_tversky_weight}, "
+        f"fraction_mae_weight={args.fraction_mae_weight}"
+    )
 
     print(f"Starting training on {device}...")
     train_losses, val_losses = [], []
