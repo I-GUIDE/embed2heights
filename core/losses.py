@@ -145,7 +145,9 @@ class ImprovedCompositeLoss(nn.Module):
                  aux_weight=0.25, loss_preset="current",
                  presence_tversky_weight=1.0, fraction_mae_weight=0.1,
                  height_loss_kind="l1", huber_delta=1.0,
+                 build_height_boost=5.0,
                  veg_height_boost=0.0,
+                 aux_veg_weight=1.0,
                  iou_loss_kind="tversky",
                  focal_gamma=2.0, focal_alpha=0.25):
         super().__init__()
@@ -176,7 +178,9 @@ class ImprovedCompositeLoss(nn.Module):
 
         self.height_loss_kind = height_loss_kind
         self.huber_delta = float(huber_delta)
+        self.build_height_boost = float(build_height_boost)
         self.veg_height_boost = float(veg_height_boost)
+        self.aux_veg_weight = float(aux_veg_weight)
         self.iou_loss_kind = iou_loss_kind
         self.focal_gamma = float(focal_gamma)
         self.focal_alpha = float(focal_alpha)
@@ -310,7 +314,7 @@ class ImprovedCompositeLoss(nn.Module):
         height_err = self._height_err(preds[:, 3, :, :], targets[:, 3, :, :]) * height_1ch
 
         height_valid_count = torch.sum(height_1ch) + 1e-6
-        per_pixel_weight = (1.0 + 5.0 * build_presence_mask
+        per_pixel_weight = (1.0 + self.build_height_boost * build_presence_mask
                             + self.veg_height_boost * veg_presence_mask)
         loss_height_boost = torch.sum(height_err * per_pixel_weight) / height_valid_count
 
@@ -401,10 +405,12 @@ class ImprovedCompositeLoss(nn.Module):
                 )
 
             total_loss = total_loss + self.aux_weight * (
-                presence_loss + aux_height_building_loss + aux_height_vegetation_loss
+                presence_loss + aux_height_building_loss
+                + self.aux_veg_weight * aux_height_vegetation_loss
             ) + self.presence_tversky_weight * presence_tversky_loss
 
-        aux_height_loss = aux_height_building_loss + aux_height_vegetation_loss
+        aux_height_loss = (aux_height_building_loss
+                           + self.aux_veg_weight * aux_height_vegetation_loss)
         components = {
             "mae": loss_mae,
             "fraction_mae": loss_fraction_mae,

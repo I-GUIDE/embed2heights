@@ -114,6 +114,7 @@ def parse_args():
     parser.add_argument("--tessera-hidden-ch", type=int, default=None)
     parser.add_argument("--tessera-hidden-depth", type=int, default=None)
     parser.add_argument("--height-specialist-depth", type=int, default=None)
+    parser.add_argument("--lightunet-base-ch", type=int, default=None)
     parser.add_argument("--test-targets-dir", default=None)
     parser.add_argument("--predictions-dir", default=None,
                         help="Output dir for .npy predictions. "
@@ -151,6 +152,10 @@ def resolve_tessera_model_kwargs(args, exp_dir):
         "height_specialist_depth": (
             args.height_specialist_depth if args.height_specialist_depth is not None
             else cfg.get("height_specialist_depth", 0)
+        ),
+        "lightunet_base_ch": (
+            args.lightunet_base_ch if args.lightunet_base_ch is not None
+            else cfg.get("lightunet_base_ch", 32)
         ),
     }
 

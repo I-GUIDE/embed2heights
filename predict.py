@@ -78,6 +78,9 @@ def parse_args():
                         help="Depth of per-class height specialist projections used at "
                              "training time. Defaults to training_params.json when "
                              "available, else 0.")
+    parser.add_argument("--lightunet-base-ch", type=int, default=None,
+                        help="LightUNet base channel width used at training time. "
+                             "Defaults to training_params.json when available, else 32.")
     parser.add_argument("--test-targets-dir", default=None,
                         help="Optional directory of label .tif files. When omitted, "
                              "runs label-free inference (competition test set).")
@@ -122,6 +125,11 @@ def resolve_tessera_model_kwargs(args, exp_dir):
             args.height_specialist_depth
             if args.height_specialist_depth is not None
             else cfg.get("height_specialist_depth", 0)
+        ),
+        "lightunet_base_ch": (
+            args.lightunet_base_ch
+            if args.lightunet_base_ch is not None
+            else cfg.get("lightunet_base_ch", 32)
         ),
     }
 

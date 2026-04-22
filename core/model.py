@@ -47,28 +47,29 @@ class UpsampleBlock(nn.Module):
 
 
 class LightUNet(nn.Module):
-    def __init__(self, n_channels, n_classes):
+    def __init__(self, n_channels, n_classes, base_ch=32):
         super(LightUNet, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
+        self.base_ch = base_ch
         self.supports_aux_outputs = True
 
-        # Architecture: Light version (32->64->128->256)
-        self.inc = DoubleConv(n_channels, 32)
-        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(32, 64))
-        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(64, 128))
-        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(128, 256))
+        c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
+        self.inc = DoubleConv(n_channels, c1)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c1, c2))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c2, c3))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c3, c4))
 
-        self.up1 = UpsampleBlock(256, 128)
-        self.conv1 = DoubleConv(256, 128)
+        self.up1 = UpsampleBlock(c4, c3)
+        self.conv1 = DoubleConv(c4, c3)
 
-        self.up2 = UpsampleBlock(128, 64)
-        self.conv2 = DoubleConv(128, 64)
+        self.up2 = UpsampleBlock(c3, c2)
+        self.conv2 = DoubleConv(c3, c2)
 
-        self.up3 = UpsampleBlock(64, 32)
-        self.conv3 = DoubleConv(64, 32)
+        self.up3 = UpsampleBlock(c2, c1)
+        self.conv3 = DoubleConv(c2, c1)
 
-        self.head = MultiTaskPredictionHead(in_ch=32, out_channels=n_classes)
+        self.head = MultiTaskPredictionHead(in_ch=c1, out_channels=n_classes)
 
     def forward_features(self, x):
         x1 = self.inc(x)
@@ -611,7 +612,8 @@ class TesseraIoUFusionLightUNet(nn.Module):
 
     def __init__(self, n_channels, n_classes=4, alpha_channels=64,
                  tessera_presence_ch=16, tessera_hidden_ch=None,
-                 tessera_hidden_depth=0, height_specialist_depth=0):
+                 tessera_hidden_depth=0, height_specialist_depth=0,
+                 base_ch=32):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TesseraIoUFusionLightUNet assumes 4 output channels")
@@ -624,7 +626,7 @@ class TesseraIoUFusionLightUNet(nn.Module):
         self.alpha_channels = alpha_channels
         tessera_channels = n_channels - alpha_channels
 
-        self.alpha_unet = LightUNet(alpha_channels, n_classes)
+        self.alpha_unet = LightUNet(alpha_channels, n_classes, base_ch=base_ch)
         self.alpha_unet.head = nn.Identity()
         self.tessera_stem = TesseraCompressionStem(
             tessera_channels,
@@ -633,7 +635,7 @@ class TesseraIoUFusionLightUNet(nn.Module):
             hidden_depth=tessera_hidden_depth,
         )
         self.head = MultiTaskPredictionHead(
-            in_ch=32,
+            in_ch=base_ch,
             out_channels=n_classes,
             presence_extra_ch=tessera_presence_ch,
             height_specialist_depth=height_specialist_depth,
@@ -874,13 +876,13 @@ def infer_model_type(n_channels):
 
 def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 tessera_hidden_ch=None, tessera_hidden_depth=0,
-                height_specialist_depth=0):
+                height_specialist_depth=0, lightunet_base_ch=32):
     selected = model_type.lower()
 
     if selected == "auto":
         selected = infer_model_type(n_channels)
     if selected == "lightunet":
-        return LightUNet(n_channels, n_classes), selected
+        return LightUNet(n_channels, n_classes, base_ch=lightunet_base_ch), selected
     if selected == "decoder":
         selected = "decoder_residual"
     if selected == "decoder_residual":
@@ -901,6 +903,7 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
             tessera_hidden_ch=tessera_hidden_ch,
             tessera_hidden_depth=tessera_hidden_depth,
             height_specialist_depth=height_specialist_depth,
+            base_ch=lightunet_base_ch,
         ), selected
 
     raise ValueError(

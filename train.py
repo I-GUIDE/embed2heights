@@ -152,9 +152,18 @@ def parse_args():
                         "supervision. Default l1 matches legacy behavior.")
     p.add_argument("--huber-delta", type=float, default=1.0,
                    help="Transition point for --height-loss-kind huber.")
+    p.add_argument("--build-height-boost", type=float, default=5.0,
+                   help="Extra per-pixel weight on building-positive pixels inside "
+                        "the height_boost term. 5.0 = legacy (previously hardcoded).")
     p.add_argument("--veg-height-boost", type=float, default=0.0,
                    help="Extra per-pixel weight on vegetation-positive pixels inside "
                         "the height_boost term. 0.0 = legacy (no veg boost).")
+    p.add_argument("--aux-veg-weight", type=float, default=1.0,
+                   help="Multiplier on aux_height_vegetation_loss only. 1.0 = legacy. "
+                        "Values > 1 amplify the vegetation specialist's direct L1 "
+                        "training signal without touching the shared trunk or the "
+                        "mixed-height loss — isolates veg-side learning from the "
+                        "presence classifier and building specialist.")
     p.add_argument("--iou-loss-kind", default="tversky",
                    choices=["tversky", "focal"],
                    help="Auxiliary IoU loss form for the presence head under "
@@ -164,6 +173,10 @@ def parse_args():
                    help="Focusing parameter for --iou-loss-kind focal.")
     p.add_argument("--focal-alpha", type=float, default=0.25,
                    help="Positive-class weight for --iou-loss-kind focal.")
+    p.add_argument("--lightunet-base-ch", type=int, default=32,
+                   help="Base channel width of LightUNet (also used inside "
+                        "tessera_iou_fusion). Decoder channels scale as "
+                        "(b, 2b, 4b, 8b). Default 32 = legacy.")
     p.add_argument("--height-specialist-depth", type=int, default=0,
                    help="Extra ConvGNAct layers prepended to the per-class height "
                         "specialist projections (building/vegetation). 0 = legacy 1x1 "
@@ -297,9 +310,12 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "tessera_hidden_ch":   args.tessera_hidden_ch,
         "tessera_hidden_depth": args.tessera_hidden_depth,
         "height_specialist_depth": args.height_specialist_depth,
+        "lightunet_base_ch":   args.lightunet_base_ch,
         "height_loss_kind":    args.height_loss_kind,
         "huber_delta":         args.huber_delta,
+        "build_height_boost":  args.build_height_boost,
         "veg_height_boost":    args.veg_height_boost,
+        "aux_veg_weight":      args.aux_veg_weight,
         "iou_loss_kind":       args.iou_loss_kind,
         "focal_gamma":         args.focal_gamma,
         "focal_alpha":         args.focal_alpha,
@@ -431,6 +447,7 @@ def main():
         tessera_hidden_ch=args.tessera_hidden_ch,
         tessera_hidden_depth=args.tessera_hidden_depth,
         height_specialist_depth=args.height_specialist_depth,
+        lightunet_base_ch=args.lightunet_base_ch,
     )
     model = model.to(device)
     print(f"Using model: {selected_model} (input channels={n_channels})")
@@ -448,7 +465,9 @@ def main():
         fraction_mae_weight=args.fraction_mae_weight,
         height_loss_kind=args.height_loss_kind,
         huber_delta=args.huber_delta,
+        build_height_boost=args.build_height_boost,
         veg_height_boost=args.veg_height_boost,
+        aux_veg_weight=args.aux_veg_weight,
         iou_loss_kind=args.iou_loss_kind,
         focal_gamma=args.focal_gamma,
         focal_alpha=args.focal_alpha,
@@ -462,7 +481,9 @@ def main():
         f"fraction_mae_weight={args.fraction_mae_weight}, "
         f"height_loss_kind={args.height_loss_kind}, "
         f"huber_delta={args.huber_delta}, "
+        f"build_height_boost={args.build_height_boost}, "
         f"veg_height_boost={args.veg_height_boost}, "
+        f"aux_veg_weight={args.aux_veg_weight}, "
         f"iou_loss_kind={args.iou_loss_kind}, "
         f"focal_gamma={args.focal_gamma}, "
         f"focal_alpha={args.focal_alpha}"
