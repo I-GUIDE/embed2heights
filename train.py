@@ -121,7 +121,6 @@ DEFAULTS = {
     "aux_weight":      1.0,
     "seed":            42,
     "model_type":      "auto",
-    "amp":             True,
     "grad_accum":      1,
     "num_workers":     8,
     "prefetch_factor": 4,
@@ -198,8 +197,6 @@ def parse_args():
     p.add_argument("--epochs",         type=int,   default=DEFAULTS["epochs"])
     p.add_argument("--lr",             type=float, default=DEFAULTS["lr"])
     p.add_argument("--weight-decay",   type=float, default=DEFAULTS["weight_decay"])
-    p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=DEFAULTS["amp"],
-                   help="Use CUDA automatic mixed precision when available.")
     p.add_argument("--grad-accum-steps", type=int, default=DEFAULTS["grad_accum"],
                    help="Accumulate gradients over N mini-batches before optimizer step.")
     p.add_argument("--num-workers",    type=int, default=DEFAULTS["num_workers"])
@@ -216,7 +213,9 @@ def parse_args():
                         "(3) dynamic=None + mark_dynamic on batch axis so one graph "
                         "handles both full and ragged final batches — no mid-epoch "
                         "recompiles, no dropped samples; "
-                        "(4) channels_last memory layout for conv throughput.")
+                        "(4) channels_last memory layout for conv throughput; "
+                        "(5) CUDA AMP in bf16 on A100/H100 (fp16 fallback on older "
+                        "GPUs) — same dynamic range as fp32, no GradScaler headaches.")
     p.add_argument("--profile-steps", type=int, default=0,
                    help="If >0, time data/forward/backward separately for this many "
                         "steps, print breakdown, and exit.")
@@ -265,10 +264,6 @@ def parse_args():
                    help="Focusing parameter for --iou-loss-kind focal.")
     p.add_argument("--focal-alpha", type=float, default=0.25,
                    help="Positive-class weight for --iou-loss-kind focal.")
-    p.add_argument("--bottleneck-attn", action="store_true",
-                   help="Enable self-attention on the LightUNet bottleneck (x4, "
-                        "c4 channels, H/8 x W/8). Adds global context at the "
-                        "semantically richest level. Off = baseline behavior.")
     p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True,
                    help="On-the-fly augmentation at train time; subgroup controlled "
                         "by --augment-mode. Val is never augmented.")
@@ -455,7 +450,6 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "tessera_hidden_depth": args.tessera_hidden_depth,
         "height_specialist_depth": args.height_specialist_depth,
         "lightunet_base_ch":   args.lightunet_base_ch,
-        "bottleneck_attn":     args.bottleneck_attn,
         "augment":             args.augment,
         "augment_mode":        args.augment_mode if args.augment else "none",
         "aux_tversky_weight":  args.aux_tversky_weight,
@@ -665,7 +659,8 @@ def main():
     loss_curve_path = os.path.join(exp_dir, "loss_curve.png")
     loss_history_path = os.path.join(exp_dir, "loss_history.jsonl")
 
-    use_amp = args.amp and device.type == "cuda"
+    # AMP is part of the --compile "go fast" bundle on CUDA.
+    use_amp = args.compile and device.type == "cuda"
     # bf16 is the right AMP dtype on A100 (same dynamic range as fp32, no GradScaler headaches).
     # Fall back to fp16 on older GPUs that don't support bf16.
     amp_dtype = torch.float16
@@ -705,7 +700,6 @@ def main():
         tessera_hidden_depth=args.tessera_hidden_depth,
         height_specialist_depth=args.height_specialist_depth,
         lightunet_base_ch=args.lightunet_base_ch,
-        use_bottleneck_attn=args.bottleneck_attn,
     )
     model = model.to(device)
     if channels_last:

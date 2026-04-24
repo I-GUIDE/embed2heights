@@ -59,53 +59,8 @@ class UpsampleBlock(nn.Module):
         return x
 
 
-class BottleneckAttnBlock(nn.Module):
-    """Pre-LN transformer block (MHSA + MLP) for the UNet bottleneck.
-
-    Operates on (B, C, H, W) feature maps: flattens the spatial dims to tokens,
-    runs multi-head self-attention via F.scaled_dot_product_attention (PyTorch
-    picks the flash-attn kernel on A100), then folds back. Adds global context
-    at the semantically richest, spatially smallest feature level.
-    """
-
-    def __init__(self, dim, num_heads=8, mlp_ratio=2.0, drop=0.0):
-        super().__init__()
-        if dim % num_heads != 0:
-            raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.norm1 = nn.LayerNorm(dim)
-        self.qkv = nn.Linear(dim, dim * 3, bias=True)
-        self.proj = nn.Linear(dim, dim)
-        self.norm2 = nn.LayerNorm(dim)
-        hidden = int(dim * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, dim),
-            nn.Dropout(drop),
-        )
-
-    def forward(self, x):
-        # (B, C, H, W) -> (B, N, C)
-        B, C, H, W = x.shape
-        N = H * W
-        h = x.flatten(2).transpose(1, 2)
-        # MHSA (pre-LN)
-        y = self.norm1(h)
-        qkv = self.qkv(y).reshape(B, N, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)
-        y = F.scaled_dot_product_attention(q, k, v)
-        y = y.transpose(1, 2).reshape(B, N, C)
-        h = h + self.proj(y)
-        # MLP (pre-LN)
-        h = h + self.mlp(self.norm2(h))
-        return h.transpose(1, 2).reshape(B, C, H, W)
-
-
 class LightUNet(nn.Module):
-    def __init__(self, n_channels, n_classes, base_ch=32, use_bottleneck_attn=False,
-                 bottleneck_attn_heads=8, bottleneck_attn_mlp_ratio=2.0):
+    def __init__(self, n_channels, n_classes, base_ch=32):
         super(LightUNet, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
@@ -117,14 +72,6 @@ class LightUNet(nn.Module):
         self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c1, c2))
         self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c2, c3))
         self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c3, c4))
-
-        # Global context at the bottleneck. 1024 tokens (32x32) x c4 channels is
-        # trivially cheap on A100 and lets each location see the whole patch.
-        self.bottleneck_attn = (
-            BottleneckAttnBlock(c4, num_heads=bottleneck_attn_heads,
-                                mlp_ratio=bottleneck_attn_mlp_ratio)
-            if use_bottleneck_attn else nn.Identity()
-        )
 
         self.up1 = UpsampleBlock(c4, c3)
         self.conv1 = DoubleConv(c4, c3)
@@ -142,7 +89,6 @@ class LightUNet(nn.Module):
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
-        x4 = self.bottleneck_attn(x4)
 
         x = self.up1(x4)
         x = torch.cat([x3, x], dim=1)
@@ -673,7 +619,7 @@ class TesseraIoUFusionLightUNet(nn.Module):
     def __init__(self, n_channels, n_classes=4, alpha_channels=64,
                  tessera_presence_ch=16, tessera_hidden_ch=None,
                  tessera_hidden_depth=0, height_specialist_depth=0,
-                 base_ch=32, use_bottleneck_attn=False):
+                 base_ch=32):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TesseraIoUFusionLightUNet assumes 4 output channels")
@@ -686,8 +632,7 @@ class TesseraIoUFusionLightUNet(nn.Module):
         self.alpha_channels = alpha_channels
         tessera_channels = n_channels - alpha_channels
 
-        self.alpha_unet = LightUNet(alpha_channels, n_classes, base_ch=base_ch,
-                                    use_bottleneck_attn=use_bottleneck_attn)
+        self.alpha_unet = LightUNet(alpha_channels, n_classes, base_ch=base_ch)
         self.alpha_unet.head = nn.Identity()
         self.tessera_stem = TesseraCompressionStem(
             tessera_channels,
@@ -937,15 +882,13 @@ def infer_model_type(n_channels):
 
 def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 tessera_hidden_ch=None, tessera_hidden_depth=0,
-                height_specialist_depth=0, lightunet_base_ch=32,
-                use_bottleneck_attn=False):
+                height_specialist_depth=0, lightunet_base_ch=32):
     selected = model_type.lower()
 
     if selected == "auto":
         selected = infer_model_type(n_channels)
     if selected == "lightunet":
-        return LightUNet(n_channels, n_classes, base_ch=lightunet_base_ch,
-                         use_bottleneck_attn=use_bottleneck_attn), selected
+        return LightUNet(n_channels, n_classes, base_ch=lightunet_base_ch), selected
     if selected == "decoder":
         selected = "decoder_residual"
     if selected == "decoder_residual":
@@ -967,7 +910,6 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
             tessera_hidden_depth=tessera_hidden_depth,
             height_specialist_depth=height_specialist_depth,
             base_ch=lightunet_base_ch,
-            use_bottleneck_attn=use_bottleneck_attn,
         ), selected
 
     raise ValueError(
