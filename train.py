@@ -10,6 +10,7 @@ import os
 import json
 import random
 import argparse
+import time
 import numpy as np
 import torch
 import torch.optim as optim
@@ -57,8 +58,10 @@ DEFAULTS = {
     "model_type":      "auto",
     "amp":             True,
     "grad_accum":      1,
-    "num_workers":     4,
-    "prefetch_factor": 1,
+    "num_workers":     8,
+    "prefetch_factor": 4,
+    "compile":         True,
+    "channels_last":   True,
 }
 
 
@@ -131,6 +134,18 @@ def parse_args():
     p.add_argument("--num-workers",    type=int, default=DEFAULTS["num_workers"])
     p.add_argument("--prefetch-factor", type=int, default=DEFAULTS["prefetch_factor"],
                    help="Batches prefetched per DataLoader worker when num_workers > 0.")
+    p.add_argument("--compile", action=argparse.BooleanOptionalAction,
+                   default=DEFAULTS["compile"],
+                   help="Wrap model with torch.compile for fused kernels.")
+    p.add_argument("--channels-last", action=argparse.BooleanOptionalAction,
+                   default=DEFAULTS["channels_last"],
+                   help="Use channels_last memory layout for conv throughput on A100.")
+    p.add_argument("--profile-steps", type=int, default=0,
+                   help="If >0, time data/forward/backward separately for this many "
+                        "steps, print breakdown, and exit.")
+    p.add_argument("--deterministic", action="store_true",
+                   help="Submission-safe mode: seeds workers, ordered DataLoader, "
+                        "deterministic cuDNN, TF32 off. Slower but reproducible.")
     p.add_argument("--aux-weight",     type=float, default=DEFAULTS["aux_weight"],
                    help="Weight for auxiliary multi-head supervision.")
     p.add_argument("--loss-preset", default=DEFAULTS["loss_preset"], choices=LOSS_PRESET_CHOICES,
@@ -266,7 +281,22 @@ def make_dataloaders(args, device):
         loader_kwargs["persistent_workers"] = True
         loader_kwargs["prefetch_factor"] = args.prefetch_factor
 
-    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    # in_order=False lets faster workers deliver batches ahead of slower ones
+    # (e.g. when NFS page-cache state varies across samples). Train only —
+    # val stays ordered so eval metrics are deterministic.
+    train_in_order = bool(getattr(args, "deterministic", False))
+    train_loader_kwargs = dict(loader_kwargs)
+    if getattr(args, "deterministic", False):
+        # Seed each worker so its RNG state is reproducible across runs.
+        def _seed_worker(worker_id):
+            import random as _r
+            worker_seed = (args.seed + worker_id) % (2 ** 32)
+            np.random.seed(worker_seed)
+            _r.seed(worker_seed)
+        train_loader_kwargs["worker_init_fn"] = _seed_worker
+        loader_kwargs["worker_init_fn"] = _seed_worker
+    train_loader = DataLoader(train_ds, shuffle=True, in_order=train_in_order,
+                              **train_loader_kwargs)
     val_loader   = DataLoader(val_ds,   shuffle=False, **loader_kwargs)
     return train_loader, val_loader, train_ds, val_ds, n_channels
 
@@ -331,13 +361,36 @@ def save_experiment_config(exp_dir, args, device, use_amp):
     print(f"Created experiment folder: {exp_dir}")
 
 
+def _print_profile_summary(prof, n):
+    """Pretty-print the per-phase timing collected in run_epoch."""
+    import statistics
+    print("\n========== PROFILE SUMMARY ==========")
+    print(f"Steps measured: {n}")
+    print(f"{'phase':<12} {'mean (ms)':>12} {'median (ms)':>14} {'p90 (ms)':>12} {'% of total':>12}")
+    total_mean = statistics.mean(prof["total"]) if prof["total"] else 1.0
+    for phase in ("data", "h2d", "forward", "backward", "optimizer", "total"):
+        vals = prof[phase]
+        if not vals:
+            continue
+        mean_ms = statistics.mean(vals) * 1000
+        med_ms = statistics.median(vals) * 1000
+        p90_ms = sorted(vals)[int(0.9 * (len(vals) - 1))] * 1000
+        pct = 100 * statistics.mean(vals) / total_mean if phase != "total" else 100.0
+        print(f"{phase:<12} {mean_ms:>12.1f} {med_ms:>14.1f} {p90_ms:>12.1f} {pct:>11.1f}%")
+    print("=====================================")
+
+
 def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
-              grad_accum_steps=1, use_amp=False, desc=""):
+              grad_accum_steps=1, use_amp=False, amp_dtype=torch.float16,
+              channels_last=False, profile_steps=0, desc=""):
     """Train or eval one epoch. Returns (avg_loss, component_avgs)."""
     model.train(train)
-    running_loss = 0.0
-    component_sums = {}
+    running_loss_t = torch.zeros((), device=device)
+    component_sums_t = {}
     samples_seen = 0
+    use_scaler = scaler is not None and scaler.is_enabled()
+    prof = {"data": [], "h2d": [], "forward": [], "backward": [], "optimizer": [], "total": []}
+    sync_cuda = (device.type == "cuda") and profile_steps > 0
 
     pbar = tqdm(loader, desc=desc, leave=False)
     if train:
@@ -346,15 +399,36 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
     context = torch.enable_grad() if train else torch.no_grad()
     non_blocking = device.type == "cuda"
     with context:
-        for step, (imgs, targets, masks) in enumerate(pbar, start=1):
+        loader_iter = iter(pbar)
+        step = 0
+        while True:
+            step += 1
+            t_step_start = time.perf_counter()
+            try:
+                imgs, targets, masks = next(loader_iter)
+            except StopIteration:
+                step -= 1
+                if profile_steps > 0 and prof["total"]:
+                    _print_profile_summary(prof, len(prof["total"]))
+                    import sys; sys.exit(0)
+                break
+            t_after_data = time.perf_counter()
             imgs = imgs.to(device, non_blocking=non_blocking)
             targets = targets.to(device, non_blocking=non_blocking)
             masks = masks.to(device, non_blocking=non_blocking)
+            if channels_last:
+                imgs = imgs.contiguous(memory_format=torch.channels_last)
+            if sync_cuda:
+                torch.cuda.synchronize()
+            t_after_h2d = time.perf_counter()
 
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 outputs = forward_for_training(model, imgs)
                 loss, loss_components = criterion(outputs, targets, masks)
                 step_loss = loss / grad_accum_steps if train else loss
+            if sync_cuda:
+                torch.cuda.synchronize()
+            t_after_fwd = time.perf_counter()
 
             if not torch.isfinite(loss):
                 print(f"\nWARN: non-finite loss at step {step}; skipping batch.")
@@ -363,27 +437,56 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
                 continue
 
             if train:
-                scaler.scale(step_loss).backward()
+                if use_scaler:
+                    scaler.scale(step_loss).backward()
+                else:
+                    step_loss.backward()
+                if sync_cuda:
+                    torch.cuda.synchronize()
+            t_after_bwd = time.perf_counter()
+
+            if train:
                 should_step = step % grad_accum_steps == 0 or step == len(loader)
                 if should_step:
-                    scaler.unscale_(optimizer)
+                    if use_scaler:
+                        scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    if use_scaler:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+            if sync_cuda:
+                torch.cuda.synchronize()
+            t_after_opt = time.perf_counter()
+
+            if profile_steps > 0:
+                prof["data"].append(t_after_data - t_step_start)
+                prof["h2d"].append(t_after_h2d - t_after_data)
+                prof["forward"].append(t_after_fwd - t_after_h2d)
+                prof["backward"].append(t_after_bwd - t_after_fwd)
+                prof["optimizer"].append(t_after_opt - t_after_bwd)
+                prof["total"].append(t_after_opt - t_step_start)
+                if step >= profile_steps:
+                    _print_profile_summary(prof, profile_steps)
+                    import sys; sys.exit(0)
 
             bs = imgs.size(0)
-            running_loss += loss.item() * bs
+            running_loss_t += loss.detach() * bs
             for name, value in loss_components.items():
-                component_sums[name] = component_sums.get(name, 0.0) + value.detach().item() * bs
+                if name not in component_sums_t:
+                    component_sums_t[name] = torch.zeros((), device=device)
+                component_sums_t[name] += value.detach() * bs
             samples_seen += bs
-            avg = running_loss / max(1, samples_seen)
-            pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{avg:.4f}")
+            if step % 20 == 0 or step == len(loader):
+                avg = (running_loss_t / max(1, samples_seen)).item()
+                pbar.set_postfix(avg=f"{avg:.4f}")
 
-    avg_loss = running_loss / max(1, samples_seen)
+    avg_loss = (running_loss_t / max(1, samples_seen)).item()
     comp_avg = {
-        name: value / max(1, samples_seen)
-        for name, value in component_sums.items()
+        name: (value / max(1, samples_seen)).item()
+        for name, value in component_sums_t.items()
     }
     return avg_loss, comp_avg
 
@@ -431,6 +534,27 @@ def main():
     loss_history_path = os.path.join(exp_dir, "loss_history.jsonl")
 
     use_amp = args.amp and device.type == "cuda"
+    # bf16 is the right AMP dtype on A100 (same dynamic range as fp32, no GradScaler headaches).
+    # Fall back to fp16 on older GPUs that don't support bf16.
+    amp_dtype = torch.float16
+    if use_amp and torch.cuda.is_bf16_supported():
+        amp_dtype = torch.bfloat16
+    if device.type == "cuda":
+        if args.deterministic:
+            # Submission-safe: cuDNN chooses a fixed (slower) algo each call,
+            # TF32 off so matmuls stay bit-compatible, autograd flags a warning
+            # on any op that has no deterministic implementation.
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            torch.use_deterministic_algorithms(True, warn_only=True)
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            torch.cuda.manual_seed_all(args.seed)
+        else:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+    channels_last = args.channels_last and device.type == "cuda"
     grad_accum_steps = max(1, args.grad_accum_steps)
     save_experiment_config(exp_dir, args, device, use_amp)
     open(loss_history_path, "w").close()
@@ -450,10 +574,20 @@ def main():
         lightunet_base_ch=args.lightunet_base_ch,
     )
     model = model.to(device)
+    if channels_last:
+        model = model.to(memory_format=torch.channels_last)
+    if args.compile and device.type == "cuda" and hasattr(torch, "compile"):
+        # "default" mode compiles kernels without CUDA graphs, so it doesn't
+        # retrace at train<->val boundaries. ~1 min one-time compile vs the
+        # multi-minute retraces "reduce-overhead" triggered here.
+        model = torch.compile(model, mode="default", dynamic=False)
     print(f"Using model: {selected_model} (input channels={n_channels})")
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    fused_ok = device.type == "cuda"
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr,
+                            weight_decay=args.weight_decay, fused=fused_ok)
+    # GradScaler is only meaningful for fp16; bf16 and fp32 don't need it.
+    scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
     resolved_loss_preset = resolve_loss_preset(args)
     loss_lambdas = effective_loss_lambdas(args)
@@ -497,11 +631,14 @@ def main():
         tr_loss, tr_comp = run_epoch(
             model, train_loader, criterion, optimizer, scaler, device,
             train=True, grad_accum_steps=grad_accum_steps, use_amp=use_amp,
+            amp_dtype=amp_dtype, channels_last=channels_last,
+            profile_steps=args.profile_steps,
             desc=f"Epoch {epoch + 1}/{args.epochs} [train]",
         )
         val_loss, val_comp = run_epoch(
             model, val_loader, criterion, optimizer, scaler, device,
             train=False, use_amp=use_amp,
+            amp_dtype=amp_dtype, channels_last=channels_last,
             desc=f"Epoch {epoch + 1}/{args.epochs} [val]",
         )
         train_losses.append(tr_loss)
