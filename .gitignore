@@ -51,4 +51,4 @@ logs/figures
 configs/*
 
 predict_tta.py
-
+slurm-*
