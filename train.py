@@ -209,6 +209,16 @@ def parse_args():
     p.add_argument("--compile", action=argparse.BooleanOptionalAction,
                    default=DEFAULTS["compile"],
                    help="Wrap model with torch.compile for fused kernels.")
+    p.add_argument("--compile-mode", default="default",
+                   choices=["default", "reduce-overhead", "max-autotune",
+                            "max-autotune-no-cudagraphs"],
+                   help="torch.compile mode. 'default' = balanced (~1min compile, "
+                        "no CUDA graphs, no train/val retrace). "
+                        "'max-autotune-no-cudagraphs' = autotunes Triton kernels "
+                        "without CUDA graphs (~5-10min compile, typically 5-15%% "
+                        "steady-state speedup on H100, no retrace pathology). "
+                        "'reduce-overhead' / 'max-autotune' use CUDA graphs and "
+                        "retrace at train<->val boundary — avoid here.")
     p.add_argument("--channels-last", action=argparse.BooleanOptionalAction,
                    default=DEFAULTS["channels_last"],
                    help="Use channels_last memory layout for conv throughput on A100.")
@@ -457,6 +467,7 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "ema":                 args.ema,
         "ema_decay":           args.ema_decay if args.ema else None,
         "lr_scheduler":        args.scheduler,
+        "compile_mode":        args.compile_mode if args.compile else None,
         "height_loss_kind":    args.height_loss_kind,
         "huber_delta":         args.huber_delta,
         "build_height_boost":  args.build_height_boost,
@@ -696,10 +707,12 @@ def main():
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
     if args.compile and device.type == "cuda" and hasattr(torch, "compile"):
-        # "default" mode compiles kernels without CUDA graphs, so it doesn't
-        # retrace at train<->val boundaries. ~1 min one-time compile vs the
-        # multi-minute retraces "reduce-overhead" triggered here.
-        model = torch.compile(model, mode="default", dynamic=False)
+        # CUDA-graph modes ('reduce-overhead', 'max-autotune') retrace at
+        # train<->val boundary because val skips augmentation/dropout, which
+        # changes shapes/strides; avoid them here. The non-cudagraph autotune
+        # mode is the only one that gets Triton autotuning without retracing.
+        model = torch.compile(model, mode=args.compile_mode, dynamic=False)
+        print(f"torch.compile: mode={args.compile_mode}")
     print(f"Using model: {selected_model} (input channels={n_channels})")
 
     fused_ok = device.type == "cuda"
