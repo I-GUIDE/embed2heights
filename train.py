@@ -33,18 +33,36 @@ class ModelEMA:
     Tracked on the same device as the model. `store()`/`restore()` let the
     caller temporarily swap EMA weights in (e.g. for validation) without
     losing the live training weights.
+
+    Decay schedule (Karras-style warmup):
+        d_t = min(target_decay, (1 + t) / (warmup + t))
+    The shadow tracks the live model exactly at t=0 and ramps to
+    `target_decay` over ~10x `warmup` steps. Without this, `target_decay
+    = 0.9995` keeps the random-init contribution above 50% for the first
+    ~1400 steps, so EMA-validated runs report garbage "best" checkpoints
+    until the shadow catches up. The first version of this class shipped
+    without warmup and produced exactly that pathology on run 80335_1.
     """
-    def __init__(self, model, decay=0.9995):
-        self.decay = float(decay)
+    def __init__(self, model, decay=0.9995, warmup=10):
+        self.target_decay = float(decay)
+        self.warmup = float(warmup)
+        self.step = 0
         # Clone current params/buffers into a detached shadow state dict.
         src = _unwrapped_state_dict(model)
         self.shadow = {k: v.detach().clone() for k, v in src.items()}
         self._backup = None
 
+    def _current_decay(self):
+        # Karras-style: at step 0, decay=0 (shadow == live); ramps to
+        # target_decay as 1/(1+1/t)-style asymptote.
+        warmed = (1.0 + self.step) / (self.warmup + self.step)
+        return min(self.target_decay, warmed)
+
     @torch.no_grad()
     def update(self, model):
+        self.step += 1
+        d = self._current_decay()
         src = _unwrapped_state_dict(model)
-        d = self.decay
         for k, v in src.items():
             sv = self.shadow[k]
             if v.dtype.is_floating_point:
