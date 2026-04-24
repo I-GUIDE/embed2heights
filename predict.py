@@ -131,6 +131,9 @@ def resolve_tessera_model_kwargs(args, exp_dir):
             if args.lightunet_base_ch is not None
             else cfg.get("lightunet_base_ch", 32)
         ),
+        # Pulled from training_params.json so the architecture matches what
+        # was trained; no CLI flag since it must mirror training exactly.
+        "use_bottleneck_attn": bool(cfg.get("bottleneck_attn", False)),
     }
 
 
@@ -200,7 +203,15 @@ def main():
         **tessera_kwargs,
     )
     model = model.to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    # torch.compile wraps the model in _orig_mod; strip that prefix at load
+    # time so checkpoints from compiled training runs load into the plain
+    # (uncompiled) inference model.
+    state = torch.load(model_path, map_location=device)
+    state = {
+        (k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
+        for k, v in state.items()
+    }
+    model.load_state_dict(state)
     model.eval()
     print(f"Loaded model: {selected_model} from {model_path} (input channels={sample_img.shape[0]})")
     if args.thresholds is not None:
