@@ -44,3 +44,11 @@ run.sbatch
 configs/
 *.sbatch
 *.out
+
+tools/plot*
+
+logs/figures
+configs/*
+
+predict_tta.py
+

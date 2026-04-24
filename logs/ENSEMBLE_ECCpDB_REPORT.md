@@ -1,19 +1,35 @@
 # Ensemble ECCpDB Submission Report
 
+> **STATUS (updated 2026-04-22 afternoon):** The original "ensemble is the
+> gap-closer" attribution in this report was **wrong** and has been
+> superseded. The follow-up `continuous` submission (posted 14:19 the same
+> day) came back at `0.3740`, essentially tied with the prior single-model
+> `fusion_closs` public score (`0.3750`) — which means the 5-way ensemble by
+> itself contributed **~0** to public score. The `+0.0469` improvement of
+> the first submission over continuous was entirely due to the
+> **binary-bake + val-tuned per-class thresholds**.
+>
+> The Outcome section at the bottom lays out the corrected interpretation
+> and the new strategy implications. The pre-Outcome analysis is kept as-is
+> for traceability; read it with that banner in mind.
+
 **Date:** 2026-04-22
-**Submission:** `submission_ECCpDB_thr_0575_0525_0725.zip` (binarized, 217.9 MB)
-**Public Score:** **0.4209** (Final_Score 0.4209)
-**Local Val Score:** 0.4692 (leaderboard-aligned, val-only 405 samples)
-**Val → Public gap:** **0.0483** (vs historical ~0.08 on prior submissions)
+**Submission A (binary, tuned):** `submission_ECCpDB_thr_0575_0525_0725.zip` (217.9 MB)
+**Submission B (continuous):** `submission_ECCpDB_continuous.zip` (836.0 MB)
+**Public Score A:** **0.4209** · **Public Score B:** **0.3740**
+**Local Val Score:** 0.4692 (tuned) / ~0.465 (base) — leaderboard-aligned, val-only 405 samples
+**Val → Public gap A (binary):** `0.0483` · **Gap B (continuous):** `~0.091`
 
-## TL;DR
+## TL;DR  (corrected)
 
-A 5-way mean ensemble of `tessera_iou_fusion` variants pushed the public
-leaderboard from `0.3750` (previous best single-model continuous submission)
-to `0.4209` — a jump of `+0.0459`. The val → public gap collapsed from the
-historically stable `~0.08` to `~0.05`. Analysis strongly attributes the gap
-reduction to ensemble variance averaging rather than the binarization format
-or the per-class threshold bake.
+A 5-way mean ensemble of `tessera_iou_fusion` variants, submitted as binary
+with val-tuned thresholds, scored `0.4209` on public. The SAME ensemble
+submitted continuous scored `0.3740`. Conclusion: **the threshold bake carried
+the +0.047 public gain**, and the ensemble averaging on its own provided no
+gap reduction relative to a single-model continuous baseline. Per-class
+deltas are dominated by `IOU_VEG` (+0.145 from threshold bake alone), which
+points to a large band of borderline-0.5 vegetation probabilities on the
+public set that the `veg=0.525` threshold rescues.
 
 ## Ensemble Configuration
 
@@ -84,7 +100,12 @@ Gap compression: `~0.033`. The question is: which part of the pipeline bought
 that compression — ensemble averaging, binarization, or the per-class
 threshold bake?
 
-### Elimination argument
+### Elimination argument  *(⚠️ superseded by the Outcome section — kept for traceability)*
+
+> The claims in this subsection turned out to be wrong. The continuous
+> submission contradicted all three bullets: threshold tuning *shrank* the
+> gap (did not widen), binarization format was NOT gap-neutral in practice,
+> and ensemble averaging on its own did NOT compress the gap.
 
 - **Threshold tuning** is expected to *widen* val→public gap, not shrink it.
   The tuned thresholds `(0.575, 0.525, 0.725)` are optimized on val and
@@ -155,6 +176,119 @@ Decision matrix:
 Tomorrow's submission will fill in the final piece. Regardless of outcome,
 ensembling the strong fusion-family checkpoints is now a confirmed standard
 move for this leaderboard.
+
+## Outcome — Continuous Submission Result  (2026-04-22 14:19)
+
+Posted the companion `submission_ECCpDB_continuous.zip` the same day.
+Result overturned the pre-registered hypothesis.
+
+### Measured numbers
+
+| Submission | Class format | Score | IOU_BUILD | IOU_VEG | IOU_WATER | RMSE_bH | RMSE_vH |
+|---|---|---:|---:|---:|---:|---:|---:|
+| A · ECCpDB binary @ `(0.575, 0.525, 0.725)` | `{0, 1}` | **0.4209** | 0.4193 | **0.8117** | 0.4590 | 2.1081 | 3.7224 |
+| B · ECCpDB continuous                         | float `[0, 1]` | **0.3740** | 0.3509 | 0.6663 | 0.4062 | 2.1081 | 3.7224 |
+| Δ (A − B) — threshold bake alone              | — | **+0.0469** | +0.0684 | **+0.1454** | +0.0528 | 0.0000 ✓ | 0.0000 ✓ |
+
+Note: `RMSE_bH` and `RMSE_vH` are identical to 4 decimal places in both
+submissions (height channel is untouched by `--binarize-thresholds`).
+Perfect control — the entire `+0.0469` score delta is attributable to the
+class-channel thresholding alone.
+
+### Decision-matrix row that fired
+
+From the planned decision matrix above:
+
+| Continuous public score | Interpretation | Future strategy |
+|---|---|---|
+| *(fired)* `< 0.40` (drop > 0.02) | Threshold bake contributed meaningfully | Keep per-class threshold sweep + binarization in the pipeline |
+
+The drop was `0.0469`, well past the `0.02` breakpoint. The "threshold bake
+contributes meaningfully" branch is selected.
+
+### Corrected gap accounting
+
+Relevant gap data points, now with both A and B:
+
+| Submission | val | public | gap |
+|---|---:|---:|---:|
+| `lightunet_v35head` (single, continuous) | 0.4213 | 0.3406 | 0.0807 |
+| `fusion_closs` = C_h96d2 (single, calibrated continuous) | 0.4561 | 0.3750 | 0.0811 |
+| **ECCpDB continuous** (5-way ensemble, raw 0.5) | ~0.465 | 0.3740 | **~0.091** |
+| **ECCpDB binary tuned** (5-way ensemble, `(0.575, 0.525, 0.725)` bake) | 0.4692 | 0.4209 | **0.0483** |
+
+The 5-way ensemble in continuous form has a **slightly worse gap than a single
+model in continuous form** (`0.091` vs `~0.081`). The `0.08 → 0.048` compression
+seen in the binary submission therefore comes almost entirely from the
+threshold bake, not from ensemble averaging.
+
+### Corrected mechanism
+
+Ensemble averaging softens per-pixel probabilities toward 0.5:
+
+- Five independently-trained members produce sharper (more confident)
+  per-pixel sigmoids than their mean.
+- Averaging collapses extreme probabilities toward the prior.
+- When the server applies a hard `pred > 0.5`, the now-softer predictions
+  cross the boundary on more pixels than the sharp single-model predictions
+  would have. Per-class IoU degrades.
+- Evidence: all three continuous IoUs are **below** `fusion_closs`'s single-
+  model IoUs (`BUILD 0.3509 < 0.3626`, `VEG 0.6663 < 0.6824`,
+  `WATER 0.4062 < 0.4142`). The ensemble is genuinely worse than a single
+  member at server threshold 0.5.
+
+The baked thresholds `(0.575, 0.525, 0.725)` recover — and then some — what
+averaging destroyed, because they are calibrated to where the ensemble's
+probability mass actually sits. The largest single contribution is to
+vegetation: `IOU_VEG 0.6663 → 0.8117 (+0.145)` says the public set contains
+a large band of vegetation pixels with ensemble probability in roughly
+`[0.5, 0.525]` that are true positives and that the lowered threshold
+rescues.
+
+### Why val dramatically underestimates the threshold's value on public
+
+On val the tuned threshold adds only `+0.004` (`0.4650 → 0.4692`). On public
+it adds `+0.047`. Two plausible contributors:
+
+1. **Distribution shift at the decision boundary.** The public subset likely
+   has more borderline probabilities than val — tiny threshold shifts move
+   many more pixels there than here.
+2. **Val threshold sweep is low-DOF and robust.** Only 3 thresholds on a
+   `0.025` grid, greedy per-class. This kind of search barely over-fits the
+   ~405 val samples, so whatever lift it finds tends to generalize.
+
+Previous worry about "threshold sweep overfitting val" (see earlier
+discussion) is now empirically rejected for this pipeline.
+
+### Future strategy
+
+1. **Always bake val-tuned thresholds on submission.** Continuous form is
+   systematically worse here. There is no free "submit continuous, let the
+   server decide" option on this leaderboard.
+2. **Threshold sweep is mandatory, not optional.** The val→public transfer
+   is strong for this 3-threshold search; the cost is one minute of CPU per
+   ensemble and the benefit is on the order of `+0.05` public score.
+3. **Ensemble-vs-single remains an open question at the binary+tuned
+   setting.** All we proved is that ensembling without threshold tuning is a
+   wash or slightly harmful. Whether a *single-model* binary-tuned
+   submission (e.g. E_specialist_d2 with per-class thresholds) matches or
+   beats the ensemble version is untested. Worth one slot: if it lands near
+   `0.42`, the 5-model inference cost can be dropped entirely.
+4. **Try calibrating the ensemble pre-threshold.** A simple per-class
+   logit shift to re-sharpen the averaged probabilities may recover the
+   variance benefit without requiring the explicit threshold bake, and may
+   unlock further per-class gain.
+
+### What this outcome does NOT tell us
+
+- It does not establish whether ensemble + tuned-thresholds beats
+  single-model + tuned-thresholds on public. Same threshold search applied
+  to a single member's predictions might close most or all of the `+0.047`
+  gap.
+- It does not rule out gains from different ensemble compositions
+  (weighted, non-`fusion` family members, stacking).
+- It does not evaluate any calibration method (logit shift, isotonic,
+  Platt) applied to ensemble output.
 
 ## Reproduction
 
