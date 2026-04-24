@@ -192,10 +192,11 @@ def parse_args():
                    help="Enable self-attention on the LightUNet bottleneck (x4, "
                         "c4 channels, H/8 x W/8). Adds global context at the "
                         "semantically richest level. Off = baseline behavior.")
-    p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=False,
+    p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True,
                    help="D4 (flips + rot90) on-the-fly augmentation at train time. "
-                        "Off by default so baseline runs are bit-comparable; pass "
-                        "--augment to enable. Val is never augmented.")
+                        "~5%% CPU overhead hidden behind GPU work; effectively 8x "
+                        "the unique views per epoch. Val is never augmented. Pass "
+                        "--no-augment to disable for a direct baseline A/B.")
     p.add_argument("--lightunet-base-ch", type=int, default=32,
                    help="Base channel width of LightUNet (also used inside "
                         "tessera_iou_fusion). Decoder channels scale as "
