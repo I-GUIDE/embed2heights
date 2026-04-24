@@ -7,9 +7,9 @@ Baselines for the **ESA Embed2Heights** competition. Each model predicts a 4-cha
 ```
 emb2heights-backbone/
 ├── core/
-│   ├── dataset.py     # PixelEmbeddingDataset, LatentTokenDataset, id/path helpers
-│   ├── model.py       # LightUNet, EmbeddingRefiner, HRNet-W{18,32}, EfficientDecoder256Fast
-│   ├── losses.py      # ImprovedCompositeLoss (MAE + SSIM + Gradient + Tversky + aux)
+│   ├── dataset.py     # PixelEmbeddingDataset, MultiPixelEmbeddingDataset (alpha+tessera fusion), LatentTokenDataset, id/path helpers
+│   ├── model.py       # LightUNet, EmbeddingRefiner, HRNet-W{18,32}, tessera_iou_fusion, EfficientDecoder256Fast
+│   ├── losses.py      # ImprovedCompositeLoss (MAE + SSIM + Gradient + Tversky + aux). SSIMLoss window is a registered buffer so .to(device)/autocast move it with the model
 │   └── metrics.py     # Leaderboard metric helpers (WEIGHTS, binary_iou, compute_weighted_score)
 ├── tools/
 │   ├── download_data.py                   # pull the EOTDL dataset
@@ -23,8 +23,9 @@ emb2heights-backbone/
 ├── splits/               # saved train/val split JSONs (reproducible seed=42 split)
 ├── runs/                 # experiment outputs (gitignored): model_best.pth, predictions/, etc.
 ├── submission/           # zipped test-set predictions ready to upload (gitignored)
+├── slurm_logs/           # SLURM job stdout/stderr (gitignored)
 ├── logs/                 # evaluation / experiment reports
-├── train.py              # single-experiment training
+├── train.py              # single-experiment training. A100-tuned defaults: bf16 autocast, TF32, channels_last, torch.compile(mode=default), fused AdamW, 8 workers + prefetch 4, in_order=False. Flags: --no-compile / --no-channels-last / --profile-steps N (per-phase timing + exit) / --deterministic (submission-safe reproducible mode).
 ├── predict.py            # inference (val or test)
 └── evaluate.py           # compute the 5 leaderboard metrics on runs/*/predictions
 ```
