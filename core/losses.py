@@ -145,7 +145,8 @@ class ImprovedCompositeLoss(nn.Module):
                  veg_height_boost=0.0,
                  aux_veg_weight=1.0,
                  iou_loss_kind="tversky",
-                 focal_gamma=2.0, focal_alpha=0.25):
+                 focal_gamma=2.0, focal_alpha=0.25,
+                 aux_tversky_weight=0.0):
         super().__init__()
         if loss_preset not in {"current", "no_ssim_grad", "presence_centered"}:
             raise ValueError(
@@ -180,6 +181,11 @@ class ImprovedCompositeLoss(nn.Module):
         self.iou_loss_kind = iou_loss_kind
         self.focal_gamma = float(focal_gamma)
         self.focal_alpha = float(focal_alpha)
+        # Under presence_centered the main Tversky on fractions is off by
+        # default (the presence head owns the IoU objective). Setting this
+        # > 0 re-enables it on the aux fraction map as an auxiliary term —
+        # a direct IoU surrogate on the main output channels.
+        self.aux_tversky_weight = float(aux_tversky_weight)
 
         # Height is now normalized, so we weight all 4 channels equally in base MAE
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
@@ -292,7 +298,7 @@ class ImprovedCompositeLoss(nn.Module):
         # Pass the mask explicitly so invalid pixels are excluded from TP/FP/FN
         # (no dilution from zero-filled nodata regions).
         gm_bool = global_1ch.bool()
-        if self.loss_preset == "presence_centered":
+        if self.loss_preset == "presence_centered" and self.aux_tversky_weight == 0.0:
             loss_tversky = zero
         else:
             t_build = self.tversky(torch.relu(class_pred[:, 0, :, :]),
@@ -321,7 +327,13 @@ class ImprovedCompositeLoss(nn.Module):
             weighted_mae = self.w_mae * loss_mae
         weighted_ssim = self.w_ssim * loss_ssim
         weighted_grad = self.w_grad * loss_grad
-        weighted_tversky = self.w_structure * loss_tversky
+        # Under presence_centered, w_structure is reserved for height_boost —
+        # the main-fraction Tversky is off unless aux_tversky_weight is set,
+        # in which case the explicit aux weight owns the term.
+        if self.loss_preset == "presence_centered":
+            weighted_tversky = self.aux_tversky_weight * loss_tversky
+        else:
+            weighted_tversky = self.w_structure * loss_tversky
         weighted_height_boost = self.w_structure * loss_height_boost
         total_loss = weighted_mae + weighted_ssim + weighted_grad + \
             weighted_tversky + weighted_height_boost

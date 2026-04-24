@@ -22,9 +22,56 @@ from tqdm.auto import tqdm
 from core.model import build_model
 from core.dataset import (
     find_file_pairs, find_multisource_file_pairs, save_split, load_split,
-    pick_dataset_class, MultiPixelEmbeddingDataset,
+    pick_dataset_class, MultiPixelEmbeddingDataset, AUGMENT_MODES,
 )
 from core.losses import ImprovedCompositeLoss
+
+
+class ModelEMA:
+    """Step-wise exponential moving average of model parameters.
+
+    Tracked on the same device as the model. `store()`/`restore()` let the
+    caller temporarily swap EMA weights in (e.g. for validation) without
+    losing the live training weights.
+    """
+    def __init__(self, model, decay=0.9995):
+        self.decay = float(decay)
+        # Clone current params/buffers into a detached shadow state dict.
+        src = _unwrapped_state_dict(model)
+        self.shadow = {k: v.detach().clone() for k, v in src.items()}
+        self._backup = None
+
+    @torch.no_grad()
+    def update(self, model):
+        src = _unwrapped_state_dict(model)
+        d = self.decay
+        for k, v in src.items():
+            sv = self.shadow[k]
+            if v.dtype.is_floating_point:
+                sv.mul_(d).add_(v.detach(), alpha=1.0 - d)
+            else:
+                # Integer buffers (e.g. num_batches_tracked) just copy through.
+                sv.copy_(v.detach())
+
+    def store(self, model):
+        """Save live weights, then swap EMA weights into the model."""
+        src = _unwrapped_state_dict(model)
+        self._backup = {k: v.detach().clone() for k, v in src.items()}
+        _load_state_dict_any(model, self.shadow)
+
+    def restore(self, model):
+        assert self._backup is not None, "restore() called without a matching store()"
+        _load_state_dict_any(model, self._backup)
+        self._backup = None
+
+    def state_dict(self):
+        return self.shadow
+
+
+def _load_state_dict_any(model, sd):
+    """Load an unwrapped state_dict into a (possibly torch.compile-wrapped) model."""
+    inner = getattr(model, "_orig_mod", model)
+    inner.load_state_dict(sd)
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -96,6 +143,13 @@ def select_device():
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def _unwrapped_state_dict(model):
+    """Unwrap torch.compile's _orig_mod so checkpoints load cleanly into a
+    plain (uncompiled) model at inference time."""
+    inner = getattr(model, "_orig_mod", model)
+    return inner.state_dict()
 
 
 def seed_everything(seed):
@@ -193,10 +247,32 @@ def parse_args():
                         "c4 channels, H/8 x W/8). Adds global context at the "
                         "semantically richest level. Off = baseline behavior.")
     p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True,
-                   help="D4 (flips + rot90) on-the-fly augmentation at train time. "
-                        "~5%% CPU overhead hidden behind GPU work; effectively 8x "
-                        "the unique views per epoch. Val is never augmented. Pass "
-                        "--no-augment to disable for a direct baseline A/B.")
+                   help="On-the-fly augmentation at train time; subgroup controlled "
+                        "by --augment-mode. Val is never augmented.")
+    p.add_argument("--augment-mode", default="d4", choices=AUGMENT_MODES,
+                   help="Augmentation subgroup. 'd4' = full dihedral (8 variants, "
+                        "includes rot90 — can hurt when features encode N-S / "
+                        "sun-angle priors). 'flip_rot180' = {id, 180, hflip, "
+                        "hflip+180} (4 variants, orientation-preserving). "
+                        "'hflip' = horizontal flip only (2 variants). 'none' = "
+                        "identity. Ignored when --no-augment.")
+    p.add_argument("--aux-tversky-weight", type=float, default=0.0,
+                   help="Weight on the auxiliary per-class Tversky loss over the "
+                        "main fraction output. Under --loss-preset presence_centered "
+                        "this term is off by default (0.0); enabling it adds a "
+                        "direct IoU surrogate on the submitted channels alongside "
+                        "the presence-head supervision.")
+    p.add_argument("--ema", action=argparse.BooleanOptionalAction, default=False,
+                   help="Maintain a step-wise EMA of model parameters; evaluate "
+                        "and checkpoint on EMA weights. Usually buys ~1pt IoU at "
+                        "zero training cost.")
+    p.add_argument("--ema-decay", type=float, default=0.9995,
+                   help="EMA decay per optimizer step. Default 0.9995 is a "
+                        "reasonable setting for ~60-epoch runs at bs=32.")
+    p.add_argument("--scheduler", default="plateau",
+                   choices=["plateau", "cosine"],
+                   help="LR schedule. plateau = ReduceLROnPlateau(factor=0.5, "
+                        "patience=2). cosine = CosineAnnealingLR over --epochs.")
     p.add_argument("--lightunet-base-ch", type=int, default=32,
                    help="Base channel width of LightUNet (also used inside "
                         "tessera_iou_fusion). Decoder channels scale as "
@@ -276,12 +352,14 @@ def make_dataloaders(args, device):
     DatasetCls = MultiPixelEmbeddingDataset if args.secondary_train_embeddings_dir else pick_dataset_class(args.model_type, n_channels)
     if DatasetCls.__name__ == "LatentTokenDataset":
         train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, scale_factor=16,
-                              is_train=True, augment=args.augment)
+                              is_train=True, augment=args.augment,
+                              augment_mode=args.augment_mode)
         val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, scale_factor=16,
                               is_train=False, augment=False)
     else:
         train_ds = DatasetCls(train_pairs, patch_size=args.patch_size,
-                              is_train=True, augment=args.augment)
+                              is_train=True, augment=args.augment,
+                              augment_mode=args.augment_mode)
         val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size,
                               is_train=False, augment=False)
 
@@ -355,7 +433,12 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "height_specialist_depth": args.height_specialist_depth,
         "lightunet_base_ch":   args.lightunet_base_ch,
         "bottleneck_attn":     args.bottleneck_attn,
-        "augment_d4":          args.augment,
+        "augment":             args.augment,
+        "augment_mode":        args.augment_mode if args.augment else "none",
+        "aux_tversky_weight":  args.aux_tversky_weight,
+        "ema":                 args.ema,
+        "ema_decay":           args.ema_decay if args.ema else None,
+        "lr_scheduler":        args.scheduler,
         "height_loss_kind":    args.height_loss_kind,
         "huber_delta":         args.huber_delta,
         "build_height_boost":  args.build_height_boost,
@@ -397,7 +480,7 @@ def _print_profile_summary(prof, n):
 
 def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
               grad_accum_steps=1, use_amp=False, amp_dtype=torch.float16,
-              channels_last=False, profile_steps=0, desc=""):
+              channels_last=False, profile_steps=0, desc="", ema=None):
     """Train or eval one epoch. Returns (avg_loss, component_avgs)."""
     model.train(train)
     running_loss_t = torch.zeros((), device=device)
@@ -472,6 +555,8 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
                     else:
                         optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
+                    if ema is not None:
+                        ema.update(model)
             if sync_cuda:
                 torch.cuda.synchronize()
             t_after_opt = time.perf_counter()
@@ -604,7 +689,16 @@ def main():
                             weight_decay=args.weight_decay, fused=fused_ok)
     # GradScaler is only meaningful for fp16; bf16 and fp32 don't need it.
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
+    if args.scheduler == "cosine":
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2
+        )
+        scheduler_step_on_val = False
+    else:
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=2
+        )
+        scheduler_step_on_val = True
     resolved_loss_preset = resolve_loss_preset(args)
     loss_lambdas = effective_loss_lambdas(args)
     criterion = ImprovedCompositeLoss(
@@ -621,7 +715,12 @@ def main():
         iou_loss_kind=args.iou_loss_kind,
         focal_gamma=args.focal_gamma,
         focal_alpha=args.focal_alpha,
+        aux_tversky_weight=args.aux_tversky_weight,
     ).to(device)
+
+    ema = ModelEMA(model, decay=args.ema_decay) if args.ema else None
+    if ema is not None:
+        print(f"EMA enabled (decay={args.ema_decay})")
     print(
         "Using loss: "
         f"preset={resolved_loss_preset} (requested={args.loss_preset}), "
@@ -650,16 +749,25 @@ def main():
             amp_dtype=amp_dtype, channels_last=channels_last,
             profile_steps=args.profile_steps,
             desc=f"Epoch {epoch + 1}/{args.epochs} [train]",
+            ema=ema,
         )
+        # Validate on EMA weights when enabled — that's the checkpoint we save.
+        if ema is not None:
+            ema.store(model)
         val_loss, val_comp = run_epoch(
             model, val_loader, criterion, optimizer, scaler, device,
             train=False, use_amp=use_amp,
             amp_dtype=amp_dtype, channels_last=channels_last,
             desc=f"Epoch {epoch + 1}/{args.epochs} [val]",
         )
+        if ema is not None:
+            ema.restore(model)
         train_losses.append(tr_loss)
         val_losses.append(val_loss)
-        scheduler.step(val_loss)
+        if scheduler_step_on_val:
+            scheduler.step(val_loss)
+        else:
+            scheduler.step()
         write_history_record(loss_history_path, {
             "epoch": epoch + 1,
             "train_loss": tr_loss,
@@ -671,7 +779,10 @@ def main():
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), best_model_path)
+            # val_loss was measured on EMA weights (if enabled), so save EMA
+            # weights to match — that's the model the leaderboard actually sees.
+            save_sd = ema.state_dict() if ema is not None else _unwrapped_state_dict(model)
+            torch.save(save_sd, best_model_path)
             print(f"   >> New best val loss {best_val_loss:.4f} — saved.")
 
         print(f"Epoch {epoch + 1}/{args.epochs} | Train: {tr_loss:.4f} | Val: {val_loss:.4f}")
@@ -681,7 +792,8 @@ def main():
         print(f"   >> Val weighted: {format_components(val_comp, WEIGHTED_COMPONENTS)}")
 
     print("--- 3. Saving ---")
-    torch.save(model.state_dict(), last_model_path)
+    last_sd = ema.state_dict() if ema is not None else _unwrapped_state_dict(model)
+    torch.save(last_sd, last_model_path)
     plot_loss_curve(train_losses, val_losses, loss_curve_path, args.experiment_name)
 
 
