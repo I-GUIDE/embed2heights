@@ -79,7 +79,9 @@ class SSIMLoss(nn.Module):
         self.window_size = window_size
         self.size_average = size_average
         self.channel = 1
-        self.window = self.create_window(window_size, self.channel)
+        # Registered as buffer so .to(device) / autocast follow the module.
+        self.register_buffer("window", self.create_window(window_size, self.channel),
+                             persistent=False)
 
     def gaussian(self, window_size, sigma):
         gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
@@ -116,19 +118,13 @@ class SSIMLoss(nn.Module):
     def forward(self, img1, img2):
         (_, channel, _, _) = img1.size()
 
-        if channel == self.channel and self.window.data.type() == img1.data.type():
-            window = self.window
-        else:
-            window = self.create_window(self.window_size, channel)
-            if img1.is_cuda:
-                window = window.cuda(img1.get_device())
-            elif img1.device.type == 'mps':
-                window = window.to('mps')
-
-            window = window.type_as(img1)
+        if channel != self.channel or self.window.device != img1.device:
+            window = self.create_window(self.window_size, channel).to(
+                device=img1.device, dtype=self.window.dtype)
             self.window = window
             self.channel = channel
 
+        window = self.window.to(dtype=img1.dtype)
         return 1 - self._ssim(img1, img2, window, self.window_size, channel, self.size_average)
 
 
