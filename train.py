@@ -126,7 +126,6 @@ DEFAULTS = {
     "num_workers":     8,
     "prefetch_factor": 4,
     "compile":         True,
-    "channels_last":   True,
 }
 
 
@@ -208,20 +207,16 @@ def parse_args():
                    help="Batches prefetched per DataLoader worker when num_workers > 0.")
     p.add_argument("--compile", action=argparse.BooleanOptionalAction,
                    default=DEFAULTS["compile"],
-                   help="Wrap model with torch.compile for fused kernels.")
-    p.add_argument("--compile-mode", default="default",
-                   choices=["default", "reduce-overhead", "max-autotune",
-                            "max-autotune-no-cudagraphs"],
-                   help="torch.compile mode. 'default' = balanced (~1min compile, "
-                        "no CUDA graphs, no train/val retrace). "
-                        "'max-autotune-no-cudagraphs' = autotunes Triton kernels "
-                        "without CUDA graphs (~5-10min compile, typically 5-15%% "
-                        "steady-state speedup on H100, no retrace pathology). "
-                        "'reduce-overhead' / 'max-autotune' use CUDA graphs and "
-                        "retrace at train<->val boundary — avoid here.")
-    p.add_argument("--channels-last", action=argparse.BooleanOptionalAction,
-                   default=DEFAULTS["channels_last"],
-                   help="Use channels_last memory layout for conv throughput on A100.")
+                   help="Master 'go fast on A100/H100' switch. When on, applies: "
+                        "(1) torch.compile in max-autotune-no-cudagraphs mode — "
+                        "Triton kernel autotuning without the CUDA-graph retracing "
+                        "pathology at train<->val boundaries; "
+                        "(2) persistent Inductor cache at ~/.cache/embed2heights_inductor "
+                        "so the ~2-5min warmup is paid once per (code, GPU) pair; "
+                        "(3) dynamic=None + mark_dynamic on batch axis so one graph "
+                        "handles both full and ragged final batches — no mid-epoch "
+                        "recompiles, no dropped samples; "
+                        "(4) channels_last memory layout for conv throughput.")
     p.add_argument("--profile-steps", type=int, default=0,
                    help="If >0, time data/forward/backward separately for this many "
                         "steps, print breakdown, and exit.")
@@ -467,7 +462,7 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "ema":                 args.ema,
         "ema_decay":           args.ema_decay if args.ema else None,
         "lr_scheduler":        args.scheduler,
-        "compile_mode":        args.compile_mode if args.compile else None,
+        "compile":             args.compile,
         "height_loss_kind":    args.height_loss_kind,
         "huber_delta":         args.huber_delta,
         "build_height_boost":  args.build_height_boost,
@@ -545,6 +540,14 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
             masks = masks.to(device, non_blocking=non_blocking)
             if channels_last:
                 imgs = imgs.contiguous(memory_format=torch.channels_last)
+            # Pre-declare batch dim (axis 0) as dynamic on the first step of a
+            # compiled run. Lets Inductor emit one graph that handles both the
+            # full batch and the ragged final batch, avoiding a mid-epoch
+            # recompile. No-op when the model isn't wrapped by torch.compile.
+            if step == 1 and hasattr(model, "_orig_mod"):
+                torch._dynamo.mark_dynamic(imgs, 0)
+                torch._dynamo.mark_dynamic(targets, 0)
+                torch._dynamo.mark_dynamic(masks, 0)
             if sync_cuda:
                 torch.cuda.synchronize()
             t_after_h2d = time.perf_counter()
@@ -683,7 +686,8 @@ def main():
         else:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
-    channels_last = args.channels_last and device.type == "cuda"
+    # channels_last is part of the --compile "go fast" bundle on CUDA.
+    channels_last = args.compile and device.type == "cuda"
     grad_accum_steps = max(1, args.grad_accum_steps)
     save_experiment_config(exp_dir, args, device, use_amp)
     open(loss_history_path, "w").close()
@@ -707,12 +711,23 @@ def main():
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
     if args.compile and device.type == "cuda" and hasattr(torch, "compile"):
-        # CUDA-graph modes ('reduce-overhead', 'max-autotune') retrace at
-        # train<->val boundary because val skips augmentation/dropout, which
-        # changes shapes/strides; avoid them here. The non-cudagraph autotune
-        # mode is the only one that gets Triton autotuning without retracing.
-        model = torch.compile(model, mode=args.compile_mode, dynamic=False)
-        print(f"torch.compile: mode={args.compile_mode}")
+        # Persist Inductor's compiled kernels across SLURM jobs so we pay the
+        # warmup once per (code, hardware) pair, not once per job.
+        cache_dir = os.path.expanduser("~/.cache/embed2heights_inductor")
+        os.makedirs(cache_dir, exist_ok=True)
+        os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", cache_dir)
+        # max-autotune-no-cudagraphs: Triton kernel autotuning without CUDA
+        # graphs. CUDA-graph modes ('reduce-overhead', 'max-autotune') retrace
+        # at the train<->val boundary because val skips augmentation/dropout,
+        # which changes shapes/strides — this is the only autotune mode that
+        # avoids that pathology.
+        # dynamic=None: first shape compiles static (full optimizations),
+        # ragged final batch triggers a one-time fallback to a batch-dim-dynamic
+        # graph. Both graphs cached, zero recompiles from epoch 2 onward.
+        model = torch.compile(model, mode="max-autotune-no-cudagraphs",
+                              dynamic=None)
+        print(f"torch.compile: mode=max-autotune-no-cudagraphs, dynamic=None, "
+              f"cache={os.environ['TORCHINDUCTOR_CACHE_DIR']}")
     print(f"Using model: {selected_model} (input channels={n_channels})")
 
     fused_ok = device.type == "cuda"
