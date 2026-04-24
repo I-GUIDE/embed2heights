@@ -188,6 +188,14 @@ def parse_args():
                    help="Focusing parameter for --iou-loss-kind focal.")
     p.add_argument("--focal-alpha", type=float, default=0.25,
                    help="Positive-class weight for --iou-loss-kind focal.")
+    p.add_argument("--bottleneck-attn", action="store_true",
+                   help="Enable self-attention on the LightUNet bottleneck (x4, "
+                        "c4 channels, H/8 x W/8). Adds global context at the "
+                        "semantically richest level. Off = baseline behavior.")
+    p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=False,
+                   help="D4 (flips + rot90) on-the-fly augmentation at train time. "
+                        "Off by default so baseline runs are bit-comparable; pass "
+                        "--augment to enable. Val is never augmented.")
     p.add_argument("--lightunet-base-ch", type=int, default=32,
                    help="Base channel width of LightUNet (also used inside "
                         "tessera_iou_fusion). Decoder channels scale as "
@@ -266,11 +274,15 @@ def make_dataloaders(args, device):
 
     DatasetCls = MultiPixelEmbeddingDataset if args.secondary_train_embeddings_dir else pick_dataset_class(args.model_type, n_channels)
     if DatasetCls.__name__ == "LatentTokenDataset":
-        train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, scale_factor=16, is_train=True)
-        val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, scale_factor=16, is_train=False)
+        train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, scale_factor=16,
+                              is_train=True, augment=args.augment)
+        val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, scale_factor=16,
+                              is_train=False, augment=False)
     else:
-        train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, is_train=True)
-        val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, is_train=False)
+        train_ds = DatasetCls(train_pairs, patch_size=args.patch_size,
+                              is_train=True, augment=args.augment)
+        val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size,
+                              is_train=False, augment=False)
 
     loader_kwargs = {
         "batch_size": args.batch_size,
@@ -341,6 +353,8 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "tessera_hidden_depth": args.tessera_hidden_depth,
         "height_specialist_depth": args.height_specialist_depth,
         "lightunet_base_ch":   args.lightunet_base_ch,
+        "bottleneck_attn":     args.bottleneck_attn,
+        "augment_d4":          args.augment,
         "height_loss_kind":    args.height_loss_kind,
         "huber_delta":         args.huber_delta,
         "build_height_boost":  args.build_height_boost,
@@ -572,6 +586,7 @@ def main():
         tessera_hidden_depth=args.tessera_hidden_depth,
         height_specialist_depth=args.height_specialist_depth,
         lightunet_base_ch=args.lightunet_base_ch,
+        use_bottleneck_attn=args.bottleneck_attn,
     )
     model = model.to(device)
     if channels_last:

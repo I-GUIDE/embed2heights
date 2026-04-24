@@ -25,6 +25,25 @@ def clean_raster_array(array):
     return np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
 
 
+def _sample_d4():
+    """Roll a random element of the D4 dihedral group: (rot_k, flip_h).
+
+    Eight combinations: 4 rotations x {no flip, hflip}. All geometrically
+    exact (no interpolation, no value changes), so labels remain valid.
+    """
+    return int(np.random.randint(0, 4)), bool(np.random.rand() < 0.5)
+
+
+def _apply_d4(arr, rot_k, flip_h):
+    """Apply a chosen D4 transform to a (C, H, W) array. np.rot90/np.flip
+    return views; ascontiguousarray materializes the result for torch."""
+    if rot_k:
+        arr = np.rot90(arr, k=rot_k, axes=(-2, -1))
+    if flip_h:
+        arr = np.flip(arr, axis=-1)
+    return np.ascontiguousarray(arr)
+
+
 def _strip_prefixes(base, prefixes):
     for prefix in prefixes:
         if base.startswith(prefix):
@@ -195,9 +214,10 @@ class PixelEmbeddingDataset(Dataset):
     For pixel-level embeddings (AlphaEarth 64ch, Tessera 128ch).
     file_pairs: list of (emb_path, label_path) tuples, OR list of emb_path strings (label-free mode).
     """
-    def __init__(self, file_pairs, patch_size=128, is_train=True):
+    def __init__(self, file_pairs, patch_size=128, is_train=True, augment=True):
         self.patch_size = patch_size
         self.is_train = is_train
+        self.augment = augment and is_train  # D4 augmentation only at train time
         # Support both paired and label-free inputs
         if file_pairs and isinstance(file_pairs[0], str):
             self.file_pairs = [(p, None) for p in file_pairs]
@@ -253,6 +273,12 @@ class PixelEmbeddingDataset(Dataset):
         target = target[:, top:top + self.patch_size, left:left + self.patch_size]
         valid_mask = valid_mask[:, top:top + self.patch_size, left:left + self.patch_size]
 
+        if self.augment:
+            rot_k, flip_h = _sample_d4()
+            image = _apply_d4(image, rot_k, flip_h)
+            target = _apply_d4(target, rot_k, flip_h)
+            valid_mask = _apply_d4(valid_mask, rot_k, flip_h)
+
         return torch.from_numpy(image), torch.from_numpy(target), torch.from_numpy(valid_mask)
 
 
@@ -265,9 +291,10 @@ class MultiPixelEmbeddingDataset(Dataset):
       - (primary_emb_path, secondary_emb_path, label_path)
       - (primary_emb_path, secondary_emb_path) for label-free inference
     """
-    def __init__(self, file_pairs, patch_size=128, is_train=True):
+    def __init__(self, file_pairs, patch_size=128, is_train=True, augment=True):
         self.patch_size = patch_size
         self.is_train = is_train
+        self.augment = augment and is_train
         self.file_pairs = file_pairs
 
     def __len__(self):
@@ -329,6 +356,12 @@ class MultiPixelEmbeddingDataset(Dataset):
         target = target[:, top:top + self.patch_size, left:left + self.patch_size]
         valid_mask = valid_mask[:, top:top + self.patch_size, left:left + self.patch_size]
 
+        if self.augment:
+            rot_k, flip_h = _sample_d4()
+            image = _apply_d4(image, rot_k, flip_h)
+            target = _apply_d4(target, rot_k, flip_h)
+            valid_mask = _apply_d4(valid_mask, rot_k, flip_h)
+
         return torch.from_numpy(image), torch.from_numpy(target), torch.from_numpy(valid_mask)
 
 # ---------------------------------------------------------
@@ -340,10 +373,11 @@ class LatentTokenDataset(Dataset):
     For patch-level embeddings (TerraMind 768ch@16x16, THOR 768ch@16x16).
     file_pairs: list of (emb_path, label_path) tuples, OR list of emb_path strings (label-free mode).
     """
-    def __init__(self, file_pairs, patch_size=256, scale_factor=16, is_train=True):
+    def __init__(self, file_pairs, patch_size=256, scale_factor=16, is_train=True, augment=True):
         self.patch_size = patch_size
         self.scale_factor = scale_factor
         self.is_train = is_train
+        self.augment = augment and is_train
         # Support both paired and label-free inputs
         if file_pairs and isinstance(file_pairs[0], str):
             self.file_pairs = [(p, None) for p in file_pairs]
@@ -405,5 +439,11 @@ class LatentTokenDataset(Dataset):
         image = image[:, top_emb:top_emb + emb_patch_size, left_emb:left_emb + emb_patch_size]
         target = target[:, top_tar:top_tar + self.patch_size, left_tar:left_tar + self.patch_size]
         valid_mask = valid_mask[:, top_tar:top_tar + self.patch_size, left_tar:left_tar + self.patch_size]
+
+        if self.augment:
+            rot_k, flip_h = _sample_d4()
+            image = _apply_d4(image, rot_k, flip_h)
+            target = _apply_d4(target, rot_k, flip_h)
+            valid_mask = _apply_d4(valid_mask, rot_k, flip_h)
 
         return torch.from_numpy(image), torch.from_numpy(target), torch.from_numpy(valid_mask)
