@@ -4,6 +4,72 @@ import torch.nn.functional as F
 from math import exp
 
 
+class UncertaintyWeightedLoss(nn.Module):
+    """Homoscedastic uncertainty weighting (Kendall, Gal & Cipolla 2018).
+
+    Wraps an inner ImprovedCompositeLoss and replaces its hand-tuned
+    aux/presence/structure scalars with learned log-variances per task group.
+    The total per Kendall et al. is
+
+        L = sum_i 0.5 * exp(-s_i) * L_i + 0.5 * s_i
+
+    where s_i = log(sigma_i^2) is a learned scalar per task. The log-term
+    prevents the trivial "push all sigmas to infinity" minimum.
+
+    Task groupings:
+        presence : presence_bce + presence_tversky    (classification-like)
+        fraction : fraction_mae + tversky             (soft regression)
+        height   : height_boost + aux_height          (regression)
+
+    The inner loss still computes raw component values; this module only
+    re-weights them. So the existing component logging stays meaningful.
+    """
+
+    def __init__(self, inner_loss):
+        super().__init__()
+        self.inner = inner_loss
+        # Initialize at log_var=0 → variance=1 → effective weight=0.5 for all
+        # tasks. Letting the optimizer see all three from the same starting
+        # weight means we don't bake in the previous hand-tuned ordering.
+        self.log_var_presence = nn.Parameter(torch.zeros(()))
+        self.log_var_fraction = nn.Parameter(torch.zeros(()))
+        self.log_var_height = nn.Parameter(torch.zeros(()))
+
+    @staticmethod
+    def _uw(log_var, loss):
+        # 0.5 * exp(-s) * L + 0.5 * s
+        return 0.5 * torch.exp(-log_var) * loss + 0.5 * log_var
+
+    def forward(self, preds, targets, valid_mask=None):
+        # Run the inner loss to get raw per-component values. We will discard
+        # its hand-weighted total and reassemble using learned uncertainties.
+        _ignored_total, components = self.inner(preds, targets, valid_mask)
+
+        zero = torch.zeros((), device=self.log_var_presence.device,
+                           dtype=self.log_var_presence.dtype)
+
+        L_presence = (components.get("presence_bce", zero)
+                      + components.get("presence_tversky", zero))
+        L_fraction = (components.get("fraction_mae", zero)
+                      + components.get("tversky", zero))
+        L_height = (components.get("height_boost", zero)
+                    + components.get("aux_height", zero))
+
+        total = (self._uw(self.log_var_presence, L_presence)
+                 + self._uw(self.log_var_fraction, L_fraction)
+                 + self._uw(self.log_var_height, L_height))
+
+        # Annotate components with the learned log-vars for logging/debug.
+        components = dict(components)
+        components["uw_log_var_presence"] = self.log_var_presence.detach()
+        components["uw_log_var_fraction"] = self.log_var_fraction.detach()
+        components["uw_log_var_height"] = self.log_var_height.detach()
+        components["uw_L_presence"] = L_presence.detach()
+        components["uw_L_fraction"] = L_fraction.detach()
+        components["uw_L_height"] = L_height.detach()
+        return total, components
+
+
 class TverskyLoss(nn.Module):
     """
     Tversky Loss for imbalanced segmentation.

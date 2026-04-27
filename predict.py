@@ -133,7 +133,7 @@ def resolve_tessera_model_kwargs(args, exp_dir):
         ),
         # Pulled from training_params.json so the architecture matches what
         # was trained; no CLI flag since it must mirror training exactly.
-        "use_bottleneck_attn": bool(cfg.get("bottleneck_attn", False)),
+        "fusion_mode": cfg.get("fusion_mode", "residual_presence"),
     }
 
 

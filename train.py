@@ -24,7 +24,7 @@ from core.dataset import (
     find_file_pairs, find_multisource_file_pairs, save_split, load_split,
     pick_dataset_class, MultiPixelEmbeddingDataset, AUGMENT_MODES,
 )
-from core.losses import ImprovedCompositeLoss
+from core.losses import ImprovedCompositeLoss, UncertaintyWeightedLoss
 
 
 class ModelEMA:
@@ -150,6 +150,15 @@ WEIGHTED_COMPONENTS = (
     "weighted_presence_bce",
     "weighted_presence_tversky",
     "weighted_aux_height",
+)
+
+UW_COMPONENTS = (
+    "uw_log_var_presence",
+    "uw_log_var_fraction",
+    "uw_log_var_height",
+    "uw_L_presence",
+    "uw_L_fraction",
+    "uw_L_height",
 )
 
 
@@ -299,6 +308,21 @@ def parse_args():
                    help="Extra ConvGNAct layers prepended to the per-class height "
                         "specialist projections (building/vegetation). 0 = legacy 1x1 "
                         "projection only.")
+    p.add_argument("--fusion-mode", default="residual_presence",
+                   choices=["residual_presence", "gated_feature"],
+                   help="How Tessera fuses with AlphaEarth in tessera_iou_fusion. "
+                        "residual_presence (legacy) = Tessera adds a zero-init "
+                        "residual to presence logits only. gated_feature = "
+                        "Tessera is promoted to a peer feature stream and "
+                        "fuses into trunk features via a learned spatial gate "
+                        "(zero-init weights + +bias so it starts as alpha-only "
+                        "and learns Tessera contribution as a residual).")
+    p.add_argument("--uncertainty-weighting", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Replace hand-tuned aux/structure/presence_tversky weights "
+                        "with learned per-task log-variances (Kendall et al. 2018). "
+                        "Three task groups: presence, fraction, height. The "
+                        "log-vars are nn.Parameters trained alongside the model.")
     p.add_argument("--structure-weight", type=float, default=None,
                    help="Override lambdas[3] (the weight on height_boost, and Tversky "
                         "under the 'current' preset). Defaults to DEFAULTS['lambdas'][3] "
@@ -455,6 +479,8 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "aux_tversky_weight":  args.aux_tversky_weight,
         "ema":                 args.ema,
         "ema_decay":           args.ema_decay if args.ema else None,
+        "fusion_mode":         args.fusion_mode,
+        "uncertainty_weighting": args.uncertainty_weighting,
         "lr_scheduler":        args.scheduler,
         "compile":             args.compile,
         "height_loss_kind":    args.height_loss_kind,
@@ -574,7 +600,11 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
                 if should_step:
                     if use_scaler:
                         scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    # Clip across every param group the optimizer owns —
+                    # this includes criterion log-vars under uncertainty
+                    # weighting.
+                    clip_targets = [p for g in optimizer.param_groups for p in g["params"]]
+                    torch.nn.utils.clip_grad_norm_(clip_targets, max_norm=1.0)
                     if use_scaler:
                         scaler.step(optimizer)
                         scaler.update()
@@ -700,6 +730,7 @@ def main():
         tessera_hidden_depth=args.tessera_hidden_depth,
         height_specialist_depth=args.height_specialist_depth,
         lightunet_base_ch=args.lightunet_base_ch,
+        fusion_mode=args.fusion_mode,
     )
     model = model.to(device)
     if channels_last:
@@ -725,20 +756,8 @@ def main():
     print(f"Using model: {selected_model} (input channels={n_channels})")
 
     fused_ok = device.type == "cuda"
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr,
-                            weight_decay=args.weight_decay, fused=fused_ok)
     # GradScaler is only meaningful for fp16; bf16 and fp32 don't need it.
     scaler = torch.amp.GradScaler("cuda", enabled=(use_amp and amp_dtype == torch.float16))
-    if args.scheduler == "cosine":
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2
-        )
-        scheduler_step_on_val = False
-    else:
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=2
-        )
-        scheduler_step_on_val = True
     resolved_loss_preset = resolve_loss_preset(args)
     loss_lambdas = effective_loss_lambdas(args)
     criterion = ImprovedCompositeLoss(
@@ -757,6 +776,25 @@ def main():
         focal_alpha=args.focal_alpha,
         aux_tversky_weight=args.aux_tversky_weight,
     ).to(device)
+    if args.uncertainty_weighting:
+        criterion = UncertaintyWeightedLoss(criterion).to(device)
+        print("Uncertainty weighting enabled (3 learned log-variances: presence, fraction, height).")
+
+    # Optimizer must see the criterion's parameters too when uncertainty
+    # weighting is on (the log-variances are learned).
+    trainable_params = list(model.parameters()) + list(criterion.parameters())
+    optimizer = optim.AdamW(trainable_params, lr=args.lr,
+                            weight_decay=args.weight_decay, fused=fused_ok)
+    if args.scheduler == "cosine":
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=args.lr * 1e-2
+        )
+        scheduler_step_on_val = False
+    else:
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=2
+        )
+        scheduler_step_on_val = True
 
     ema = ModelEMA(model, decay=args.ema_decay) if args.ema else None
     if ema is not None:
@@ -830,6 +868,8 @@ def main():
         print(f"   >> Train weighted: {format_components(tr_comp, WEIGHTED_COMPONENTS)}")
         print(f"   >> Val raw:   {format_components(val_comp, RAW_COMPONENTS)}")
         print(f"   >> Val weighted: {format_components(val_comp, WEIGHTED_COMPONENTS)}")
+        if args.uncertainty_weighting:
+            print(f"   >> UW: {format_components(tr_comp, UW_COMPONENTS)}")
 
     print("--- 3. Saving ---")
     last_sd = ema.state_dict() if ema is not None else _unwrapped_state_dict(model)

@@ -656,6 +656,102 @@ class TesseraIoUFusionLightUNet(nn.Module):
         return self.head(alpha_feat, return_aux=return_aux, presence_extra=tessera_feat)
 
 
+class TesseraIoUFusionGatedLightUNet(nn.Module):
+    """AlphaEarth + Tessera fused at the **feature level** via a learned gate.
+
+    Distinct from TesseraIoUFusionLightUNet, which adds Tessera only as a
+    residual correction on the *presence logits*. Here Tessera is promoted
+    to a peer feature stream that fuses into the trunk features just before
+    the head.
+
+    Flow:
+        AE  ─► alpha_unet.forward_features ─► alpha_feat (B, base_ch, H, W)
+        TES ─► tessera_stem (out_ch=base_ch) ─► tessera_feat (B, base_ch, H, W)
+
+        gate = sigmoid(gate_conv(concat(alpha_feat, tessera_feat)))   ∈ (0,1)
+        fused = gate * alpha_feat + (1 - gate) * tessera_feat
+
+    Initialization mirrors the existing zero-init residual pattern in this
+    codebase (presence_delta_head, height deltas via softplus): the gate's
+    final conv is zero-init with a large positive bias so sigmoid(b) ≈ 1
+    at step 0 → fused ≈ alpha_feat. Tessera contributes nothing initially
+    and learns to seep in as a residual correction. Identical t=0 behavior
+    to the AE-only baseline; any divergence is learned from data.
+
+    The presence-logit residual path is *also* preserved (set
+    presence_extra_ch>0 to keep it). It is orthogonal to the trunk-level
+    fusion and the two compose: trunk fusion improves shared features for
+    all heads (incl. height); the presence residual is a lightweight
+    correction directly on the IoU output.
+    """
+
+    def __init__(self, n_channels, n_classes=4, alpha_channels=64,
+                 tessera_presence_ch=0, tessera_hidden_ch=None,
+                 tessera_hidden_depth=0, height_specialist_depth=0,
+                 base_ch=32, gate_init_bias=4.0):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("TesseraIoUFusionGatedLightUNet assumes 4 output channels")
+        if n_channels <= alpha_channels:
+            raise ValueError(
+                "TesseraIoUFusionGatedLightUNet expects concatenated AlphaEarth+Tessera "
+                f"input with >{alpha_channels} channels, got {n_channels}"
+            )
+        self.supports_aux_outputs = True
+        self.alpha_channels = alpha_channels
+        tessera_channels = n_channels - alpha_channels
+
+        self.alpha_unet = LightUNet(alpha_channels, n_classes, base_ch=base_ch)
+        self.alpha_unet.head = nn.Identity()
+        # Tessera stem outputs base_ch (peer width with alpha_feat) for
+        # feature-level fusion. Optionally a smaller presence_extra branch
+        # is also produced if tessera_presence_ch > 0.
+        self.tessera_feature_stem = TesseraCompressionStem(
+            tessera_channels,
+            out_ch=base_ch,
+            hidden_ch=tessera_hidden_ch,
+            hidden_depth=tessera_hidden_depth,
+        )
+        # Spatial gate: 1x1 conv on concat(alpha, tessera), sigmoid.
+        # Zero-init weights + large positive bias → starts as gate≈1
+        # (alpha-only) and learns Tessera contribution as a residual.
+        self.gate_conv = nn.Conv2d(2 * base_ch, base_ch, kernel_size=1)
+        nn.init.zeros_(self.gate_conv.weight)
+        nn.init.constant_(self.gate_conv.bias, gate_init_bias)
+
+        # Optional small presence-logit residual on top (composes with gate).
+        self.tessera_presence_ch = int(tessera_presence_ch)
+        if self.tessera_presence_ch > 0:
+            # Reuse the same stem signature, just project from the (already
+            # computed) base_ch feature down to a small width for the
+            # presence residual branch.
+            self.presence_extra_proj = nn.Conv2d(base_ch, self.tessera_presence_ch, 1)
+        else:
+            self.presence_extra_proj = None
+
+        self.head = MultiTaskPredictionHead(
+            in_ch=base_ch,
+            out_channels=n_classes,
+            presence_extra_ch=self.tessera_presence_ch,
+            height_specialist_depth=height_specialist_depth,
+        )
+
+    def forward(self, x, return_aux=False):
+        alpha = x[:, :self.alpha_channels, :, :]
+        tessera = x[:, self.alpha_channels:, :, :]
+
+        alpha_feat = self.alpha_unet.forward_features(alpha)
+        tessera_feat = self.tessera_feature_stem(tessera)
+
+        gate = torch.sigmoid(self.gate_conv(torch.cat([alpha_feat, tessera_feat], dim=1)))
+        fused = gate * alpha_feat + (1.0 - gate) * tessera_feat
+
+        presence_extra = (self.presence_extra_proj(tessera_feat)
+                          if self.presence_extra_proj is not None else None)
+        return self.head(fused, return_aux=return_aux,
+                         presence_extra=presence_extra)
+
+
 class EmbeddingRefiner(nn.Module):
     """Encoder-light, decoder-heavy model for pixel-aligned GFM embeddings.
 
@@ -882,7 +978,8 @@ def infer_model_type(n_channels):
 
 def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 tessera_hidden_ch=None, tessera_hidden_depth=0,
-                height_specialist_depth=0, lightunet_base_ch=32):
+                height_specialist_depth=0, lightunet_base_ch=32,
+                fusion_mode="residual_presence"):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -902,6 +999,16 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
     if selected == "hrnet_w32":
         return HRNetEmbedding(n_channels=n_channels, n_classes=n_classes, width=32), selected
     if selected == "tessera_iou_fusion":
+        if fusion_mode == "gated_feature":
+            return TesseraIoUFusionGatedLightUNet(
+                n_channels=n_channels,
+                n_classes=n_classes,
+                tessera_presence_ch=tessera_presence_ch,
+                tessera_hidden_ch=tessera_hidden_ch,
+                tessera_hidden_depth=tessera_hidden_depth,
+                height_specialist_depth=height_specialist_depth,
+                base_ch=lightunet_base_ch,
+            ), selected
         return TesseraIoUFusionLightUNet(
             n_channels=n_channels,
             n_classes=n_classes,
