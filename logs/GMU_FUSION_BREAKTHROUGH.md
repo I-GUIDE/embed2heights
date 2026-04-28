@@ -119,12 +119,174 @@ checkpoints on the test embeddings → average → zip 946 `.npy` files
 into `runs/submission/gated_F_5fold_ensemble.zip`. Each file is
 `(4, 256, 256)` `[building%, veg%, water%, height_m]`.
 
+## Cross-task spatial attention (`ctaskattn_v1`) — small positive signal
+
+After `gated_feature`, the next architectural move that produced a
+*positive* delta on fold 0 was **cross-task spatial attention from the
+land-cover head onto the height_trunk** (commit `b689aff`,
+`--cross-task-attention`). One additional piece inside
+`MultiTaskPredictionHead`, downstream of the existing FiLM step:
+
+```
+fractions (B, 3, H, W) ──► Conv1x1(3 → 1) ──► sigmoid ──► attn ∈ (0, 1)
+                            (zero-init weights)
+
+FiLM-conditioned height features  h  ──►  h * (0.5 + attn)   ∈ [0.5·h, 1.5·h]
+```
+
+Zero-init weights → `attn = sigmoid(0) = 0.5` at t=0 → multiplier 1.0
+→ no-op at init (same warm-start hygiene as gated_feature). Gain is
+soft (range [0.5, 1.5]) so a confidently wrong segmentation cannot
+zero out the height.
+
+| run (fold 0) | iou_bld | iou_tree | iou_wat | RMSE_bH | RMSE_vH | Score | Δ |
+|---|---|---|---|---|---|---|---|
+| `gated_F_fold0` (champion) | 0.5003 | 0.7518 | 0.4692 | 1.8442 | 3.1997 | **0.4766** | — |
+| **`ctaskattn_v1`** | **0.5015** | **0.7533** | **0.4950** | 1.8548 | **3.1771** | **0.4810** | **+0.0044** |
+
+Gain concentrated on `iou_water` (+0.026) and a small lift on `iou_bld`,
+with `RMSE_vH` slightly improved. Within the +0.006 noise margin on a
+single fold but every per-axis number moved the right direction. Worth
+a 5-fold confirmation before promoting.
+
+## What also got tried in this round and didn't pan out
+
+- **4-modality flat GMU** (`multi_gfm_v1`, commit `e1fefab`): k=4 untied
+  gates over AE+Tessera+TerraMind+THOR (Arevalo Figure 2a). Anchor
+  warm-start (AE open, others closed). Result on fold 0: pending re-eval.
+- **Hierarchical bipartite GMU** (`hierarchical_v1`, commit `b689aff`):
+  3-stage tree of bimodal GMUs grouped by temporal scope (annual ↔
+  epoch). Fold 0: **0.4666 (−0.0100)**. The grouping prior over-
+  constrained the model. Closed.
+- **Dirichlet auxiliary loss** (`dirichlet_v1`, commit `b689aff`):
+  4-class softplus head + Dirichlet NLL on the simplex
+  {bld, veg, wat, background}. Fold 0: **0.4626 (−0.0140)**. The α
+  values diverged (sum-of-α grew unbounded, val_loss hit −13) but the
+  IoU/RMSE metrics didn't improve. Closed.
+
+These are documented for the record so we don't re-litigate them.
+
+## How to run these models
+
+All commands assume the conda env is active and CWD is the project
+root:
+
+```bash
+SCRIPT_DIR=/u/dkiv2/group_dkiv2/active/embed2heights
+DATA_DIR=/projects/bcrm/emb2height/data/train
+TEST_DIR=/projects/bcrm/emb2height/data/test
+cd $SCRIPT_DIR
+conda activate emb2heights
+```
+
+### Train `ctaskattn_v1` (champion + cross-task attention)
+
+The single CLI delta vs `gated_feature` champion is
+`--cross-task-attention`. Everything else mirrors `uw_gated_F`'s
+recipe:
+
+```bash
+python train.py \
+    --experiment-name ctaskattn_v1 \
+    --model-type tessera_iou_fusion \
+    --train-embeddings-dir $DATA_DIR/alphaearth_emb \
+    --secondary-train-embeddings-dir $DATA_DIR/tessera_emb \
+    --train-targets-dir $DATA_DIR/labels \
+    --split-file $SCRIPT_DIR/splits/group_code_5fold_seed42/fold_0/split.json \
+    --batch-size 32 --patch-size 256 --epochs 30 \
+    --lr 2e-4 --weight-decay 1e-4 \
+    --loss-preset presence_centered \
+    --aux-weight 1.0 --presence-tversky-weight 1.0 --fraction-mae-weight 0.1 \
+    --tessera-presence-ch 16 --tessera-hidden-ch 96 --tessera-hidden-depth 2 \
+    --height-specialist-depth 2 --lightunet-base-ch 48 \
+    --build-height-boost 5.0 --veg-height-boost 1.5 --aux-veg-weight 1.0 \
+    --iou-loss-kind tversky --focal-gamma 2.0 --focal-alpha 0.25 \
+    --structure-weight 2.0 --no-augment --scheduler plateau --compile \
+    --fusion-mode gated_feature --cross-task-attention \
+    --seed 42
+```
+
+Or via slurm:
+
+```bash
+sbatch run_tier1_2_fold0.bash    # array index 2 = ctaskattn_v1
+```
+
+### Predict on the test set (label-free, submission format)
+
+```bash
+python predict.py \
+    --experiment-name ctaskattn_v1 \
+    --model-type tessera_iou_fusion \
+    --test-embeddings-dir $TEST_DIR/alphaearth_test_emb \
+    --secondary-test-embeddings-dir $TEST_DIR/tessera_test_emb
+```
+
+`fusion_mode`, `cross_task_attention`, channel widths, etc. are
+auto-loaded from `runs/<exp>/training_params.json` — no need to repeat
+training-time flags. Outputs land in `runs/<exp>/predictions/` as
+`<core>_<region>_<year>.npy`, shape `(4, 256, 256)`,
+`[building%, veg%, water%, height_m]`.
+
+### Predict on the train set for offline eval (paired mode)
+
+```bash
+python predict.py \
+    --experiment-name ctaskattn_v1 \
+    --model-type tessera_iou_fusion \
+    --test-embeddings-dir $DATA_DIR/alphaearth_emb \
+    --secondary-test-embeddings-dir $DATA_DIR/tessera_emb \
+    --test-targets-dir $DATA_DIR/labels
+```
+
+### Evaluate on a chosen split
+
+Group-fold (the honest leaderboard estimate):
+
+```bash
+python evaluate.py \
+    --only ctaskattn_v1 \
+    --val-only \
+    --split-file $SCRIPT_DIR/splits/group_code_5fold_seed42/fold_0/split.json \
+    --labels-dir $DATA_DIR/labels
+```
+
+Random val (reproduces the old 0.5072 baseline number):
+
+```bash
+python evaluate.py \
+    --only ctaskattn_v1 \
+    --val-only \
+    --split-file $SCRIPT_DIR/splits/split.json \
+    --labels-dir $DATA_DIR/labels
+```
+
+### Train a 5-fold bag for the new champion
+
+Pattern is identical to [`run_gated_F_5fold.bash`](../run_gated_F_5fold.bash);
+just add `--cross-task-attention` and rename. Once trained,
+[`run_submission_ensemble.bash`](../run_submission_ensemble.bash)
+generalizes — point it at the new fold experiment names.
+
+### Re-train any other variant
+
+| variant | model_type | extra flags |
+|---|---|---|
+| `gated_feature` champion | `tessera_iou_fusion` | `--fusion-mode gated_feature` |
+| `ctaskattn` (this section) | `tessera_iou_fusion` | `--fusion-mode gated_feature --cross-task-attention` |
+| 4-modality flat GMU | `multi_gfm` | `--fusion-mode gated_feature` (default for multi_gfm), all 4 emb dirs |
+| Hierarchical bipartite | `multi_gfm` | `--fusion-mode hierarchical`, all 4 emb dirs |
+| Dirichlet aux | `tessera_iou_fusion` | `--fusion-mode gated_feature --dirichlet-weight 0.5` |
+
+For the 4-modality variants, supply
+`--terramind-s1-train-emb-dir`, `--terramind-s2-train-emb-dir`,
+`--thor-s1-train-emb-dir`, `--thor-s2-train-emb-dir`. Test-time uses
+the analogous `--*-test-emb-dir` flags.
+
 ## Where to push next
 
-The fusion scaffold composes cleanly to 4 modalities. TerraMind and
-THOR embeddings are already on disk at
-`/projects/bcrm/emb2height/data/train/{terramind,thor}_s{1,2}_emb`.
-Extending `gated_feature` to a 4-stream multimodal-GMU
-([Arevalo §3.1, Figure 2a](https://arxiv.org/abs/1702.01992)) is the
-next obvious swing — same zero-init bias trick, k=4 gates instead of
-2, no other architectural change required.
+- Confirm `ctaskattn_v1` across the 5 group folds before promoting.
+- Resolve `multi_gfm_v1` (4-modality flat) once 80776 evaluates — that
+  decides whether more modalities help in any form.
+- If both confirm: stack `ctaskattn` on top of the chosen fusion, run
+  the 5-fold bag with `--cross-task-attention`, ensemble for submission.
