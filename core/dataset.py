@@ -512,16 +512,27 @@ class MultiGFMDataset(Dataset):
             valid_mask = np.ones((2, pixel_imgs.shape[1], pixel_imgs.shape[2]),
                                  dtype=np.float32)
 
-        # Pad / center crop to patch_size on the pixel stream + targets.
-        # Token stream is always 16x16 (we don't crop tokens). If
-        # patch_size != 256 the token grid no longer covers the cropped
-        # area — reject that combination explicitly.
+        # Pad pixel stream + targets to patch_size if a tile happens to be
+        # smaller (some training tiles are 255x256 instead of 256x256). We
+        # don't *crop* — the token stream is fixed at its native low res
+        # and would mis-align with a cropped pixel grid. Pad-only keeps the
+        # full-tile spatial correspondence between pixel and token grids
+        # (each token covers a fixed 16x16 patch of native pixels).
         _, h, w = pixel_imgs.shape
-        if self.patch_size != h or self.patch_size != w:
+        if h < self.patch_size or w < self.patch_size:
+            pad_h = max(0, self.patch_size - h)
+            pad_w = max(0, self.patch_size - w)
+            pixel_imgs = np.pad(pixel_imgs, ((0, 0), (0, pad_h), (0, pad_w)),
+                                mode='reflect')
+            target = np.pad(target, ((0, 0), (0, pad_h), (0, pad_w)),
+                            mode='reflect')
+            valid_mask = np.pad(valid_mask, ((0, 0), (0, pad_h), (0, pad_w)),
+                                mode='constant', constant_values=0)
+            h, w = pixel_imgs.shape[1], pixel_imgs.shape[2]
+        if h != self.patch_size or w != self.patch_size:
             raise ValueError(
-                f"MultiGFMDataset requires patch_size == native pixel "
-                f"resolution; got patch_size={self.patch_size}, "
-                f"native HxW={h}x{w}. Token streams cannot be cropped."
+                f"MultiGFMDataset cannot crop pixels (token grid would mis-align). "
+                f"Got patch_size={self.patch_size}, native pixel HxW={h}x{w}."
             )
 
         if self.augment:

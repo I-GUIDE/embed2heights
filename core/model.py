@@ -445,7 +445,8 @@ class MultiTaskPredictionHead(nn.Module):
     """
 
     def __init__(self, in_ch, out_channels=4, hidden_ch=None, drop=0.05,
-                 presence_extra_ch=0, height_specialist_depth=0):
+                 presence_extra_ch=0, height_specialist_depth=0,
+                 enable_dirichlet=True, enable_cross_task_attn=False):
         super().__init__()
         if out_channels != 4:
             raise ValueError("MultiTaskPredictionHead assumes 4 output channels")
@@ -453,6 +454,8 @@ class MultiTaskPredictionHead(nn.Module):
         self._hidden_ch = hidden_ch
         self.presence_extra_ch = presence_extra_ch
         self.height_specialist_depth = int(height_specialist_depth)
+        self.enable_dirichlet = bool(enable_dirichlet)
+        self.enable_cross_task_attn = bool(enable_cross_task_attn)
 
         # --- Deeper shared trunk: 2 layers + residual ---
         self.shared = nn.Sequential(
@@ -505,6 +508,31 @@ class MultiTaskPredictionHead(nn.Module):
         self.height_building_delta_proj = _specialist_head(self.height_specialist_depth)
         self.height_vegetation_delta_proj = _specialist_head(self.height_specialist_depth)
 
+        # Optional Dirichlet head for fractional simplex modeling. 4 outputs:
+        # building, vegetation, water, background. Always built so checkpoints
+        # are interchangeable across runs; the loss decides whether to use
+        # it (see ImprovedCompositeLoss.dirichlet_weight).
+        if self.enable_dirichlet:
+            self.dirichlet_head = nn.Sequential(
+                ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
+                nn.Conv2d(hidden_ch, 4, 1),
+            )
+        else:
+            self.dirichlet_head = None
+
+        # Optional cross-task spatial attention from land-cover head onto
+        # the height_trunk features. A 1-channel sigmoid mask derived from
+        # the 3-channel fractions; multiplied into the height features as
+        # a residual gate so initial behavior matches no-attention.
+        # The conv is zero-init so the multiplier starts at 1.0
+        # (cross_task_attn_logit = 0 → sigmoid = 0.5 → 1 + 2(0.5-0.5) = 1).
+        if self.enable_cross_task_attn:
+            self.cross_task_attn = nn.Conv2d(3, 1, kernel_size=1)
+            nn.init.zeros_(self.cross_task_attn.weight)
+            nn.init.zeros_(self.cross_task_attn.bias)
+        else:
+            self.cross_task_attn = None
+
     def forward(self, x, return_aux=False, presence_extra=None):
         # Shared trunk with residual
         x = self.shared(x)
@@ -532,6 +560,15 @@ class MultiTaskPredictionHead(nn.Module):
         scale = self.film_scale(fractions)
         shift = self.film_shift(fractions)
         h = x * (1.0 + scale) + shift
+
+        # Optional cross-task spatial attention. A per-pixel sigmoid mask
+        # from the land-cover fractions is multiplied into h as a residual
+        # gate. Zero-init weights → sigmoid(0) = 0.5 → multiplier = 1
+        # (no-op at t=0). Forces sharp segmentation boundaries to gate the
+        # height feature map at training time, mitigating regression blur.
+        if self.cross_task_attn is not None:
+            attn = torch.sigmoid(self.cross_task_attn(fractions))   # (B, 1, H, W)
+            h = h * (0.5 + attn)                                    # in [0.5, 1.5]
 
         # Shared height trunk -> 3 lightweight projections
         h = self.height_trunk(h)
@@ -565,6 +602,18 @@ class MultiTaskPredictionHead(nn.Module):
         # channel 3 is the presence-gated specialist height.
         out = torch.cat([presence_prob, height], dim=1)
 
+        # Optional Dirichlet concentration parameters. Output shape (B, 4, H, W)
+        # for {building, vegetation, water, background}. Computed from the
+        # shared trunk features (post-residual block, pre-FiLM), since the
+        # Dirichlet head is conceptually an *additional* land-cover view —
+        # not derived from, nor in series with, the existing fraction head.
+        # softplus + ε keeps α_c > 0 as required by the Dirichlet pdf.
+        if self.dirichlet_head is not None:
+            dirichlet_logits = self.dirichlet_head(x)
+            dirichlet_alpha = F.softplus(dirichlet_logits) + 1e-3
+        else:
+            dirichlet_alpha = None
+
         if not return_aux:
             return out
         return {
@@ -579,6 +628,7 @@ class MultiTaskPredictionHead(nn.Module):
             "height_base": base_height,
             "height_building": building_height,
             "height_vegetation": vegetation_height,
+            "dirichlet_alpha": dirichlet_alpha,
         }
 
 
@@ -802,7 +852,8 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
                  tessera_hidden_depth=0, height_specialist_depth=0,
                  base_ch=32, gate_init_bias=4.0,
                  gate_mode="simple", gate_untied=False,
-                 modality_dropout=0.0):
+                 modality_dropout=0.0,
+                 enable_dirichlet=True, enable_cross_task_attn=False):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TesseraIoUFusionGatedLightUNet assumes 4 output channels")
@@ -848,6 +899,8 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
             out_channels=n_classes,
             presence_extra_ch=self.tessera_presence_ch,
             height_specialist_depth=height_specialist_depth,
+            enable_dirichlet=enable_dirichlet,
+            enable_cross_task_attn=enable_cross_task_attn,
         )
 
     def forward(self, x, return_aux=False):
@@ -1085,7 +1138,8 @@ class MultiGFMGatedLightUNet(nn.Module):
                  terramind_channels=1536, thor_channels=1536,
                  token_spatial=16, pixel_spatial=256,
                  base_ch=48, height_specialist_depth=0,
-                 gate_init_bias=4.0, modality_dropout=0.0):
+                 gate_init_bias=4.0, modality_dropout=0.0,
+                 enable_dirichlet=True, enable_cross_task_attn=False):
         super().__init__()
         if n_classes != 4:
             raise ValueError("MultiGFMGatedLightUNet assumes 4 output channels")
@@ -1143,6 +1197,8 @@ class MultiGFMGatedLightUNet(nn.Module):
             out_channels=n_classes,
             presence_extra_ch=0,
             height_specialist_depth=height_specialist_depth,
+            enable_dirichlet=enable_dirichlet,
+            enable_cross_task_attn=enable_cross_task_attn,
         )
 
     @staticmethod
@@ -1203,6 +1259,120 @@ class MultiGFMGatedLightUNet(nn.Module):
                  + g_tm * f_tm + g_thor * f_thor)
 
         return self.head(fused, return_aux=return_aux)
+
+
+class HierarchicalMultiGFMGatedLightUNet(nn.Module):
+    """Hierarchical 4-modality fusion grouped by temporal scope.
+
+    Replaces MultiGFMGatedLightUNet's flat 4-way Arevalo Figure 2(a) gate
+    with a 3-stage tree of bimodal Arevalo Figure 2(b) gates, encoding the
+    pretraining-time-scope prior:
+
+        Stage 1a (within-group, annual):
+            F_annual = G_annual ⊙ F_AE  + (1 - G_annual) ⊙ F_TES
+        Stage 1b (within-group, single-epoch):
+            F_epoch  = G_epoch  ⊙ F_TM  + (1 - G_epoch)  ⊙ F_THOR
+        Stage 2 (across-group):
+            F_fused  = G_final  ⊙ F_annual + (1 - G_final) ⊙ F_epoch
+
+    Each gate uses the bimodal form (the same one that gave us
+    uw_gated_F = 0.5072 between AE and Tessera). All three gates anchor
+    the "primary" side open at init via +bias and the secondary side
+    closed via the convex-combination structure:
+        Stage 1a:  G_annual ≈ 0.98 → F_annual ≈ F_AE
+        Stage 1b:  G_epoch  ≈ 0.98 → F_epoch  ≈ F_TM
+        Stage 2:   G_final  ≈ 0.98 → F_fused  ≈ F_annual ≈ F_AE
+
+    So the model is bit-near AE-only at t=0 (same warm-start hygiene as
+    every other gated_feature variant in this codebase) and learns
+    Tessera, TM, THOR as residual contributions in the order their
+    respective gates open. Modality dropout applies to non-anchor
+    streams identically to MultiGFMGatedLightUNet.
+    """
+
+    def __init__(self, n_classes=4,
+                 ae_channels=64, tessera_channels=128,
+                 terramind_channels=1536, thor_channels=1536,
+                 token_spatial=16, pixel_spatial=256,
+                 base_ch=48, height_specialist_depth=0,
+                 gate_init_bias=4.0, modality_dropout=0.0,
+                 enable_dirichlet=True, enable_cross_task_attn=False):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("HierarchicalMultiGFMGatedLightUNet assumes 4 output channels")
+        self.supports_aux_outputs = True
+        self.ae_channels = int(ae_channels)
+        self.tessera_channels = int(tessera_channels)
+        self.terramind_channels = int(terramind_channels)
+        self.thor_channels = int(thor_channels)
+        self.modality_dropout = float(modality_dropout)
+        if pixel_spatial % token_spatial != 0:
+            raise ValueError("pixel_spatial must be a multiple of token_spatial")
+        scale_factor = pixel_spatial // token_spatial
+
+        self.alpha_unet = LightUNet(self.ae_channels, n_classes, base_ch=base_ch)
+        self.alpha_unet.head = nn.Identity()
+        self.tessera_stem = TesseraCompressionStem(
+            self.tessera_channels, out_ch=base_ch,
+            hidden_ch=max(base_ch * 2, 96), hidden_depth=2,
+        )
+        self.terramind_stem = TokenUpsamplingStem(
+            self.terramind_channels, out_ch=base_ch, scale_factor=scale_factor,
+        )
+        self.thor_stem = TokenUpsamplingStem(
+            self.thor_channels, out_ch=base_ch, scale_factor=scale_factor,
+        )
+
+        # Three bimodal gates (same form as the gated_feature champion).
+        self.gate_annual = _build_fusion_gate(
+            base_ch, mode="simple", untied=False, init_bias=gate_init_bias
+        )
+        self.gate_epoch = _build_fusion_gate(
+            base_ch, mode="simple", untied=False, init_bias=gate_init_bias
+        )
+        self.gate_final = _build_fusion_gate(
+            base_ch, mode="simple", untied=False, init_bias=gate_init_bias
+        )
+
+        self.head = MultiTaskPredictionHead(
+            in_ch=base_ch,
+            out_channels=n_classes,
+            presence_extra_ch=0,
+            height_specialist_depth=height_specialist_depth,
+            enable_dirichlet=enable_dirichlet,
+            enable_cross_task_attn=enable_cross_task_attn,
+        )
+
+    def forward(self, imgs, return_aux=False):
+        if not isinstance(imgs, (tuple, list)) or len(imgs) != 2:
+            raise ValueError(
+                "HierarchicalMultiGFMGatedLightUNet expects imgs as a 2-tuple "
+                f"(pixel_imgs, token_imgs); got {type(imgs).__name__}"
+            )
+        pixel_imgs, token_imgs = imgs
+
+        ae = pixel_imgs[:, :self.ae_channels, :, :]
+        tessera = pixel_imgs[:, self.ae_channels:, :, :]
+        tm = token_imgs[:, :self.terramind_channels, :, :]
+        thor = token_imgs[:, self.terramind_channels:, :, :]
+
+        f_ae = self.alpha_unet.forward_features(ae)
+        f_tes = self.tessera_stem(tessera)
+        f_tm = self.terramind_stem(tm)
+        f_thor = self.thor_stem(thor)
+
+        if self.training and self.modality_dropout > 0.0:
+            f_tes = _maybe_drop_modality(f_tes, self.modality_dropout, True)
+            f_tm = _maybe_drop_modality(f_tm, self.modality_dropout, True)
+            f_thor = _maybe_drop_modality(f_thor, self.modality_dropout, True)
+
+        # Stage 1: within-group fusion.
+        f_annual = _apply_fusion_gate(self.gate_annual, f_ae, f_tes, untied=False)
+        f_epoch = _apply_fusion_gate(self.gate_epoch, f_tm, f_thor, untied=False)
+        # Stage 2: across-group fusion.
+        f_fused = _apply_fusion_gate(self.gate_final, f_annual, f_epoch, untied=False)
+
+        return self.head(f_fused, return_aux=return_aux)
 
 
 class EmbeddingRefiner(nn.Module):
@@ -1435,7 +1605,8 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 fusion_mode="residual_presence",
                 gate_mode="simple", gate_untied=False,
                 modality_dropout=0.0,
-                multi_gfm_kwargs=None):
+                multi_gfm_kwargs=None,
+                cross_task_attention=False):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -1459,6 +1630,8 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
         kw.setdefault("base_ch", lightunet_base_ch)
         kw.setdefault("height_specialist_depth", height_specialist_depth)
         kw.setdefault("modality_dropout", modality_dropout)
+        if fusion_mode == "hierarchical":
+            return HierarchicalMultiGFMGatedLightUNet(n_classes=n_classes, **kw), selected
         return MultiGFMGatedLightUNet(n_classes=n_classes, **kw), selected
     if selected == "tessera_iou_fusion":
         if fusion_mode == "gated_feature":
@@ -1473,6 +1646,7 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 gate_mode=gate_mode,
                 gate_untied=gate_untied,
                 modality_dropout=modality_dropout,
+                enable_cross_task_attn=cross_task_attention,
             ), selected
         if fusion_mode == "pyramid_gated":
             return TesseraIoUFusionPyramidGatedLightUNet(

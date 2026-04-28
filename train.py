@@ -324,15 +324,16 @@ def parse_args():
                         "specialist projections (building/vegetation). 0 = legacy 1x1 "
                         "projection only.")
     p.add_argument("--fusion-mode", default="residual_presence",
-                   choices=["residual_presence", "gated_feature", "pyramid_gated"],
-                   help="How Tessera fuses with AlphaEarth in tessera_iou_fusion. "
-                        "residual_presence (legacy) = Tessera adds a zero-init "
-                        "residual to presence logits only. gated_feature = "
-                        "single-scale GMU at the trunk output (champion 0.5072). "
-                        "pyramid_gated = multi-scale GMU at all 4 U-Net levels "
-                        "(Tessera encoder pyramid, one gate per scale; lets each "
-                        "scale learn its own fusion policy — coarse for water/"
-                        "vegetation, fine for building edges).")
+                   choices=["residual_presence", "gated_feature", "pyramid_gated",
+                            "hierarchical"],
+                   help="Fusion strategy. residual_presence (legacy) = Tessera "
+                        "as zero-init residual on presence logits. gated_feature "
+                        "= single-scale GMU at the trunk output (champion 0.5072). "
+                        "pyramid_gated = multi-scale GMU at all 4 U-Net levels. "
+                        "hierarchical (multi_gfm only) = bipartite tree of bimodal "
+                        "GMUs grouped by temporal scope: stage 1 fuses AE↔Tessera "
+                        "(annual) and TM↔THOR (single-epoch); stage 2 fuses the "
+                        "two grouped streams.")
     p.add_argument("--gate-mode", default="simple",
                    choices=["simple", "rich"],
                    help="Gate depth for gated_feature / pyramid_gated. "
@@ -346,6 +347,20 @@ def parse_args():
                         "G/(1-G) form. Strictly more expressive — a pixel "
                         "where both modalities are informative can have both "
                         "gates open. Mirrors GMU Figure 2(a) multimodal form.")
+    p.add_argument("--dirichlet-weight", type=float, default=0.0,
+                   help="Weight on the Dirichlet auxiliary loss. 0 = off (default). "
+                        "When > 0, the optional dirichlet head produces 4 softplus "
+                        "concentration parameters per pixel for {bld, veg, wat, bg}; "
+                        "the Dirichlet NLL of the fractional simplex target is "
+                        "added to the loss. Models the simplex constraint that "
+                        "BCE+MAE+Tversky doesn't enforce.")
+    p.add_argument("--cross-task-attention", action=argparse.BooleanOptionalAction,
+                   default=False,
+                   help="Add a per-pixel sigmoid attention map from the land-cover "
+                        "fractions onto the height_trunk features (multiplicative "
+                        "residual gate, zero-init = no-op at t=0). Forces sharp "
+                        "segmentation boundaries to gate the height feature map at "
+                        "training time, mitigating regression blur.")
     p.add_argument("--modality-dropout", type=float, default=0.0,
                    help="Per-sample probability of zeroing the Tessera feature "
                         "stream during training (inverted dropout). Forces the "
@@ -553,6 +568,8 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "gate_mode":           args.gate_mode,
         "gate_untied":         args.gate_untied,
         "modality_dropout":    args.modality_dropout,
+        "dirichlet_weight":    args.dirichlet_weight,
+        "cross_task_attention": args.cross_task_attention,
         "uncertainty_weighting": args.uncertainty_weighting,
         "lr_scheduler":        args.scheduler,
         "compile":             args.compile,
@@ -845,6 +862,8 @@ def main():
               f"TM={tm_s1_ch}+{tm_s2_ch}={tm_s1_ch+tm_s2_ch} "
               f"THOR={th_s1_ch}+{th_s2_ch}={th_s1_ch+th_s2_ch} "
               f"token_spatial={tok_h}")
+    if multi_gfm_kwargs is not None:
+        multi_gfm_kwargs.setdefault("enable_cross_task_attn", args.cross_task_attention)
     model, selected_model = build_model(
         args.model_type,
         n_channels,
@@ -859,6 +878,7 @@ def main():
         gate_untied=args.gate_untied,
         modality_dropout=args.modality_dropout,
         multi_gfm_kwargs=multi_gfm_kwargs,
+        cross_task_attention=args.cross_task_attention,
     )
     model = model.to(device)
     if channels_last:
@@ -903,6 +923,7 @@ def main():
         focal_gamma=args.focal_gamma,
         focal_alpha=args.focal_alpha,
         aux_tversky_weight=args.aux_tversky_weight,
+        dirichlet_weight=args.dirichlet_weight,
     ).to(device)
     if args.uncertainty_weighting:
         criterion = UncertaintyWeightedLoss(criterion).to(device)

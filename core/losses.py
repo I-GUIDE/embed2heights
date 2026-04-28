@@ -70,6 +70,45 @@ class UncertaintyWeightedLoss(nn.Module):
         return total, components
 
 
+def dirichlet_simplex_nll(alpha, target_simplex, valid_mask, eps=1e-6):
+    """Dirichlet negative log-likelihood for continuous simplex targets.
+
+    For each pixel, the predicted distribution is Dir(α). The target is
+    a point on the C-simplex (target_simplex.sum(axis=1) == 1.0 per pixel).
+    The pdf-likelihood is
+
+        log p(y | α) = log Γ(α_0) - sum_c log Γ(α_c) + sum_c (α_c - 1) log y_c
+
+    so NLL = -log p(y | α). Targets clamped at eps to avoid log(0).
+
+    Args:
+        alpha:          (B, C, H, W), strictly positive (use softplus + eps).
+        target_simplex: (B, C, H, W), nonneg, columns sum to 1 along C-axis.
+        valid_mask:     (B, 1, H, W) ∈ {0, 1}; pixels with mask=0 contribute 0.
+    Returns scalar mean over valid pixels.
+    """
+    alpha_sum = alpha.sum(dim=1, keepdim=True)
+    log_y = torch.log(target_simplex.clamp_min(eps))
+    log_B = (torch.lgamma(alpha).sum(dim=1, keepdim=True)
+             - torch.lgamma(alpha_sum))
+    nll = log_B - ((alpha - 1.0) * log_y).sum(dim=1, keepdim=True)  # (B, 1, H, W)
+    valid_count = torch.sum(valid_mask) + 1e-6
+    return torch.sum(nll * valid_mask) / valid_count
+
+
+def make_simplex_targets(targets):
+    """Build a 4-class simplex from the 3 fractional channels of targets.
+
+    The dataset stores building/veg/water% in channels 0..2; the residual
+    (1 - sum) is treated as the 'background' class for the Dirichlet
+    formulation. Output sums to ~1 along channel axis (within numerical
+    floor of 0).
+    """
+    bvw = targets[:, :3, :, :].clamp(min=0.0)
+    bg = (1.0 - bvw.sum(dim=1, keepdim=True)).clamp(min=0.0)
+    return torch.cat([bvw, bg], dim=1)  # (B, 4, H, W)
+
+
 class TverskyLoss(nn.Module):
     """
     Tversky Loss for imbalanced segmentation.
@@ -212,7 +251,8 @@ class ImprovedCompositeLoss(nn.Module):
                  aux_veg_weight=1.0,
                  iou_loss_kind="tversky",
                  focal_gamma=2.0, focal_alpha=0.25,
-                 aux_tversky_weight=0.0):
+                 aux_tversky_weight=0.0,
+                 dirichlet_weight=0.0):
         super().__init__()
         if loss_preset not in {"current", "no_ssim_grad", "presence_centered"}:
             raise ValueError(
@@ -252,6 +292,11 @@ class ImprovedCompositeLoss(nn.Module):
         # > 0 re-enables it on the aux fraction map as an auxiliary term —
         # a direct IoU surrogate on the main output channels.
         self.aux_tversky_weight = float(aux_tversky_weight)
+        # Dirichlet auxiliary loss on the optional dirichlet head's output.
+        # 0 = disabled (default). > 0 = treats the 4-class fractional labels
+        # (B, V, W, Background) as a probability simplex and minimizes
+        # Dirichlet NLL on the predicted concentration parameters.
+        self.dirichlet_weight = float(dirichlet_weight)
 
         # Height is now normalized, so we weight all 4 channels equally in base MAE
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
@@ -483,6 +528,19 @@ class ImprovedCompositeLoss(nn.Module):
                 + self.aux_veg_weight * aux_height_vegetation_loss
             ) + self.presence_tversky_weight * presence_tversky_loss
 
+        # --- 6. Optional Dirichlet auxiliary loss on simplex ---
+        dirichlet_loss = zero
+        if (self.dirichlet_weight > 0.0
+                and aux_outputs is not None
+                and aux_outputs.get("dirichlet_alpha") is not None):
+            simplex_target = make_simplex_targets(targets)
+            dirichlet_loss = dirichlet_simplex_nll(
+                aux_outputs["dirichlet_alpha"],
+                simplex_target,
+                global_mask,
+            )
+            total_loss = total_loss + self.dirichlet_weight * dirichlet_loss
+
         aux_height_loss = (aux_height_building_loss
                            + self.aux_veg_weight * aux_height_vegetation_loss)
         components = {
@@ -497,6 +555,8 @@ class ImprovedCompositeLoss(nn.Module):
             "aux_height_building": aux_height_building_loss,
             "aux_height_vegetation": aux_height_vegetation_loss,
             "aux_height": aux_height_loss,
+            "dirichlet": dirichlet_loss,
+            "weighted_dirichlet": self.dirichlet_weight * dirichlet_loss,
             "weighted_mae": weighted_mae,
             "weighted_ssim": weighted_ssim,
             "weighted_grad": weighted_grad,
