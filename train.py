@@ -313,10 +313,28 @@ def parse_args():
                    help="How Tessera fuses with AlphaEarth in tessera_iou_fusion. "
                         "residual_presence (legacy) = Tessera adds a zero-init "
                         "residual to presence logits only. gated_feature = "
-                        "Tessera is promoted to a peer feature stream and "
-                        "fuses into trunk features via a learned spatial gate "
-                        "(zero-init weights + +bias so it starts as alpha-only "
-                        "and learns Tessera contribution as a residual).")
+                        "single-scale GMU at the trunk output (champion 0.5072). "
+                        "Gate depth/tying/dropout is controlled by --gate-mode, "
+                        "--gate-untied, --modality-dropout.")
+    p.add_argument("--gate-mode", default="simple",
+                   choices=["simple", "rich"],
+                   help="Gate depth for gated_feature / pyramid_gated. "
+                        "simple = Conv1x1 → sigmoid (linear-then-sigmoid). "
+                        "rich = Conv1x1 → GN → GELU → Conv1x1 → sigmoid; lets "
+                        "the gate learn nonlinear modality-routing decisions, "
+                        "as the GMU paper §5.1 explicitly recommends.")
+    p.add_argument("--gate-untied", action=argparse.BooleanOptionalAction, default=False,
+                   help="Use independent gates G_AE and G_TES (both in (0,1), "
+                        "not constrained to sum to 1) instead of the tied "
+                        "G/(1-G) form. Strictly more expressive — a pixel "
+                        "where both modalities are informative can have both "
+                        "gates open. Mirrors GMU Figure 2(a) multimodal form.")
+    p.add_argument("--modality-dropout", type=float, default=0.0,
+                   help="Per-sample probability of zeroing the Tessera feature "
+                        "stream during training (inverted dropout). Forces the "
+                        "AE branch to remain self-sufficient and prevents the "
+                        "gate from collapsing onto Tessera. 0.15 is a common "
+                        "default for multimodal small-data regimes.")
     p.add_argument("--uncertainty-weighting", action=argparse.BooleanOptionalAction,
                    default=False,
                    help="Replace hand-tuned aux/structure/presence_tversky weights "
@@ -480,6 +498,9 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "ema":                 args.ema,
         "ema_decay":           args.ema_decay if args.ema else None,
         "fusion_mode":         args.fusion_mode,
+        "gate_mode":           args.gate_mode,
+        "gate_untied":         args.gate_untied,
+        "modality_dropout":    args.modality_dropout,
         "uncertainty_weighting": args.uncertainty_weighting,
         "lr_scheduler":        args.scheduler,
         "compile":             args.compile,
@@ -731,6 +752,9 @@ def main():
         height_specialist_depth=args.height_specialist_depth,
         lightunet_base_ch=args.lightunet_base_ch,
         fusion_mode=args.fusion_mode,
+        gate_mode=args.gate_mode,
+        gate_untied=args.gate_untied,
+        modality_dropout=args.modality_dropout,
     )
     model = model.to(device)
     if channels_last:

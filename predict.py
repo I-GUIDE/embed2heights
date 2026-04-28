@@ -132,8 +132,11 @@ def resolve_tessera_model_kwargs(args, exp_dir):
             else cfg.get("lightunet_base_ch", 32)
         ),
         # Pulled from training_params.json so the architecture matches what
-        # was trained; no CLI flag since it must mirror training exactly.
+        # was trained; no CLI flag since these must mirror training exactly.
         "fusion_mode": cfg.get("fusion_mode", "residual_presence"),
+        "gate_mode": cfg.get("gate_mode", "simple"),
+        "gate_untied": bool(cfg.get("gate_untied", False)),
+        "modality_dropout": float(cfg.get("modality_dropout", 0.0)),
     }
 
 

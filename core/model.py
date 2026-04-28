@@ -656,6 +656,83 @@ class TesseraIoUFusionLightUNet(nn.Module):
         return self.head(alpha_feat, return_aux=return_aux, presence_extra=tessera_feat)
 
 
+def _build_fusion_gate(channels, mode="simple", untied=False, init_bias=4.0):
+    """Build a gate module that sees concat(alpha, tessera) features.
+
+    Args:
+        channels: width of each modality stream (gate input is 2*channels).
+        mode: "simple" (1x1 conv) or "rich" (Conv1x1 → GN → GELU → Conv1x1).
+              The rich variant lets the gate learn nonlinear "this region is
+              water-like AND temporally stable" decisions instead of a single
+              hyperplane (the GMU paper, Section 5.1, explicitly recommends
+              non-linearities on the gate).
+        untied: if False, output a single tied gate G ∈ (0,1), used as
+                fused = G·AE + (1-G)·TES. If True, output independent gates
+                G_AE and G_TES (both in (0,1), not constrained to sum to 1)
+                so that fused = G_AE·AE + G_TES·TES — strictly more expressive
+                (GMU Figure 2a multimodal form), since it can boost both
+                modalities on a pixel where both are informative.
+        init_bias: bias initial value chosen so that at t=0 the fused output
+                equals the AE features (warm-start as alpha-only — preserves
+                the codebase's zero-init residual hygiene). For tied gates
+                that's a single +init_bias; for untied it's +init_bias on the
+                AE half and -init_bias on the TES half.
+    """
+    n_out = 2 * channels if untied else channels
+    if mode == "simple":
+        gate = nn.Conv2d(2 * channels, n_out, kernel_size=1)
+        final = gate
+    elif mode == "rich":
+        hidden = max(channels, 32)
+        gate = nn.Sequential(
+            nn.Conv2d(2 * channels, hidden, 1, bias=False),
+            nn.GroupNorm(_group_count(hidden), hidden),
+            nn.GELU(),
+            nn.Conv2d(hidden, n_out, 1),
+        )
+        final = gate[-1]
+    else:
+        raise ValueError(f"Unknown gate mode: {mode!r}")
+
+    nn.init.zeros_(final.weight)
+    if untied:
+        bias = torch.empty(n_out)
+        bias[:channels].fill_(init_bias)        # AE half: open at init
+        bias[channels:].fill_(-init_bias)       # TES half: closed at init
+        final.bias.data.copy_(bias)
+    else:
+        nn.init.constant_(final.bias, init_bias)
+    return gate
+
+
+def _apply_fusion_gate(gate_module, ae_feat, tes_feat, untied):
+    """Run the gate and combine ae/tes features. See _build_fusion_gate."""
+    raw = gate_module(torch.cat([ae_feat, tes_feat], dim=1))
+    if untied:
+        C = ae_feat.size(1)
+        g_ae = torch.sigmoid(raw[:, :C])
+        g_tes = torch.sigmoid(raw[:, C:])
+        return g_ae * ae_feat + g_tes * tes_feat
+    g = torch.sigmoid(raw)
+    return g * ae_feat + (1.0 - g) * tes_feat
+
+
+def _maybe_drop_modality(tes_feat, p, training):
+    """Per-sample modality dropout on Tessera features (training only).
+
+    Each sample in the batch is independently zeroed with probability p,
+    then the remaining samples are scaled by 1/(1-p) (inverted-dropout
+    convention). This keeps the AE branch self-sufficient — prevents the
+    gate from over-relying on Tessera and crashing when Tessera signal is
+    noisy on an unfamiliar test patch.
+    """
+    if not training or p <= 0.0:
+        return tes_feat
+    B = tes_feat.size(0)
+    keep = (torch.rand(B, 1, 1, 1, device=tes_feat.device) >= p).float()
+    return tes_feat * keep / max(1e-6, 1.0 - p)
+
+
 class TesseraIoUFusionGatedLightUNet(nn.Module):
     """AlphaEarth + Tessera fused at the **feature level** via a learned gate.
 
@@ -688,7 +765,9 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
     def __init__(self, n_channels, n_classes=4, alpha_channels=64,
                  tessera_presence_ch=0, tessera_hidden_ch=None,
                  tessera_hidden_depth=0, height_specialist_depth=0,
-                 base_ch=32, gate_init_bias=4.0):
+                 base_ch=32, gate_init_bias=4.0,
+                 gate_mode="simple", gate_untied=False,
+                 modality_dropout=0.0):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TesseraIoUFusionGatedLightUNet assumes 4 output channels")
@@ -699,6 +778,8 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
             )
         self.supports_aux_outputs = True
         self.alpha_channels = alpha_channels
+        self.gate_untied = bool(gate_untied)
+        self.modality_dropout = float(modality_dropout)
         tessera_channels = n_channels - alpha_channels
 
         self.alpha_unet = LightUNet(alpha_channels, n_classes, base_ch=base_ch)
@@ -712,19 +793,17 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
             hidden_ch=tessera_hidden_ch,
             hidden_depth=tessera_hidden_depth,
         )
-        # Spatial gate: 1x1 conv on concat(alpha, tessera), sigmoid.
-        # Zero-init weights + large positive bias → starts as gate≈1
-        # (alpha-only) and learns Tessera contribution as a residual.
-        self.gate_conv = nn.Conv2d(2 * base_ch, base_ch, kernel_size=1)
-        nn.init.zeros_(self.gate_conv.weight)
-        nn.init.constant_(self.gate_conv.bias, gate_init_bias)
+        # Gate: configurable depth (simple Conv1x1 vs rich MLP) and tying
+        # (tied G/(1-G) vs untied G_AE,G_TES). Both modes warm-start as
+        # AE-only via the bias trick — see _build_fusion_gate.
+        self.gate_conv = _build_fusion_gate(
+            base_ch, mode=gate_mode, untied=self.gate_untied,
+            init_bias=gate_init_bias,
+        )
 
         # Optional small presence-logit residual on top (composes with gate).
         self.tessera_presence_ch = int(tessera_presence_ch)
         if self.tessera_presence_ch > 0:
-            # Reuse the same stem signature, just project from the (already
-            # computed) base_ch feature down to a small width for the
-            # presence residual branch.
             self.presence_extra_proj = nn.Conv2d(base_ch, self.tessera_presence_ch, 1)
         else:
             self.presence_extra_proj = None
@@ -742,9 +821,12 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
 
         alpha_feat = self.alpha_unet.forward_features(alpha)
         tessera_feat = self.tessera_feature_stem(tessera)
+        tessera_feat = _maybe_drop_modality(
+            tessera_feat, self.modality_dropout, self.training
+        )
 
-        gate = torch.sigmoid(self.gate_conv(torch.cat([alpha_feat, tessera_feat], dim=1)))
-        fused = gate * alpha_feat + (1.0 - gate) * tessera_feat
+        fused = _apply_fusion_gate(self.gate_conv, alpha_feat, tessera_feat,
+                                   untied=self.gate_untied)
 
         presence_extra = (self.presence_extra_proj(tessera_feat)
                           if self.presence_extra_proj is not None else None)
@@ -979,7 +1061,9 @@ def infer_model_type(n_channels):
 def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 tessera_hidden_ch=None, tessera_hidden_depth=0,
                 height_specialist_depth=0, lightunet_base_ch=32,
-                fusion_mode="residual_presence"):
+                fusion_mode="residual_presence",
+                gate_mode="simple", gate_untied=False,
+                modality_dropout=0.0):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -1008,6 +1092,9 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 tessera_hidden_depth=tessera_hidden_depth,
                 height_specialist_depth=height_specialist_depth,
                 base_ch=lightunet_base_ch,
+                gate_mode=gate_mode,
+                gate_untied=gate_untied,
+                modality_dropout=modality_dropout,
             ), selected
         return TesseraIoUFusionLightUNet(
             n_channels=n_channels,
