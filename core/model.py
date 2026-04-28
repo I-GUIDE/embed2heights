@@ -1003,6 +1003,208 @@ class TesseraIoUFusionPyramidGatedLightUNet(nn.Module):
                          presence_extra=presence_extra)
 
 
+class TokenUpsamplingStem(nn.Module):
+    """Convert a 16x16 patch-level feature map (e.g. TerraMind/THOR token
+    grid) to a 256x256 pixel-level feature map at ``out_ch`` channels.
+
+    Pattern: cheap channel projection at low res (1x1 + 3x3) → bilinear
+    upsample by ``scale_factor`` (default 16) → spatial refinement
+    (two 3x3 ConvGNAct). Doing the projection BEFORE upsampling keeps the
+    memory cost low — we never materialize 16x the tokens at full
+    channel width.
+    """
+
+    def __init__(self, in_ch, out_ch=48, scale_factor=16, hidden_ch=None):
+        super().__init__()
+        hidden_ch = hidden_ch or max(out_ch * 2, 64)
+        self.calib = ChannelCalibration(in_ch)
+        self.proj = nn.Sequential(
+            ConvGNAct(in_ch, hidden_ch, kernel_size=1, padding=0),
+            ConvGNAct(hidden_ch, out_ch, kernel_size=3),
+        )
+        self.upsample = nn.Upsample(scale_factor=scale_factor, mode="bilinear",
+                                    align_corners=False)
+        self.refine = nn.Sequential(
+            ConvGNAct(out_ch, out_ch, kernel_size=3),
+            ConvGNAct(out_ch, out_ch, kernel_size=3),
+        )
+
+    def forward(self, x):
+        x = self.calib(x)
+        x = self.proj(x)
+        x = self.upsample(x)
+        x = self.refine(x)
+        return x
+
+
+class MultiGFMGatedLightUNet(nn.Module):
+    """4-modality GMU fusion: AE + Tessera + TerraMind + THOR.
+
+    Generalizes TesseraIoUFusionGatedLightUNet's bimodal Arevalo §2017
+    Figure 2(b) gate to the k=4 untied multimodal form (Figure 2a):
+
+        F_i, i ∈ {AE, TES, TM, THOR}                 (per-modality features)
+        N_i  = LayerNorm_per_modality(F_i)            (modern stability fix —
+                                                       prevents one stream's
+                                                       feature magnitudes
+                                                       from dominating gate
+                                                       logits)
+        H    = concat(N_AE, N_TES, N_TM, N_THOR)
+        G_i  = sigmoid(W_i · H + b_i)                 (independent gates,
+                                                       not constrained to
+                                                       sum to 1)
+        F_fused = Σ_i G_i ⊙ F_i
+
+    Init bias mirrors the bimodal warm-start convention but anchors AE:
+        b_AE   = +init_bias  → G_AE  ≈ 0.98 at t=0  (open: anchor modality)
+        b_TES  = -init_bias  → G_TES ≈ 0.02 at t=0  (closed: residual)
+        b_TM   = -init_bias  → G_TM  ≈ 0.02 at t=0  (closed: residual)
+        b_THOR = -init_bias  → G_THOR≈ 0.02 at t=0  (closed: residual)
+
+    So F_fused at t=0 ≈ 0.98 · F_AE — the model is essentially AE-only at
+    init. Tessera/TM/THOR each learn to seep in as residual corrections.
+    Identical hygiene to the bimodal champion (uw_gated_F = 0.5072).
+
+    Input shape contract:
+        forward(imgs) where imgs is a 2-tuple (pixel_imgs, token_imgs):
+            pixel_imgs : (B, ae_channels + tessera_channels, H, W)
+                         AE on channels [0:ae_channels],
+                         Tessera on channels [ae_channels:].
+            token_imgs : (B, tm_channels + thor_channels, h_tok, w_tok)
+                         TerraMind on channels [0:tm_channels],
+                         THOR on channels [tm_channels:].
+
+    Per-modality optional dropout (modality_dropout > 0): during
+    training, each non-anchor modality is independently zeroed per
+    sample with probability ``modality_dropout`` (inverted dropout
+    scaling), forcing AE to remain self-sufficient.
+    """
+
+    def __init__(self, n_classes=4,
+                 ae_channels=64, tessera_channels=128,
+                 terramind_channels=1536, thor_channels=1536,
+                 token_spatial=16, pixel_spatial=256,
+                 base_ch=48, height_specialist_depth=0,
+                 gate_init_bias=4.0, modality_dropout=0.0):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("MultiGFMGatedLightUNet assumes 4 output channels")
+        self.supports_aux_outputs = True
+        self.ae_channels = int(ae_channels)
+        self.tessera_channels = int(tessera_channels)
+        self.terramind_channels = int(terramind_channels)
+        self.thor_channels = int(thor_channels)
+        self.modality_dropout = float(modality_dropout)
+        if pixel_spatial % token_spatial != 0:
+            raise ValueError("pixel_spatial must be a multiple of token_spatial")
+        scale_factor = pixel_spatial // token_spatial
+
+        # AE drives the U-Net trunk (anchor modality).
+        self.alpha_unet = LightUNet(self.ae_channels, n_classes, base_ch=base_ch)
+        self.alpha_unet.head = nn.Identity()
+
+        # Tessera: pixel-level, compress 128 → base_ch via existing stem.
+        self.tessera_stem = TesseraCompressionStem(
+            self.tessera_channels, out_ch=base_ch,
+            hidden_ch=max(base_ch * 2, 96), hidden_depth=2,
+        )
+
+        # TerraMind / THOR: token-level (16x16), upsample to base_ch at 256x256.
+        self.terramind_stem = TokenUpsamplingStem(
+            self.terramind_channels, out_ch=base_ch, scale_factor=scale_factor,
+        )
+        self.thor_stem = TokenUpsamplingStem(
+            self.thor_channels, out_ch=base_ch, scale_factor=scale_factor,
+        )
+
+        # Per-modality feature normalization before gate input. Modern
+        # multimodal-fusion practice (post-2017): without it, a stream
+        # whose features have larger magnitude can dominate the gate
+        # logits even when the gate weights are well-calibrated. Use
+        # GroupNorm for parameter-efficiency and bf16 stability.
+        self.norm_ae = nn.GroupNorm(_group_count(base_ch), base_ch)
+        self.norm_tes = nn.GroupNorm(_group_count(base_ch), base_ch)
+        self.norm_tm = nn.GroupNorm(_group_count(base_ch), base_ch)
+        self.norm_thor = nn.GroupNorm(_group_count(base_ch), base_ch)
+
+        # Four independent gates, each a Conv1x1 over the concat of all
+        # four normalized streams. Bias init differentiates anchor vs
+        # residuals: AE open (sigmoid(+4) ≈ 0.98), others closed
+        # (sigmoid(-4) ≈ 0.02). Weight zero-init keeps the start state
+        # purely a function of the bias.
+        gate_in = 4 * base_ch
+        self.gate_ae = self._make_gate(gate_in, base_ch, +gate_init_bias)
+        self.gate_tes = self._make_gate(gate_in, base_ch, -gate_init_bias)
+        self.gate_tm = self._make_gate(gate_in, base_ch, -gate_init_bias)
+        self.gate_thor = self._make_gate(gate_in, base_ch, -gate_init_bias)
+
+        self.head = MultiTaskPredictionHead(
+            in_ch=base_ch,
+            out_channels=n_classes,
+            presence_extra_ch=0,
+            height_specialist_depth=height_specialist_depth,
+        )
+
+    @staticmethod
+    def _make_gate(in_ch, out_ch, init_bias):
+        gate = nn.Conv2d(in_ch, out_ch, kernel_size=1)
+        nn.init.zeros_(gate.weight)
+        nn.init.constant_(gate.bias, init_bias)
+        return gate
+
+    @staticmethod
+    def _drop_modality(feat, p, training):
+        if not training or p <= 0.0:
+            return feat
+        B = feat.size(0)
+        keep = (torch.rand(B, 1, 1, 1, device=feat.device) >= p).float()
+        return feat * keep / max(1e-6, 1.0 - p)
+
+    def forward(self, imgs, return_aux=False):
+        if not isinstance(imgs, (tuple, list)) or len(imgs) != 2:
+            raise ValueError(
+                "MultiGFMGatedLightUNet expects imgs as a 2-tuple "
+                "(pixel_imgs, token_imgs); got "
+                f"{type(imgs).__name__}"
+            )
+        pixel_imgs, token_imgs = imgs
+
+        ae = pixel_imgs[:, :self.ae_channels, :, :]
+        tessera = pixel_imgs[:, self.ae_channels:, :, :]
+        tm = token_imgs[:, :self.terramind_channels, :, :]
+        thor = token_imgs[:, self.terramind_channels:, :, :]
+
+        # Per-modality features at common (256, 256, base_ch).
+        f_ae = self.alpha_unet.forward_features(ae)
+        f_tes = self.tessera_stem(tessera)
+        f_tm = self.terramind_stem(tm)
+        f_thor = self.thor_stem(thor)
+
+        # Modality dropout on non-anchor streams only — keeps AE branch
+        # self-sufficient (the model must still produce reasonable
+        # predictions even when novel modalities are silenced).
+        f_tes = self._drop_modality(f_tes, self.modality_dropout, self.training)
+        f_tm = self._drop_modality(f_tm, self.modality_dropout, self.training)
+        f_thor = self._drop_modality(f_thor, self.modality_dropout, self.training)
+
+        # Normalize per-modality before computing gate logits.
+        n_ae = self.norm_ae(f_ae)
+        n_tes = self.norm_tes(f_tes)
+        n_tm = self.norm_tm(f_tm)
+        n_thor = self.norm_thor(f_thor)
+        gate_in = torch.cat([n_ae, n_tes, n_tm, n_thor], dim=1)
+
+        g_ae = torch.sigmoid(self.gate_ae(gate_in))
+        g_tes = torch.sigmoid(self.gate_tes(gate_in))
+        g_tm = torch.sigmoid(self.gate_tm(gate_in))
+        g_thor = torch.sigmoid(self.gate_thor(gate_in))
+
+        fused = (g_ae * f_ae + g_tes * f_tes
+                 + g_tm * f_tm + g_thor * f_thor)
+
+        return self.head(fused, return_aux=return_aux)
+
+
 class EmbeddingRefiner(nn.Module):
     """Encoder-light, decoder-heavy model for pixel-aligned GFM embeddings.
 
@@ -1232,7 +1434,8 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 height_specialist_depth=0, lightunet_base_ch=32,
                 fusion_mode="residual_presence",
                 gate_mode="simple", gate_untied=False,
-                modality_dropout=0.0):
+                modality_dropout=0.0,
+                multi_gfm_kwargs=None):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -1251,6 +1454,12 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
         return HRNetEmbedding(n_channels=n_channels, n_classes=n_classes, width=18), selected
     if selected == "hrnet_w32":
         return HRNetEmbedding(n_channels=n_channels, n_classes=n_classes, width=32), selected
+    if selected == "multi_gfm":
+        kw = dict(multi_gfm_kwargs or {})
+        kw.setdefault("base_ch", lightunet_base_ch)
+        kw.setdefault("height_specialist_depth", height_specialist_depth)
+        kw.setdefault("modality_dropout", modality_dropout)
+        return MultiGFMGatedLightUNet(n_classes=n_classes, **kw), selected
     if selected == "tessera_iou_fusion":
         if fusion_mode == "gated_feature":
             return TesseraIoUFusionGatedLightUNet(

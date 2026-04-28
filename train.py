@@ -21,8 +21,11 @@ from tqdm.auto import tqdm
 
 from core.model import build_model
 from core.dataset import (
-    find_file_pairs, find_multisource_file_pairs, save_split, load_split,
-    pick_dataset_class, MultiPixelEmbeddingDataset, AUGMENT_MODES,
+    find_file_pairs, find_multisource_file_pairs,
+    find_multi_gfm_file_pairs,
+    save_split, load_split,
+    pick_dataset_class, MultiPixelEmbeddingDataset, MultiGFMDataset,
+    AUGMENT_MODES,
 )
 from core.losses import ImprovedCompositeLoss, UncertaintyWeightedLoss
 
@@ -98,7 +101,7 @@ DEFAULT_TRAIN_TAR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "data", "trai
 
 MODEL_CHOICES = [
     "auto", "lightunet", "decoder_residual", "token_neck", "embedding_refiner",
-    "hrnet_w18", "hrnet_w32", "tessera_iou_fusion",
+    "hrnet_w18", "hrnet_w32", "tessera_iou_fusion", "multi_gfm",
 ]
 LOSS_PRESET_CHOICES = ["auto", "current", "no_ssim_grad", "presence_centered"]
 
@@ -191,6 +194,18 @@ def parse_args():
     p.add_argument("--secondary-train-embeddings-dir", default=None,
                    help="Optional second pixel-aligned embedding dir to concatenate with "
                         "--train-embeddings-dir, e.g. Tessera with AlphaEarth.")
+    p.add_argument("--terramind-s1-train-emb-dir", default=None,
+                   help="TerraMind S1 (16x16x768) train embeddings; required for "
+                        "--model-type multi_gfm.")
+    p.add_argument("--terramind-s2-train-emb-dir", default=None,
+                   help="TerraMind S2 (16x16x768) train embeddings; required for "
+                        "--model-type multi_gfm.")
+    p.add_argument("--thor-s1-train-emb-dir", default=None,
+                   help="THOR S1 (16x16x768) train embeddings; required for "
+                        "--model-type multi_gfm.")
+    p.add_argument("--thor-s2-train-emb-dir", default=None,
+                   help="THOR S2 (16x16x768) train embeddings; required for "
+                        "--model-type multi_gfm.")
     p.add_argument("--tessera-presence-ch", type=int, default=16,
                    help="Compressed Tessera channels exposed to the residual presence head.")
     p.add_argument("--tessera-hidden-ch", type=int, default=None,
@@ -378,8 +393,29 @@ def resolve_loss_preset(args):
     return "current"
 
 
+def _is_multi_gfm(args):
+    return args.model_type.lower() == "multi_gfm"
+
+
 def make_dataloaders(args, device):
-    if args.secondary_train_embeddings_dir:
+    if _is_multi_gfm(args):
+        for k in ("terramind_s1_train_emb_dir", "terramind_s2_train_emb_dir",
+                  "thor_s1_train_emb_dir", "thor_s2_train_emb_dir",
+                  "secondary_train_embeddings_dir"):
+            if not getattr(args, k):
+                raise ValueError(
+                    f"--model-type multi_gfm requires --{k.replace('_', '-')}"
+                )
+        all_pairs = find_multi_gfm_file_pairs(
+            args.train_embeddings_dir,
+            args.secondary_train_embeddings_dir,
+            args.terramind_s1_train_emb_dir,
+            args.terramind_s2_train_emb_dir,
+            args.thor_s1_train_emb_dir,
+            args.thor_s2_train_emb_dir,
+            args.train_targets_dir,
+        )
+    elif args.secondary_train_embeddings_dir:
         all_pairs = find_multisource_file_pairs(
             args.train_embeddings_dir,
             args.secondary_train_embeddings_dir,
@@ -405,13 +441,27 @@ def make_dataloaders(args, device):
         if args.split_file:
             save_split(args.split_file, train_pairs, val_pairs)
 
-    with rasterio.open(train_pairs[0][0]) as src:
-        n_channels = src.count
-    if args.secondary_train_embeddings_dir:
+    if _is_multi_gfm(args):
+        # n_channels is reported only for the AE+Tessera pixel concat;
+        # token streams are exposed separately to the model via the
+        # 2-tuple input contract.
+        with rasterio.open(train_pairs[0][0]) as src:
+            n_channels = src.count
         with rasterio.open(train_pairs[0][1]) as src:
             n_channels += src.count
+    else:
+        with rasterio.open(train_pairs[0][0]) as src:
+            n_channels = src.count
+        if args.secondary_train_embeddings_dir:
+            with rasterio.open(train_pairs[0][1]) as src:
+                n_channels += src.count
 
-    DatasetCls = MultiPixelEmbeddingDataset if args.secondary_train_embeddings_dir else pick_dataset_class(args.model_type, n_channels)
+    if _is_multi_gfm(args):
+        DatasetCls = MultiGFMDataset
+    elif args.secondary_train_embeddings_dir:
+        DatasetCls = MultiPixelEmbeddingDataset
+    else:
+        DatasetCls = pick_dataset_class(args.model_type, n_channels)
     if DatasetCls.__name__ == "LatentTokenDataset":
         train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, scale_factor=16,
                               is_train=True, augment=args.augment,
@@ -578,17 +628,37 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
                     import sys; sys.exit(0)
                 break
             t_after_data = time.perf_counter()
-            imgs = imgs.to(device, non_blocking=non_blocking)
+            # imgs may be a single tensor or a tuple of tensors (multi_gfm
+            # dataset returns (pixel_imgs, token_imgs)). Handle both.
+            if isinstance(imgs, (tuple, list)):
+                imgs = tuple(t.to(device, non_blocking=non_blocking) for t in imgs)
+            else:
+                imgs = imgs.to(device, non_blocking=non_blocking)
             targets = targets.to(device, non_blocking=non_blocking)
             masks = masks.to(device, non_blocking=non_blocking)
             if channels_last:
-                imgs = imgs.contiguous(memory_format=torch.channels_last)
+                # Only convert the (4D, NCHW) pixel-stream tensor; the token
+                # stream is also 4D but tiny (16x16) so the layout swap is
+                # not load-bearing there. Be permissive and apply to all 4D
+                # tensors when imgs is a tuple.
+                if isinstance(imgs, tuple):
+                    imgs = tuple(
+                        (t.contiguous(memory_format=torch.channels_last)
+                         if t.ndim == 4 else t)
+                        for t in imgs
+                    )
+                else:
+                    imgs = imgs.contiguous(memory_format=torch.channels_last)
             # Pre-declare batch dim (axis 0) as dynamic on the first step of a
             # compiled run. Lets Inductor emit one graph that handles both the
             # full batch and the ragged final batch, avoiding a mid-epoch
             # recompile. No-op when the model isn't wrapped by torch.compile.
             if step == 1 and hasattr(model, "_orig_mod"):
-                torch._dynamo.mark_dynamic(imgs, 0)
+                if isinstance(imgs, tuple):
+                    for t in imgs:
+                        torch._dynamo.mark_dynamic(t, 0)
+                else:
+                    torch._dynamo.mark_dynamic(imgs, 0)
                 torch._dynamo.mark_dynamic(targets, 0)
                 torch._dynamo.mark_dynamic(masks, 0)
             if sync_cuda:
@@ -651,7 +721,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
                     _print_profile_summary(prof, profile_steps)
                     import sys; sys.exit(0)
 
-            bs = imgs.size(0)
+            bs = imgs[0].size(0) if isinstance(imgs, tuple) else imgs.size(0)
             running_loss_t += loss.detach() * bs
             for name, value in loss_components.items():
                 if name not in component_sums_t:
@@ -744,6 +814,37 @@ def main():
     train_loader, val_loader, train_ds, val_ds, n_channels = make_dataloaders(args, device)
 
     print("--- 2. Model Init ---")
+    multi_gfm_kwargs = None
+    if _is_multi_gfm(args):
+        # Probe shapes from first sample to set channel widths.
+        sample = train_ds.file_pairs[0]
+        with rasterio.open(sample[0]) as src:
+            ae_ch = src.count
+        with rasterio.open(sample[1]) as src:
+            tes_ch = src.count
+        with rasterio.open(sample[2]) as src:
+            tm_s1_ch = src.count
+            tok_h, tok_w = src.height, src.width
+        with rasterio.open(sample[3]) as src:
+            tm_s2_ch = src.count
+        with rasterio.open(sample[4]) as src:
+            th_s1_ch = src.count
+        with rasterio.open(sample[5]) as src:
+            th_s2_ch = src.count
+        if tok_h != tok_w:
+            raise ValueError(f"Token streams must be square; got {tok_h}x{tok_w}")
+        multi_gfm_kwargs = dict(
+            ae_channels=ae_ch,
+            tessera_channels=tes_ch,
+            terramind_channels=tm_s1_ch + tm_s2_ch,
+            thor_channels=th_s1_ch + th_s2_ch,
+            token_spatial=tok_h,
+            pixel_spatial=args.patch_size,
+        )
+        print(f"multi_gfm channels: AE={ae_ch} TES={tes_ch} "
+              f"TM={tm_s1_ch}+{tm_s2_ch}={tm_s1_ch+tm_s2_ch} "
+              f"THOR={th_s1_ch}+{th_s2_ch}={th_s1_ch+th_s2_ch} "
+              f"token_spatial={tok_h}")
     model, selected_model = build_model(
         args.model_type,
         n_channels,
@@ -757,6 +858,7 @@ def main():
         gate_mode=args.gate_mode,
         gate_untied=args.gate_untied,
         modality_dropout=args.modality_dropout,
+        multi_gfm_kwargs=multi_gfm_kwargs,
     )
     model = model.to(device)
     if channels_last:

@@ -192,6 +192,46 @@ def find_multisource_embedding_files(primary_emb_dir, secondary_emb_dir):
     return [(primary_files[cid], secondary_files[cid]) for cid in common_ids]
 
 
+def find_multi_gfm_file_pairs(ae_dir, tessera_dir,
+                              terramind_s1_dir, terramind_s2_dir,
+                              thor_s1_dir, thor_s2_dir,
+                              tar_dir):
+    """Match all 4 GeoFM streams + labels by normalized core id.
+
+    Each tuple is (ae, tessera, tm_s1, tm_s2, thor_s1, thor_s2, label).
+    The AE path is used for split keys and submission ids — same
+    convention as find_multisource_file_pairs."""
+    ae = _index_embedding_dir(ae_dir)
+    tes = _index_embedding_dir(tessera_dir)
+    tm1 = _index_embedding_dir(terramind_s1_dir)
+    tm2 = _index_embedding_dir(terramind_s2_dir)
+    th1 = _index_embedding_dir(thor_s1_dir)
+    th2 = _index_embedding_dir(thor_s2_dir)
+    labels = {
+        normalize_core_id(p): p
+        for p in glob.glob(os.path.join(tar_dir, "**", "label_*.tif"), recursive=True)
+    }
+    common = sorted(set(ae) & set(tes) & set(tm1) & set(tm2)
+                    & set(th1) & set(th2) & set(labels))
+    return [(ae[i], tes[i], tm1[i], tm2[i], th1[i], th2[i], labels[i])
+            for i in common]
+
+
+def find_multi_gfm_embedding_files(ae_dir, tessera_dir,
+                                   terramind_s1_dir, terramind_s2_dir,
+                                   thor_s1_dir, thor_s2_dir):
+    """Label-free analogue of find_multi_gfm_file_pairs (test set)."""
+    ae = _index_embedding_dir(ae_dir)
+    tes = _index_embedding_dir(tessera_dir)
+    tm1 = _index_embedding_dir(terramind_s1_dir)
+    tm2 = _index_embedding_dir(terramind_s2_dir)
+    th1 = _index_embedding_dir(thor_s1_dir)
+    th2 = _index_embedding_dir(thor_s2_dir)
+    common = sorted(set(ae) & set(tes) & set(tm1) & set(tm2)
+                    & set(th1) & set(th2))
+    return [(ae[i], tes[i], tm1[i], tm2[i], th1[i], th2[i]) for i in common]
+
+
 def save_split(split_path, train_pairs, val_pairs):
     """Save train/val split to a JSON file using normalized core IDs."""
     data = {
@@ -385,6 +425,116 @@ class MultiPixelEmbeddingDataset(Dataset):
             valid_mask = _apply_d4(valid_mask, rot_k, flip_h)
 
         return torch.from_numpy(image), torch.from_numpy(target), torch.from_numpy(valid_mask)
+
+# ---------------------------------------------------------
+# DATASET 1c: Multi-GFM (AE + Tessera pixel-level
+#             + TerraMind S1+S2 + THOR S1+S2 token-level)
+# Returns imgs as a 2-tuple (pixel_imgs, token_imgs):
+#   pixel_imgs : (192, 256, 256) = AE(64) ++ Tessera(128)
+#   token_imgs : (3072, 16, 16)  = TM_S1(768) ++ TM_S2(768)
+#                                  ++ THOR_S1(768) ++ THOR_S2(768)
+# Channel order is fixed and parsed inside MultiGFMGatedLightUNet.
+# ---------------------------------------------------------
+class MultiGFMDataset(Dataset):
+    """4-modality dataset: AE + Tessera (pixel) + TerraMind + THOR (token).
+
+    file_pairs items are 7-tuples
+        (ae, tes, tm_s1, tm_s2, thor_s1, thor_s2, label)
+    or 6-tuples (label-free inference, no label path).
+
+    D4 augmentation is applied to the pixel stream + targets/mask only.
+    The token stream is treated as semantic context that is NOT spatially
+    augmented — augmenting at 16x16 resolution flips the wrong way
+    relative to the 256x256 ground truth (the 16x scale factor creates
+    an aliased mapping). Aug on the pixel stream alone is the closest
+    safe approximation; for now we keep aug off in the recipe anyway.
+    """
+
+    def __init__(self, file_pairs, patch_size=128, is_train=True,
+                 augment=False, augment_mode="none"):
+        self.patch_size = patch_size
+        self.is_train = is_train
+        # We default augment off for multi-GFM because the token stream
+        # is at 16x16; if augment is enabled we apply D4 to pixel only
+        # (token branch unaffected — see note above).
+        self.augment = augment and is_train
+        self.augment_mode = augment_mode
+        self.file_pairs = file_pairs
+
+    def __len__(self):
+        return len(self.file_pairs)
+
+    def __getitem__(self, idx):
+        pair = self.file_pairs[idx]
+        if len(pair) == 7:
+            ae_p, tes_p, tm1_p, tm2_p, th1_p, th2_p, tar_p = pair
+        elif len(pair) == 6:
+            ae_p, tes_p, tm1_p, tm2_p, th1_p, th2_p = pair
+            tar_p = None
+        else:
+            raise ValueError("MultiGFMDataset expects 6- or 7-item tuples")
+
+        with rasterio.open(ae_p) as src:
+            ae = clean_raster_array(src.read())
+        with rasterio.open(tes_p) as src:
+            tes = clean_raster_array(src.read())
+        if ae.shape[1:] != tes.shape[1:]:
+            raise ValueError(
+                f"Pixel-stream shapes do not align: AE {ae.shape} vs "
+                f"Tessera {tes.shape} ({ae_p}, {tes_p})"
+            )
+        pixel_imgs = np.concatenate([ae, tes], axis=0)
+
+        with rasterio.open(tm1_p) as src:
+            tm1 = clean_raster_array(src.read())
+        with rasterio.open(tm2_p) as src:
+            tm2 = clean_raster_array(src.read())
+        with rasterio.open(th1_p) as src:
+            th1 = clean_raster_array(src.read())
+        with rasterio.open(th2_p) as src:
+            th2 = clean_raster_array(src.read())
+        # All four token streams are 16x16. Concat on channel axis.
+        token_imgs = np.concatenate([tm1, tm2, th1, th2], axis=0)
+
+        if tar_p is not None:
+            with rasterio.open(tar_p) as src:
+                raw_target = clean_raster_array(src.read())
+            global_valid = ~np.all(raw_target == 0, axis=0)
+            has_landcover = (raw_target[0] > 0) | (raw_target[1] > 0) | (raw_target[2] > 0)
+            ndsm_hole = (raw_target[3] == 0) & has_landcover
+            height_valid = global_valid & ~ndsm_hole
+            valid_mask = np.stack([global_valid, height_valid], axis=0).astype(np.float32)
+            target = raw_target
+            target[3, :, :] = np.maximum(target[3, :, :], 0.0) / HEIGHT_NORM_CONSTANT
+        else:
+            target = np.zeros((4, pixel_imgs.shape[1], pixel_imgs.shape[2]),
+                              dtype=np.float32)
+            valid_mask = np.ones((2, pixel_imgs.shape[1], pixel_imgs.shape[2]),
+                                 dtype=np.float32)
+
+        # Pad / center crop to patch_size on the pixel stream + targets.
+        # Token stream is always 16x16 (we don't crop tokens). If
+        # patch_size != 256 the token grid no longer covers the cropped
+        # area — reject that combination explicitly.
+        _, h, w = pixel_imgs.shape
+        if self.patch_size != h or self.patch_size != w:
+            raise ValueError(
+                f"MultiGFMDataset requires patch_size == native pixel "
+                f"resolution; got patch_size={self.patch_size}, "
+                f"native HxW={h}x{w}. Token streams cannot be cropped."
+            )
+
+        if self.augment:
+            rot_k, flip_h = _sample_d4(self.augment_mode)
+            pixel_imgs = _apply_d4(pixel_imgs, rot_k, flip_h)
+            target = _apply_d4(target, rot_k, flip_h)
+            valid_mask = _apply_d4(valid_mask, rot_k, flip_h)
+            # NB: token stream is intentionally not transformed; see class doc.
+
+        return ((torch.from_numpy(pixel_imgs), torch.from_numpy(token_imgs)),
+                torch.from_numpy(target),
+                torch.from_numpy(valid_mask))
+
 
 # ---------------------------------------------------------
 # DATASET 2: Latent Token-Based (TerraMind, Thor)
