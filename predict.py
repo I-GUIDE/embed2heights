@@ -294,7 +294,20 @@ def main():
         (k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
         for k, v in state.items()
     }
-    model.load_state_dict(state)
+    # strict=False so checkpoints from earlier versions of the codebase
+    # (e.g., before optional heads like dirichlet_head were added) still
+    # load — missing keys for unused inference-time heads are harmless.
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        ignorable = [k for k in missing if "dirichlet_head" in k or "cross_task_attn" in k]
+        critical = [k for k in missing if k not in ignorable]
+        if critical:
+            raise RuntimeError(f"Missing critical keys in state_dict: {critical}")
+        if ignorable:
+            print(f"Note: ignored {len(ignorable)} missing keys for unused "
+                  f"optional heads (e.g. dirichlet_head, cross_task_attn).")
+    if unexpected:
+        raise RuntimeError(f"Unexpected keys in state_dict: {unexpected}")
     model.eval()
     in_ch_desc = (
         f"pixel={sample_img[0].shape[0]} token={sample_img[1].shape[0]}"
