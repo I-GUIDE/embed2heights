@@ -87,7 +87,7 @@ def summarize(name, arr):
 def main():
     exp_name = "alphaearth_tessera_iou_fusion_E_specialist_d2"
     pred_dir = os.path.join(REPO_DIR, "runs", exp_name, "predictions")
-    labels_dir = "/u/dingqi2/workspace/esa/data/train/labels"
+    labels_dir = "/projects/bcrm/emb2height/data/train/labels"
     split_file = os.path.join(REPO_DIR, "splits", "split.json")
 
     val_ids = load_val_ids(split_file)

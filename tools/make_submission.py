@@ -7,7 +7,7 @@ Typical use:
     # 1. Run inference on the test embeddings
     python predict.py --experiment-name lightunet_alphaearth_v3head \\
         --model-type lightunet \\
-        --test-embeddings-dir /u/dingqi2/workspace/esa/data/test/alphaearth_test_emb \\
+        --test-embeddings-dir /projects/bcrm/emb2height/data/test/alphaearth_test_emb \\
         --predictions-dir runs/lightunet_alphaearth_v3head/test_predictions_alphaearth
 
     # 2a. Continuous submission (keeps class channels as-is — large ~800 MB zip)
