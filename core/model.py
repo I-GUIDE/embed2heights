@@ -47,7 +47,7 @@ class UpsampleBlock(nn.Module):
 
 
 class LightUNet(nn.Module):
-    def __init__(self, n_channels, n_classes, base_ch=32):
+    def __init__(self, n_channels, n_classes, base_ch=32, use_bkg=False):
         super(LightUNet, self).__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
@@ -69,7 +69,8 @@ class LightUNet(nn.Module):
         self.up3 = UpsampleBlock(c2, c1)
         self.conv3 = DoubleConv(c2, c1)
 
-        self.head = MultiTaskPredictionHead(in_ch=c1, out_channels=n_classes)
+        self.head = MultiTaskPredictionHead(in_ch=c1, out_channels=n_classes,
+                                            use_bkg=use_bkg)
 
     def forward_features(self, x):
         x1 = self.inc(x)
@@ -219,7 +220,7 @@ class TokenNeckDecoder(nn.Module):
     """
 
     def __init__(self, n_channels=768, n_classes=4,
-                 level_channels=(256, 128, 64, 32), drop=0.05):
+                 level_channels=(256, 128, 64, 32), drop=0.05, use_bkg=False):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TokenNeckDecoder assumes 4 output channels")
@@ -250,7 +251,8 @@ class TokenNeckDecoder(nn.Module):
         self.up_128_256 = UpsampleBlock(c128, c128)
         self.fuse_256 = ConvGNAct(c128, c128, kernel_size=3)
 
-        self.head = MultiTaskPredictionHead(c128, out_channels=n_classes, drop=drop)
+        self.head = MultiTaskPredictionHead(c128, out_channels=n_classes, drop=drop,
+                                            use_bkg=use_bkg)
 
     def forward(self, x, return_aux=False):
         pyr = self.neck(x)
@@ -439,7 +441,8 @@ class MultiTaskPredictionHead(nn.Module):
     """
 
     def __init__(self, in_ch, out_channels=4, hidden_ch=None, drop=0.05,
-                 presence_extra_ch=0, height_specialist_depth=0):
+                 presence_extra_ch=0, height_specialist_depth=0,
+                 use_bkg=False):
         super().__init__()
         if out_channels != 4:
             raise ValueError("MultiTaskPredictionHead assumes 4 output channels")
@@ -447,6 +450,12 @@ class MultiTaskPredictionHead(nn.Module):
         self._hidden_ch = hidden_ch
         self.presence_extra_ch = presence_extra_ch
         self.height_specialist_depth = int(height_specialist_depth)
+        self.use_bkg = bool(use_bkg)
+        # use_bkg widens the FRACTION head to 4 logits over [B,V,W,bkg]
+        # (softmax simplex, fits area-fraction labels). The PRESENCE head
+        # stays at 3 logits + sigmoid because per-channel BCE on `label > 0`
+        # is the empirical IoU champion (see logs/BEST_RESULT.md).
+        n_frac_logits = 4 if self.use_bkg else 3
 
         # --- Deeper shared trunk: 2 layers + residual ---
         self.shared = nn.Sequential(
@@ -463,7 +472,7 @@ class MultiTaskPredictionHead(nn.Module):
         # --- Fraction head (auxiliary: soft coverage regression) ---
         self.fraction_head = nn.Sequential(
             ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
-            nn.Conv2d(hidden_ch, 3, 1),
+            nn.Conv2d(hidden_ch, n_frac_logits, 1),
         )
 
         # --- Presence head (main: binary classifier for submission channels 0-2) ---
@@ -479,8 +488,8 @@ class MultiTaskPredictionHead(nn.Module):
             self.presence_delta_head = None
 
         # --- FiLM conditioning: soft fractions modulate height features ---
-        self.film_scale = nn.Conv2d(3, hidden_ch, 1)
-        self.film_shift = nn.Conv2d(3, hidden_ch, 1)
+        self.film_scale = nn.Conv2d(n_frac_logits, hidden_ch, 1)
+        self.film_shift = nn.Conv2d(n_frac_logits, hidden_ch, 1)
 
         # --- Shared height trunk + 3 lightweight output projections ---
         self.height_trunk = nn.Sequential(
@@ -506,7 +515,12 @@ class MultiTaskPredictionHead(nn.Module):
 
         # Auxiliary soft fraction (for height gating + regression losses)
         fraction_logits = self.fraction_head(x)
-        fractions = torch.sigmoid(fraction_logits)
+        # use_bkg: 4-channel softmax over [B, V, W, bkg] (probability simplex).
+        # Otherwise: 3-channel sigmoid (independent per-class fractions).
+        if self.use_bkg:
+            fractions = F.softmax(fraction_logits, dim=1)
+        else:
+            fractions = torch.sigmoid(fraction_logits)
 
         # Main presence classifier (submission channels 0-2). When an external
         # edge feature is provided, it learns only a zero-initialized residual
@@ -548,7 +562,12 @@ class MultiTaskPredictionHead(nn.Module):
         height_presence_prob = torch.sigmoid(alpha_presence_logits)
         p_b = height_presence_prob[:, 0:1, :, :]
         p_v = height_presence_prob[:, 1:2, :, :]
-        p_fg = 1.0 - (1.0 - p_b) * (1.0 - p_v)           # P(any of {b,v} present)
+        if self.use_bkg:
+            # Calibrated "any non-bkg present" from the simplex; replaces the
+            # independence-product 1 - (1-p_b)(1-p_v) in the no-bkg path.
+            p_fg = (1.0 - fractions[:, 3:4, :, :]).clamp(0.0, 1.0)
+        else:
+            p_fg = 1.0 - (1.0 - p_b) * (1.0 - p_v)           # P(any of {b,v} present)
         denom = p_b + p_v + 1e-6
         w_b = p_b / denom
         w_v = p_v / denom
@@ -613,7 +632,7 @@ class TesseraIoUFusionLightUNet(nn.Module):
     def __init__(self, n_channels, n_classes=4, alpha_channels=64,
                  tessera_presence_ch=16, tessera_hidden_ch=None,
                  tessera_hidden_depth=0, height_specialist_depth=0,
-                 base_ch=32):
+                 base_ch=32, use_bkg=False):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TesseraIoUFusionLightUNet assumes 4 output channels")
@@ -626,7 +645,8 @@ class TesseraIoUFusionLightUNet(nn.Module):
         self.alpha_channels = alpha_channels
         tessera_channels = n_channels - alpha_channels
 
-        self.alpha_unet = LightUNet(alpha_channels, n_classes, base_ch=base_ch)
+        self.alpha_unet = LightUNet(alpha_channels, n_classes, base_ch=base_ch,
+                                    use_bkg=use_bkg)
         self.alpha_unet.head = nn.Identity()
         self.tessera_stem = TesseraCompressionStem(
             tessera_channels,
@@ -639,6 +659,7 @@ class TesseraIoUFusionLightUNet(nn.Module):
             out_channels=n_classes,
             presence_extra_ch=tessera_presence_ch,
             height_specialist_depth=height_specialist_depth,
+            use_bkg=use_bkg,
         )
 
     def forward(self, x, return_aux=False):
@@ -663,7 +684,7 @@ class EmbeddingRefiner(nn.Module):
     """
 
     def __init__(self, n_channels, n_classes=4, dim=96, n_blocks=6,
-                 aspp_dim=128, drop=0.05):
+                 aspp_dim=128, drop=0.05, use_bkg=False):
         super().__init__()
         if n_classes != 4:
             raise ValueError("EmbeddingRefiner assumes 4 output channels: building, veg, water, height")
@@ -686,7 +707,8 @@ class EmbeddingRefiner(nn.Module):
         )
         self.refine_late = nn.Sequential(*[ConvNeXtBlock(dim, drop=drop) for _ in range(n_blocks - half)])
 
-        self.head = MultiTaskPredictionHead(dim, out_channels=n_classes, drop=drop)
+        self.head = MultiTaskPredictionHead(dim, out_channels=n_classes, drop=drop,
+                                            use_bkg=use_bkg)
 
     def forward(self, x, return_aux=False):
         x = self.calib(x)
@@ -813,7 +835,7 @@ class HRStage(nn.Module):
 class HRNetEmbedding(nn.Module):
     """HRNet-style high-resolution backbone for 256x256 GFM embeddings."""
 
-    def __init__(self, n_channels, n_classes=4, width=18, drop=0.05):
+    def __init__(self, n_channels, n_classes=4, width=18, drop=0.05, use_bkg=False):
         super().__init__()
         if n_classes != 4:
             raise ValueError("HRNetEmbedding assumes 4 output channels")
@@ -837,7 +859,8 @@ class HRNetEmbedding(nn.Module):
             ConvGNAct(fused_ch, head_ch, kernel_size=1, padding=0),
             ConvGNAct(head_ch, head_ch, kernel_size=3),
         )
-        self.head = MultiTaskPredictionHead(head_ch, out_channels=n_classes, drop=drop)
+        self.head = MultiTaskPredictionHead(head_ch, out_channels=n_classes, drop=drop,
+                                            use_bkg=use_bkg)
 
     def forward(self, x, return_aux=False):
         x = self.calib(x)
@@ -876,25 +899,33 @@ def infer_model_type(n_channels):
 
 def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 tessera_hidden_ch=None, tessera_hidden_depth=0,
-                height_specialist_depth=0, lightunet_base_ch=32):
+                height_specialist_depth=0, lightunet_base_ch=32,
+                use_bkg=False):
     selected = model_type.lower()
 
     if selected == "auto":
         selected = infer_model_type(n_channels)
     if selected == "lightunet":
-        return LightUNet(n_channels, n_classes, base_ch=lightunet_base_ch), selected
+        return LightUNet(n_channels, n_classes, base_ch=lightunet_base_ch,
+                         use_bkg=use_bkg), selected
     if selected == "decoder":
         selected = "decoder_residual"
     if selected == "decoder_residual":
+        # EfficientDecoder256Fast has no MultiTaskPredictionHead, so use_bkg
+        # has no effect here. The flag is silently ignored for this backbone.
         return EfficientDecoder256Fast(in_channels=n_channels, out_channels=n_classes), selected
     if selected == "token_neck":
-        return TokenNeckDecoder(n_channels=n_channels, n_classes=n_classes), selected
+        return TokenNeckDecoder(n_channels=n_channels, n_classes=n_classes,
+                                use_bkg=use_bkg), selected
     if selected == "embedding_refiner":
-        return EmbeddingRefiner(n_channels=n_channels, n_classes=n_classes), selected
+        return EmbeddingRefiner(n_channels=n_channels, n_classes=n_classes,
+                                use_bkg=use_bkg), selected
     if selected == "hrnet_w18":
-        return HRNetEmbedding(n_channels=n_channels, n_classes=n_classes, width=18), selected
+        return HRNetEmbedding(n_channels=n_channels, n_classes=n_classes, width=18,
+                              use_bkg=use_bkg), selected
     if selected == "hrnet_w32":
-        return HRNetEmbedding(n_channels=n_channels, n_classes=n_classes, width=32), selected
+        return HRNetEmbedding(n_channels=n_channels, n_classes=n_classes, width=32,
+                              use_bkg=use_bkg), selected
     if selected == "tessera_iou_fusion":
         return TesseraIoUFusionLightUNet(
             n_channels=n_channels,
@@ -904,6 +935,7 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
             tessera_hidden_depth=tessera_hidden_depth,
             height_specialist_depth=height_specialist_depth,
             base_ch=lightunet_base_ch,
+            use_bkg=use_bkg,
         ), selected
 
     raise ValueError(

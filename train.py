@@ -60,6 +60,7 @@ DEFAULTS = {
     "grad_accum":      1,
     "num_workers":     4,
     "prefetch_factor": 1,
+    "use_bkg":         False,
 }
 
 
@@ -182,6 +183,13 @@ def parse_args():
                    help="Extra ConvGNAct layers prepended to the per-class height "
                         "specialist projections (building/vegetation). 0 = legacy 1x1 "
                         "projection only.")
+    p.add_argument("--use-bkg", action=argparse.BooleanOptionalAction,
+                   default=DEFAULTS["use_bkg"],
+                   help="If set, the FRACTION head emits 4 logits over [B,V,W,bkg] "
+                        "with softmax + soft cross-entropy (replaces the per-channel "
+                        "sigmoid + MAE on fractions). The PRESENCE head stays at 3 "
+                        "sigmoid logits + BCE — empirically the best loss for IoU. "
+                        "Height gate becomes p_fg = 1 - p_bkg from the fraction head.")
     p.add_argument("--structure-weight", type=float, default=None,
                    help="Override lambdas[3] (the weight on height_boost, and Tversky "
                         "under the 'current' preset). Defaults to DEFAULTS['lambdas'][3] "
@@ -320,6 +328,7 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "iou_loss_kind":       args.iou_loss_kind,
         "focal_gamma":         args.focal_gamma,
         "focal_alpha":         args.focal_alpha,
+        "use_bkg":             args.use_bkg,
         "train_targets_dir":    args.train_targets_dir,
         "val_split":       DEFAULTS["val_split"],
         "device":          str(device),
@@ -449,6 +458,7 @@ def main():
         tessera_hidden_depth=args.tessera_hidden_depth,
         height_specialist_depth=args.height_specialist_depth,
         lightunet_base_ch=args.lightunet_base_ch,
+        use_bkg=args.use_bkg,
     )
     model = model.to(device)
     print(f"Using model: {selected_model} (input channels={n_channels})")
@@ -472,6 +482,7 @@ def main():
         iou_loss_kind=args.iou_loss_kind,
         focal_gamma=args.focal_gamma,
         focal_alpha=args.focal_alpha,
+        use_bkg=args.use_bkg,
     ).to(device)
     print(
         "Using loss: "
@@ -487,7 +498,8 @@ def main():
         f"aux_veg_weight={args.aux_veg_weight}, "
         f"iou_loss_kind={args.iou_loss_kind}, "
         f"focal_gamma={args.focal_gamma}, "
-        f"focal_alpha={args.focal_alpha}"
+        f"focal_alpha={args.focal_alpha}, "
+        f"use_bkg={args.use_bkg}"
     )
 
     print(f"Starting training on {device}...")

@@ -149,7 +149,8 @@ class ImprovedCompositeLoss(nn.Module):
                  veg_height_boost=0.0,
                  aux_veg_weight=1.0,
                  iou_loss_kind="tversky",
-                 focal_gamma=2.0, focal_alpha=0.25):
+                 focal_gamma=2.0, focal_alpha=0.25,
+                 use_bkg=False):
         super().__init__()
         if loss_preset not in {"current", "no_ssim_grad", "presence_centered"}:
             raise ValueError(
@@ -160,6 +161,9 @@ class ImprovedCompositeLoss(nn.Module):
         if iou_loss_kind not in {"tversky", "focal"}:
             raise ValueError("iou_loss_kind must be one of: tversky, focal")
         self.loss_preset = loss_preset
+        # use_bkg: replaces fraction-head MAE with softmax+soft-CE over
+        # [B, V, W, bkg]. Presence head stays sigmoid+BCE (empirical champion).
+        self.use_bkg = bool(use_bkg)
         self.ssim = SSIMLoss(window_size=11)
         self.gdl = GradientDifferenceLoss()
 
@@ -217,6 +221,32 @@ class ImprovedCompositeLoss(nn.Module):
         denom = torch.sum(mask) + 1e-6
         return torch.sum(loss * mask) / denom
 
+    @staticmethod
+    def _build_soft_target_4ch(targets, eps=1e-6):
+        """Build a 4-channel probability-simplex target from 3-channel fractions.
+
+        Returns [B, 4, H, W] = [B_frac, V_frac, W_frac, bkg] summing to 1.
+        Defensive renormalization is applied if a row's foreground sum exceeds
+        1 (the dataset is documented to satisfy B+V+W <= 1, so this is slack).
+        """
+        f3 = targets[:, :3, :, :].clamp(min=0.0)
+        s = f3.sum(dim=1, keepdim=True)
+        scale = torch.where(s > 1.0, 1.0 / (s + eps), torch.ones_like(s))
+        f3 = f3 * scale
+        bkg = (1.0 - f3.sum(dim=1, keepdim=True)).clamp(min=0.0)
+        return torch.cat([f3, bkg], dim=1)
+
+    @staticmethod
+    def _soft_ce(logits, target_dist, mask_1ch, eps=1e-6):
+        """Masked soft cross-entropy over the channel dim.
+
+        logits / target_dist: (B, C, H, W). mask_1ch: (B, 1, H, W) float in
+        {0, 1}. Returns scalar mean over valid pixels.
+        """
+        logp = F.log_softmax(logits, dim=1)
+        per_pixel = -(target_dist * logp).sum(dim=1, keepdim=True)
+        return (per_pixel * mask_1ch).sum() / (mask_1ch.sum() + eps)
+
     def forward(self, preds, targets, valid_mask=None):
         """
         Args:
@@ -253,8 +283,11 @@ class ImprovedCompositeLoss(nn.Module):
         # (MAE/SSIM/Gradient/Tversky on land cover) must target the auxiliary
         # `fractions` instead, which is still a soft [0,1] coverage regressor.
         # Height (channel 3) continues to come from `preds[:, 3]`.
+        # Under use_bkg, aux_outputs["fractions"] is 4-channel softmax over
+        # [B, V, W, bkg]; slice to 3ch foreground for the legacy structural
+        # losses (MAE/SSIM/Grad/Tversky) which operate per-class.
         if aux_outputs is not None and "fractions" in aux_outputs:
-            class_pred = aux_outputs["fractions"]  # (B, 3, H, W) — soft fractions
+            class_pred = aux_outputs["fractions"][:, :3, :, :]  # (B, 3, H, W) — soft fractions
         else:
             class_pred = preds[:, :3, :, :]        # fallback for models without a split head
 
@@ -281,6 +314,31 @@ class ImprovedCompositeLoss(nn.Module):
             global_mask.expand(-1, 3, -1, -1),
             fraction_mae_weights,
         )
+
+        # Under use_bkg, replace the fraction-side MAE with soft CE on the
+        # 4-channel [B, V, W, bkg] simplex — softmax + CE is the natural fit
+        # for area-fraction labels that satisfy B+V+W+bkg=1. The presence head
+        # path below is left untouched (BCE on `label > 0` is the empirical
+        # champion loss for IoU; see logs/BEST_RESULT.md).
+        use_bkg_active = bool(self.use_bkg and aux_outputs is not None
+                              and "fraction_logits" in aux_outputs
+                              and aux_outputs["fraction_logits"].shape[1] == 4)
+        if use_bkg_active:
+            soft_target_4 = self._build_soft_target_4ch(targets)
+            loss_fraction_ce = self._soft_ce(
+                aux_outputs["fraction_logits"], soft_target_4, global_mask
+            )
+            # Override the fraction MAE term outright.
+            loss_fraction_mae = loss_fraction_ce
+            # Replace the class portion of base MAE with soft CE; keep height
+            # MAE on channel 3 unchanged.
+            height_only_mae = split_fg_bg_mae(
+                preds[:, 3:4, :, :],
+                targets[:, 3:4, :, :],
+                ch_mask[:, 3:4, :, :],
+                mae_weights[3:4],
+            )
+            loss_mae = loss_fraction_ce + height_only_mae
 
         # --- 2. Structural & Gradient Loss on Land Cover Only ---
         # Zero out predictions at nodata pixels so they match targets (no spurious loss)
