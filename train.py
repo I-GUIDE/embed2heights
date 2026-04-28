@@ -309,13 +309,15 @@ def parse_args():
                         "specialist projections (building/vegetation). 0 = legacy 1x1 "
                         "projection only.")
     p.add_argument("--fusion-mode", default="residual_presence",
-                   choices=["residual_presence", "gated_feature"],
+                   choices=["residual_presence", "gated_feature", "pyramid_gated"],
                    help="How Tessera fuses with AlphaEarth in tessera_iou_fusion. "
                         "residual_presence (legacy) = Tessera adds a zero-init "
                         "residual to presence logits only. gated_feature = "
                         "single-scale GMU at the trunk output (champion 0.5072). "
-                        "Gate depth/tying/dropout is controlled by --gate-mode, "
-                        "--gate-untied, --modality-dropout.")
+                        "pyramid_gated = multi-scale GMU at all 4 U-Net levels "
+                        "(Tessera encoder pyramid, one gate per scale; lets each "
+                        "scale learn its own fusion policy — coarse for water/"
+                        "vegetation, fine for building edges).")
     p.add_argument("--gate-mode", default="simple",
                    choices=["simple", "rich"],
                    help="Gate depth for gated_feature / pyramid_gated. "

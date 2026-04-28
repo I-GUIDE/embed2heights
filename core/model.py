@@ -733,6 +733,41 @@ def _maybe_drop_modality(tes_feat, p, training):
     return tes_feat * keep / max(1e-6, 1.0 - p)
 
 
+class TesseraPyramidStem(nn.Module):
+    """Tessera encoder pyramid producing features at all 4 U-Net scales.
+
+    Mirrors LightUNet's encoder (DoubleConv + MaxPool stages), so its outputs
+    are channel- and spatially-aligned with the AE encoder's [x1,x2,x3,x4]
+    intermediate features. Used by TesseraIoUFusionPyramidGatedLightUNet to
+    fuse Tessera into the AE encoder *at every scale*, not just at the
+    decoder output.
+
+    Output channels: (base_ch, 2·base_ch, 4·base_ch, 8·base_ch).
+    Output spatial: (1, 1/2, 1/4, 1/8) of input.
+    """
+
+    def __init__(self, in_ch, base_ch=32):
+        super().__init__()
+        self.calib = ChannelCalibration(in_ch)
+        c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
+        # 1x1 lift then DoubleConv at full res. The 1x1 keeps the per-pixel
+        # transformation cheap before paying for 3x3 spatial mixing.
+        self.stem_lift = nn.Conv2d(in_ch, c1, kernel_size=1, bias=False)
+        self.stem = DoubleConv(c1, c1)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c1, c2))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c2, c3))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c3, c4))
+
+    def forward(self, x):
+        x = self.calib(x)
+        x = self.stem_lift(x)
+        t1 = self.stem(x)
+        t2 = self.down1(t1)
+        t3 = self.down2(t2)
+        t4 = self.down3(t3)
+        return t1, t2, t3, t4
+
+
 class TesseraIoUFusionGatedLightUNet(nn.Module):
     """AlphaEarth + Tessera fused at the **feature level** via a learned gate.
 
@@ -831,6 +866,140 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
         presence_extra = (self.presence_extra_proj(tessera_feat)
                           if self.presence_extra_proj is not None else None)
         return self.head(fused, return_aux=return_aux,
+                         presence_extra=presence_extra)
+
+
+class TesseraIoUFusionPyramidGatedLightUNet(nn.Module):
+    """Multi-scale gated fusion: AE↔Tessera at every U-Net level.
+
+    The single-scale TesseraIoUFusionGatedLightUNet fuses once at the
+    decoder output. That's a single fusion policy for every spatial scale
+    of the prediction. But water (large, contiguous), building edges
+    (sharp, fine), and tree heights (mid-scale phenology) each benefit
+    from different fusion behavior.
+
+    Here we run a parallel Tessera encoder pyramid that produces features
+    at the same 4 scales as the AE encoder's intermediates, then fuse
+    *each* scale with its own gate before passing the (now Tessera-aware)
+    skip features to the decoder. Each gate's warm-start is AE-only, same
+    bias trick as the single-scale variant.
+
+    Flow:
+        AE  → x1 (c1, full)  ─┐
+        AE  → x2 (c2, /2)   ─┼─► gates fuse with t1..t4 ─► f1..f4
+        AE  → x3 (c3, /4)   ─┼   (per-scale, same warm-start)
+        AE  → x4 (c4, /8)   ─┘                              │
+        TES → t1..t4 (TesseraPyramidStem)                   │
+                                                             ▼
+        decoder uses f4 as bottleneck input, f1..f3 as skip connections
+    """
+
+    def __init__(self, n_channels, n_classes=4, alpha_channels=64,
+                 tessera_presence_ch=0, height_specialist_depth=0,
+                 base_ch=32, gate_init_bias=4.0,
+                 gate_mode="simple", gate_untied=False,
+                 modality_dropout=0.0):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("TesseraIoUFusionPyramidGatedLightUNet assumes 4 output channels")
+        if n_channels <= alpha_channels:
+            raise ValueError(
+                "TesseraIoUFusionPyramidGatedLightUNet expects concatenated AlphaEarth+Tessera "
+                f"input with >{alpha_channels} channels, got {n_channels}"
+            )
+        self.supports_aux_outputs = True
+        self.alpha_channels = alpha_channels
+        self.gate_untied = bool(gate_untied)
+        self.modality_dropout = float(modality_dropout)
+        tessera_channels = n_channels - alpha_channels
+        c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
+
+        # AE encoder/decoder — replicated from LightUNet so we can intercept
+        # the per-scale features for fusion.
+        self.inc = DoubleConv(alpha_channels, c1)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c1, c2))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c2, c3))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c3, c4))
+        self.up1 = UpsampleBlock(c4, c3)
+        self.conv1 = DoubleConv(c4, c3)
+        self.up2 = UpsampleBlock(c3, c2)
+        self.conv2 = DoubleConv(c3, c2)
+        self.up3 = UpsampleBlock(c2, c1)
+        self.conv3 = DoubleConv(c2, c1)
+
+        # Tessera pyramid → matched-shape features at each scale.
+        self.tessera_pyramid = TesseraPyramidStem(tessera_channels, base_ch=base_ch)
+
+        # One gate per scale. Each warm-starts as AE-only via the bias trick.
+        self.gate1 = _build_fusion_gate(c1, mode=gate_mode,
+                                        untied=self.gate_untied,
+                                        init_bias=gate_init_bias)
+        self.gate2 = _build_fusion_gate(c2, mode=gate_mode,
+                                        untied=self.gate_untied,
+                                        init_bias=gate_init_bias)
+        self.gate3 = _build_fusion_gate(c3, mode=gate_mode,
+                                        untied=self.gate_untied,
+                                        init_bias=gate_init_bias)
+        self.gate4 = _build_fusion_gate(c4, mode=gate_mode,
+                                        untied=self.gate_untied,
+                                        init_bias=gate_init_bias)
+
+        self.tessera_presence_ch = int(tessera_presence_ch)
+        if self.tessera_presence_ch > 0:
+            self.presence_extra_proj = nn.Conv2d(c1, self.tessera_presence_ch, 1)
+        else:
+            self.presence_extra_proj = None
+
+        self.head = MultiTaskPredictionHead(
+            in_ch=c1,
+            out_channels=n_classes,
+            presence_extra_ch=self.tessera_presence_ch,
+            height_specialist_depth=height_specialist_depth,
+        )
+
+    def forward(self, x, return_aux=False):
+        alpha = x[:, :self.alpha_channels, :, :]
+        tessera = x[:, self.alpha_channels:, :, :]
+
+        # AE encoder
+        x1 = self.inc(alpha)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+
+        # Tessera pyramid (one drop decision per sample applied uniformly
+        # across scales — keeps the per-sample regularization signal coherent).
+        t1, t2, t3, t4 = self.tessera_pyramid(tessera)
+        if self.training and self.modality_dropout > 0.0:
+            B = t1.size(0)
+            keep = (torch.rand(B, 1, 1, 1, device=t1.device)
+                    >= self.modality_dropout).float()
+            scale = 1.0 / max(1e-6, 1.0 - self.modality_dropout)
+            t1 = t1 * keep * scale
+            t2 = t2 * keep * scale
+            t3 = t3 * keep * scale
+            t4 = t4 * keep * scale
+
+        # Multi-scale fusion
+        f1 = _apply_fusion_gate(self.gate1, x1, t1, untied=self.gate_untied)
+        f2 = _apply_fusion_gate(self.gate2, x2, t2, untied=self.gate_untied)
+        f3 = _apply_fusion_gate(self.gate3, x3, t3, untied=self.gate_untied)
+        f4 = _apply_fusion_gate(self.gate4, x4, t4, untied=self.gate_untied)
+
+        # AE decoder using fused skips
+        h = self.up1(f4)
+        h = torch.cat([f3, h], dim=1)
+        h = self.conv1(h)
+        h = self.up2(h)
+        h = torch.cat([f2, h], dim=1)
+        h = self.conv2(h)
+        h = self.up3(h)
+        h = torch.cat([f1, h], dim=1)
+        h = self.conv3(h)
+
+        presence_extra = (self.presence_extra_proj(t1)
+                          if self.presence_extra_proj is not None else None)
+        return self.head(h, return_aux=return_aux,
                          presence_extra=presence_extra)
 
 
@@ -1090,6 +1259,17 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 tessera_presence_ch=tessera_presence_ch,
                 tessera_hidden_ch=tessera_hidden_ch,
                 tessera_hidden_depth=tessera_hidden_depth,
+                height_specialist_depth=height_specialist_depth,
+                base_ch=lightunet_base_ch,
+                gate_mode=gate_mode,
+                gate_untied=gate_untied,
+                modality_dropout=modality_dropout,
+            ), selected
+        if fusion_mode == "pyramid_gated":
+            return TesseraIoUFusionPyramidGatedLightUNet(
+                n_channels=n_channels,
+                n_classes=n_classes,
+                tessera_presence_ch=tessera_presence_ch,
                 height_specialist_depth=height_specialist_depth,
                 base_ch=lightunet_base_ch,
                 gate_mode=gate_mode,
