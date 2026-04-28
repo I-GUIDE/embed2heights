@@ -33,8 +33,9 @@ from core.dataset import normalize_core_id
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_ROOT = "/projects/bcrm/emb2height/data"
 DEFAULT_RUNS_DIR = os.path.join(SCRIPT_DIR, "runs")
-DEFAULT_DATA_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "data", "train"))
+DEFAULT_DATA_DIR = os.path.join(DATA_ROOT, "train")
 DEFAULT_LABELS_DIR = os.path.join(DEFAULT_DATA_DIR, "labels")
 DEFAULT_SPLIT_FILE = os.path.join(SCRIPT_DIR, "splits", "split.json")
 

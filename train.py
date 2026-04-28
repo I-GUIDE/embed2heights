@@ -27,8 +27,9 @@ from core.losses import ImprovedCompositeLoss
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_TRAIN_EMB = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "data", "train", "alphaearth_emb"))
-DEFAULT_TRAIN_TAR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "data", "train", "labels"))
+DATA_ROOT = "/projects/bcrm/emb2height/data"
+DEFAULT_TRAIN_EMB = os.path.join(DATA_ROOT, "train", "alphaearth_emb")
+DEFAULT_TRAIN_TAR = os.path.join(DATA_ROOT, "train", "labels")
 
 MODEL_CHOICES = [
     "auto", "lightunet", "decoder_residual", "token_neck", "embedding_refiner",
