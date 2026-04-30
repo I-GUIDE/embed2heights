@@ -52,3 +52,4 @@ configs/*
 
 predict_tta.py
 slurm-*.out
+slurm_logs/

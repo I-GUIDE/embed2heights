@@ -3,22 +3,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _group_count(channels):
+    for groups in (16, 8, 4, 2):
+        if channels % groups == 0:
+            return groups
+    return 1
+
+
 # ==========================================
 # 1. LIGHT UNET COMPONENTS
 # ==========================================
 
 class DoubleConv(nn.Module):
-    """(convolution => [BN] => ReLU) * 2"""
+    """(conv => GroupNorm => GELU) * 2.
+
+    GroupNorm + GELU instead of BatchNorm + ReLU — batch-size-independent
+    (important at bs=32), mixed-precision stable (no running stats), and
+    matches the GN+GELU convention already used by ConvGNAct / the v35 head.
+    """
 
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(out_channels), out_channels),
+            nn.GELU(),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(out_channels), out_channels),
+            nn.GELU(),
         )
 
     def forward(self, x):
@@ -26,22 +38,23 @@ class DoubleConv(nn.Module):
 
 
 class UpsampleBlock(nn.Module):
-    """
-    Bilinear Upsampling + Convolution.
-    Smoother than PixelShuffle/TransposeConv, avoids checkerboard artifacts.
+    """Bilinear upsample + 3x3 conv + GroupNorm + GELU.
+
+    Smoother than PixelShuffle/TransposeConv (avoids checkerboard artifacts);
+    GN+GELU matches the rest of the codebase and trains stably in bf16.
     """
 
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.act = nn.ReLU(inplace=True)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.norm = nn.GroupNorm(_group_count(out_channels), out_channels)
+        self.act = nn.GELU()
 
     def forward(self, x):
         x = self.upsample(x)
         x = self.conv(x)
-        x = self.bn(x)
+        x = self.norm(x)
         x = self.act(x)
         return x
 
@@ -384,13 +397,6 @@ class ASPP(nn.Module):
         return self.project(torch.cat(feats, dim=1))
 
 
-def _group_count(channels):
-    for groups in (16, 8, 4, 2):
-        if channels % groups == 0:
-            return groups
-    return 1
-
-
 class ConvGNAct(nn.Module):
     def __init__(self, in_ch, out_ch, kernel_size=3, stride=1, padding=None):
         super().__init__()
@@ -439,7 +445,8 @@ class MultiTaskPredictionHead(nn.Module):
     """
 
     def __init__(self, in_ch, out_channels=4, hidden_ch=None, drop=0.05,
-                 presence_extra_ch=0, height_specialist_depth=0):
+                 presence_extra_ch=0, height_specialist_depth=0,
+                 enable_dirichlet=True, enable_cross_task_attn=False):
         super().__init__()
         if out_channels != 4:
             raise ValueError("MultiTaskPredictionHead assumes 4 output channels")
@@ -447,6 +454,8 @@ class MultiTaskPredictionHead(nn.Module):
         self._hidden_ch = hidden_ch
         self.presence_extra_ch = presence_extra_ch
         self.height_specialist_depth = int(height_specialist_depth)
+        self.enable_dirichlet = bool(enable_dirichlet)
+        self.enable_cross_task_attn = bool(enable_cross_task_attn)
 
         # --- Deeper shared trunk: 2 layers + residual ---
         self.shared = nn.Sequential(
@@ -499,6 +508,31 @@ class MultiTaskPredictionHead(nn.Module):
         self.height_building_delta_proj = _specialist_head(self.height_specialist_depth)
         self.height_vegetation_delta_proj = _specialist_head(self.height_specialist_depth)
 
+        # Optional Dirichlet head for fractional simplex modeling. 4 outputs:
+        # building, vegetation, water, background. Always built so checkpoints
+        # are interchangeable across runs; the loss decides whether to use
+        # it (see ImprovedCompositeLoss.dirichlet_weight).
+        if self.enable_dirichlet:
+            self.dirichlet_head = nn.Sequential(
+                ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
+                nn.Conv2d(hidden_ch, 4, 1),
+            )
+        else:
+            self.dirichlet_head = None
+
+        # Optional cross-task spatial attention from land-cover head onto
+        # the height_trunk features. A 1-channel sigmoid mask derived from
+        # the 3-channel fractions; multiplied into the height features as
+        # a residual gate so initial behavior matches no-attention.
+        # The conv is zero-init so the multiplier starts at 1.0
+        # (cross_task_attn_logit = 0 → sigmoid = 0.5 → 1 + 2(0.5-0.5) = 1).
+        if self.enable_cross_task_attn:
+            self.cross_task_attn = nn.Conv2d(3, 1, kernel_size=1)
+            nn.init.zeros_(self.cross_task_attn.weight)
+            nn.init.zeros_(self.cross_task_attn.bias)
+        else:
+            self.cross_task_attn = None
+
     def forward(self, x, return_aux=False, presence_extra=None):
         # Shared trunk with residual
         x = self.shared(x)
@@ -526,6 +560,15 @@ class MultiTaskPredictionHead(nn.Module):
         scale = self.film_scale(fractions)
         shift = self.film_shift(fractions)
         h = x * (1.0 + scale) + shift
+
+        # Optional cross-task spatial attention. A per-pixel sigmoid mask
+        # from the land-cover fractions is multiplied into h as a residual
+        # gate. Zero-init weights → sigmoid(0) = 0.5 → multiplier = 1
+        # (no-op at t=0). Forces sharp segmentation boundaries to gate the
+        # height feature map at training time, mitigating regression blur.
+        if self.cross_task_attn is not None:
+            attn = torch.sigmoid(self.cross_task_attn(fractions))   # (B, 1, H, W)
+            h = h * (0.5 + attn)                                    # in [0.5, 1.5]
 
         # Shared height trunk -> 3 lightweight projections
         h = self.height_trunk(h)
@@ -559,6 +602,18 @@ class MultiTaskPredictionHead(nn.Module):
         # channel 3 is the presence-gated specialist height.
         out = torch.cat([presence_prob, height], dim=1)
 
+        # Optional Dirichlet concentration parameters. Output shape (B, 4, H, W)
+        # for {building, vegetation, water, background}. Computed from the
+        # shared trunk features (post-residual block, pre-FiLM), since the
+        # Dirichlet head is conceptually an *additional* land-cover view —
+        # not derived from, nor in series with, the existing fraction head.
+        # softplus + ε keeps α_c > 0 as required by the Dirichlet pdf.
+        if self.dirichlet_head is not None:
+            dirichlet_logits = self.dirichlet_head(x)
+            dirichlet_alpha = F.softplus(dirichlet_logits) + 1e-3
+        else:
+            dirichlet_alpha = None
+
         if not return_aux:
             return out
         return {
@@ -573,6 +628,7 @@ class MultiTaskPredictionHead(nn.Module):
             "height_base": base_height,
             "height_building": building_height,
             "height_vegetation": vegetation_height,
+            "dirichlet_alpha": dirichlet_alpha,
         }
 
 
@@ -648,6 +704,675 @@ class TesseraIoUFusionLightUNet(nn.Module):
         alpha_feat = self.alpha_unet.forward_features(alpha)
         tessera_feat = self.tessera_stem(tessera)
         return self.head(alpha_feat, return_aux=return_aux, presence_extra=tessera_feat)
+
+
+def _build_fusion_gate(channels, mode="simple", untied=False, init_bias=4.0):
+    """Build a gate module that sees concat(alpha, tessera) features.
+
+    Args:
+        channels: width of each modality stream (gate input is 2*channels).
+        mode: "simple" (1x1 conv) or "rich" (Conv1x1 → GN → GELU → Conv1x1).
+              The rich variant lets the gate learn nonlinear "this region is
+              water-like AND temporally stable" decisions instead of a single
+              hyperplane (the GMU paper, Section 5.1, explicitly recommends
+              non-linearities on the gate).
+        untied: if False, output a single tied gate G ∈ (0,1), used as
+                fused = G·AE + (1-G)·TES. If True, output independent gates
+                G_AE and G_TES (both in (0,1), not constrained to sum to 1)
+                so that fused = G_AE·AE + G_TES·TES — strictly more expressive
+                (GMU Figure 2a multimodal form), since it can boost both
+                modalities on a pixel where both are informative.
+        init_bias: bias initial value chosen so that at t=0 the fused output
+                equals the AE features (warm-start as alpha-only — preserves
+                the codebase's zero-init residual hygiene). For tied gates
+                that's a single +init_bias; for untied it's +init_bias on the
+                AE half and -init_bias on the TES half.
+    """
+    n_out = 2 * channels if untied else channels
+    if mode == "simple":
+        gate = nn.Conv2d(2 * channels, n_out, kernel_size=1)
+        final = gate
+    elif mode == "rich":
+        hidden = max(channels, 32)
+        gate = nn.Sequential(
+            nn.Conv2d(2 * channels, hidden, 1, bias=False),
+            nn.GroupNorm(_group_count(hidden), hidden),
+            nn.GELU(),
+            nn.Conv2d(hidden, n_out, 1),
+        )
+        final = gate[-1]
+    else:
+        raise ValueError(f"Unknown gate mode: {mode!r}")
+
+    nn.init.zeros_(final.weight)
+    if untied:
+        bias = torch.empty(n_out)
+        bias[:channels].fill_(init_bias)        # AE half: open at init
+        bias[channels:].fill_(-init_bias)       # TES half: closed at init
+        final.bias.data.copy_(bias)
+    else:
+        nn.init.constant_(final.bias, init_bias)
+    return gate
+
+
+def _apply_fusion_gate(gate_module, ae_feat, tes_feat, untied):
+    """Run the gate and combine ae/tes features. See _build_fusion_gate."""
+    raw = gate_module(torch.cat([ae_feat, tes_feat], dim=1))
+    if untied:
+        C = ae_feat.size(1)
+        g_ae = torch.sigmoid(raw[:, :C])
+        g_tes = torch.sigmoid(raw[:, C:])
+        return g_ae * ae_feat + g_tes * tes_feat
+    g = torch.sigmoid(raw)
+    return g * ae_feat + (1.0 - g) * tes_feat
+
+
+def _maybe_drop_modality(tes_feat, p, training):
+    """Per-sample modality dropout on Tessera features (training only).
+
+    Each sample in the batch is independently zeroed with probability p,
+    then the remaining samples are scaled by 1/(1-p) (inverted-dropout
+    convention). This keeps the AE branch self-sufficient — prevents the
+    gate from over-relying on Tessera and crashing when Tessera signal is
+    noisy on an unfamiliar test patch.
+    """
+    if not training or p <= 0.0:
+        return tes_feat
+    B = tes_feat.size(0)
+    keep = (torch.rand(B, 1, 1, 1, device=tes_feat.device) >= p).float()
+    return tes_feat * keep / max(1e-6, 1.0 - p)
+
+
+class TesseraPyramidStem(nn.Module):
+    """Tessera encoder pyramid producing features at all 4 U-Net scales.
+
+    Mirrors LightUNet's encoder (DoubleConv + MaxPool stages), so its outputs
+    are channel- and spatially-aligned with the AE encoder's [x1,x2,x3,x4]
+    intermediate features. Used by TesseraIoUFusionPyramidGatedLightUNet to
+    fuse Tessera into the AE encoder *at every scale*, not just at the
+    decoder output.
+
+    Output channels: (base_ch, 2·base_ch, 4·base_ch, 8·base_ch).
+    Output spatial: (1, 1/2, 1/4, 1/8) of input.
+    """
+
+    def __init__(self, in_ch, base_ch=32):
+        super().__init__()
+        self.calib = ChannelCalibration(in_ch)
+        c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
+        # 1x1 lift then DoubleConv at full res. The 1x1 keeps the per-pixel
+        # transformation cheap before paying for 3x3 spatial mixing.
+        self.stem_lift = nn.Conv2d(in_ch, c1, kernel_size=1, bias=False)
+        self.stem = DoubleConv(c1, c1)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c1, c2))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c2, c3))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c3, c4))
+
+    def forward(self, x):
+        x = self.calib(x)
+        x = self.stem_lift(x)
+        t1 = self.stem(x)
+        t2 = self.down1(t1)
+        t3 = self.down2(t2)
+        t4 = self.down3(t3)
+        return t1, t2, t3, t4
+
+
+class TesseraIoUFusionGatedLightUNet(nn.Module):
+    """AlphaEarth + Tessera fused at the **feature level** via a learned gate.
+
+    Distinct from TesseraIoUFusionLightUNet, which adds Tessera only as a
+    residual correction on the *presence logits*. Here Tessera is promoted
+    to a peer feature stream that fuses into the trunk features just before
+    the head.
+
+    Flow:
+        AE  ─► alpha_unet.forward_features ─► alpha_feat (B, base_ch, H, W)
+        TES ─► tessera_stem (out_ch=base_ch) ─► tessera_feat (B, base_ch, H, W)
+
+        gate = sigmoid(gate_conv(concat(alpha_feat, tessera_feat)))   ∈ (0,1)
+        fused = gate * alpha_feat + (1 - gate) * tessera_feat
+
+    Initialization mirrors the existing zero-init residual pattern in this
+    codebase (presence_delta_head, height deltas via softplus): the gate's
+    final conv is zero-init with a large positive bias so sigmoid(b) ≈ 1
+    at step 0 → fused ≈ alpha_feat. Tessera contributes nothing initially
+    and learns to seep in as a residual correction. Identical t=0 behavior
+    to the AE-only baseline; any divergence is learned from data.
+
+    The presence-logit residual path is *also* preserved (set
+    presence_extra_ch>0 to keep it). It is orthogonal to the trunk-level
+    fusion and the two compose: trunk fusion improves shared features for
+    all heads (incl. height); the presence residual is a lightweight
+    correction directly on the IoU output.
+    """
+
+    def __init__(self, n_channels, n_classes=4, alpha_channels=64,
+                 tessera_presence_ch=0, tessera_hidden_ch=None,
+                 tessera_hidden_depth=0, height_specialist_depth=0,
+                 base_ch=32, gate_init_bias=4.0,
+                 gate_mode="simple", gate_untied=False,
+                 modality_dropout=0.0,
+                 enable_dirichlet=True, enable_cross_task_attn=False):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("TesseraIoUFusionGatedLightUNet assumes 4 output channels")
+        if n_channels <= alpha_channels:
+            raise ValueError(
+                "TesseraIoUFusionGatedLightUNet expects concatenated AlphaEarth+Tessera "
+                f"input with >{alpha_channels} channels, got {n_channels}"
+            )
+        self.supports_aux_outputs = True
+        self.alpha_channels = alpha_channels
+        self.gate_untied = bool(gate_untied)
+        self.modality_dropout = float(modality_dropout)
+        tessera_channels = n_channels - alpha_channels
+
+        self.alpha_unet = LightUNet(alpha_channels, n_classes, base_ch=base_ch)
+        self.alpha_unet.head = nn.Identity()
+        # Tessera stem outputs base_ch (peer width with alpha_feat) for
+        # feature-level fusion. Optionally a smaller presence_extra branch
+        # is also produced if tessera_presence_ch > 0.
+        self.tessera_feature_stem = TesseraCompressionStem(
+            tessera_channels,
+            out_ch=base_ch,
+            hidden_ch=tessera_hidden_ch,
+            hidden_depth=tessera_hidden_depth,
+        )
+        # Gate: configurable depth (simple Conv1x1 vs rich MLP) and tying
+        # (tied G/(1-G) vs untied G_AE,G_TES). Both modes warm-start as
+        # AE-only via the bias trick — see _build_fusion_gate.
+        self.gate_conv = _build_fusion_gate(
+            base_ch, mode=gate_mode, untied=self.gate_untied,
+            init_bias=gate_init_bias,
+        )
+
+        # Optional small presence-logit residual on top (composes with gate).
+        self.tessera_presence_ch = int(tessera_presence_ch)
+        if self.tessera_presence_ch > 0:
+            self.presence_extra_proj = nn.Conv2d(base_ch, self.tessera_presence_ch, 1)
+        else:
+            self.presence_extra_proj = None
+
+        self.head = MultiTaskPredictionHead(
+            in_ch=base_ch,
+            out_channels=n_classes,
+            presence_extra_ch=self.tessera_presence_ch,
+            height_specialist_depth=height_specialist_depth,
+            enable_dirichlet=enable_dirichlet,
+            enable_cross_task_attn=enable_cross_task_attn,
+        )
+
+    def forward(self, x, return_aux=False):
+        alpha = x[:, :self.alpha_channels, :, :]
+        tessera = x[:, self.alpha_channels:, :, :]
+
+        alpha_feat = self.alpha_unet.forward_features(alpha)
+        tessera_feat = self.tessera_feature_stem(tessera)
+        tessera_feat = _maybe_drop_modality(
+            tessera_feat, self.modality_dropout, self.training
+        )
+
+        fused = _apply_fusion_gate(self.gate_conv, alpha_feat, tessera_feat,
+                                   untied=self.gate_untied)
+
+        presence_extra = (self.presence_extra_proj(tessera_feat)
+                          if self.presence_extra_proj is not None else None)
+        return self.head(fused, return_aux=return_aux,
+                         presence_extra=presence_extra)
+
+
+class TesseraIoUFusionPyramidGatedLightUNet(nn.Module):
+    """Multi-scale gated fusion: AE↔Tessera at every U-Net level.
+
+    The single-scale TesseraIoUFusionGatedLightUNet fuses once at the
+    decoder output. That's a single fusion policy for every spatial scale
+    of the prediction. But water (large, contiguous), building edges
+    (sharp, fine), and tree heights (mid-scale phenology) each benefit
+    from different fusion behavior.
+
+    Here we run a parallel Tessera encoder pyramid that produces features
+    at the same 4 scales as the AE encoder's intermediates, then fuse
+    *each* scale with its own gate before passing the (now Tessera-aware)
+    skip features to the decoder. Each gate's warm-start is AE-only, same
+    bias trick as the single-scale variant.
+
+    Flow:
+        AE  → x1 (c1, full)  ─┐
+        AE  → x2 (c2, /2)   ─┼─► gates fuse with t1..t4 ─► f1..f4
+        AE  → x3 (c3, /4)   ─┼   (per-scale, same warm-start)
+        AE  → x4 (c4, /8)   ─┘                              │
+        TES → t1..t4 (TesseraPyramidStem)                   │
+                                                             ▼
+        decoder uses f4 as bottleneck input, f1..f3 as skip connections
+    """
+
+    def __init__(self, n_channels, n_classes=4, alpha_channels=64,
+                 tessera_presence_ch=0, height_specialist_depth=0,
+                 base_ch=32, gate_init_bias=4.0,
+                 gate_mode="simple", gate_untied=False,
+                 modality_dropout=0.0):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("TesseraIoUFusionPyramidGatedLightUNet assumes 4 output channels")
+        if n_channels <= alpha_channels:
+            raise ValueError(
+                "TesseraIoUFusionPyramidGatedLightUNet expects concatenated AlphaEarth+Tessera "
+                f"input with >{alpha_channels} channels, got {n_channels}"
+            )
+        self.supports_aux_outputs = True
+        self.alpha_channels = alpha_channels
+        self.gate_untied = bool(gate_untied)
+        self.modality_dropout = float(modality_dropout)
+        tessera_channels = n_channels - alpha_channels
+        c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
+
+        # AE encoder/decoder — replicated from LightUNet so we can intercept
+        # the per-scale features for fusion.
+        self.inc = DoubleConv(alpha_channels, c1)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c1, c2))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c2, c3))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c3, c4))
+        self.up1 = UpsampleBlock(c4, c3)
+        self.conv1 = DoubleConv(c4, c3)
+        self.up2 = UpsampleBlock(c3, c2)
+        self.conv2 = DoubleConv(c3, c2)
+        self.up3 = UpsampleBlock(c2, c1)
+        self.conv3 = DoubleConv(c2, c1)
+
+        # Tessera pyramid → matched-shape features at each scale.
+        self.tessera_pyramid = TesseraPyramidStem(tessera_channels, base_ch=base_ch)
+
+        # One gate per scale. Each warm-starts as AE-only via the bias trick.
+        self.gate1 = _build_fusion_gate(c1, mode=gate_mode,
+                                        untied=self.gate_untied,
+                                        init_bias=gate_init_bias)
+        self.gate2 = _build_fusion_gate(c2, mode=gate_mode,
+                                        untied=self.gate_untied,
+                                        init_bias=gate_init_bias)
+        self.gate3 = _build_fusion_gate(c3, mode=gate_mode,
+                                        untied=self.gate_untied,
+                                        init_bias=gate_init_bias)
+        self.gate4 = _build_fusion_gate(c4, mode=gate_mode,
+                                        untied=self.gate_untied,
+                                        init_bias=gate_init_bias)
+
+        self.tessera_presence_ch = int(tessera_presence_ch)
+        if self.tessera_presence_ch > 0:
+            self.presence_extra_proj = nn.Conv2d(c1, self.tessera_presence_ch, 1)
+        else:
+            self.presence_extra_proj = None
+
+        self.head = MultiTaskPredictionHead(
+            in_ch=c1,
+            out_channels=n_classes,
+            presence_extra_ch=self.tessera_presence_ch,
+            height_specialist_depth=height_specialist_depth,
+        )
+
+    def forward(self, x, return_aux=False):
+        alpha = x[:, :self.alpha_channels, :, :]
+        tessera = x[:, self.alpha_channels:, :, :]
+
+        # AE encoder
+        x1 = self.inc(alpha)
+        x2 = self.down1(x1)
+        x3 = self.down2(x2)
+        x4 = self.down3(x3)
+
+        # Tessera pyramid (one drop decision per sample applied uniformly
+        # across scales — keeps the per-sample regularization signal coherent).
+        t1, t2, t3, t4 = self.tessera_pyramid(tessera)
+        if self.training and self.modality_dropout > 0.0:
+            B = t1.size(0)
+            keep = (torch.rand(B, 1, 1, 1, device=t1.device)
+                    >= self.modality_dropout).float()
+            scale = 1.0 / max(1e-6, 1.0 - self.modality_dropout)
+            t1 = t1 * keep * scale
+            t2 = t2 * keep * scale
+            t3 = t3 * keep * scale
+            t4 = t4 * keep * scale
+
+        # Multi-scale fusion
+        f1 = _apply_fusion_gate(self.gate1, x1, t1, untied=self.gate_untied)
+        f2 = _apply_fusion_gate(self.gate2, x2, t2, untied=self.gate_untied)
+        f3 = _apply_fusion_gate(self.gate3, x3, t3, untied=self.gate_untied)
+        f4 = _apply_fusion_gate(self.gate4, x4, t4, untied=self.gate_untied)
+
+        # AE decoder using fused skips
+        h = self.up1(f4)
+        h = torch.cat([f3, h], dim=1)
+        h = self.conv1(h)
+        h = self.up2(h)
+        h = torch.cat([f2, h], dim=1)
+        h = self.conv2(h)
+        h = self.up3(h)
+        h = torch.cat([f1, h], dim=1)
+        h = self.conv3(h)
+
+        presence_extra = (self.presence_extra_proj(t1)
+                          if self.presence_extra_proj is not None else None)
+        return self.head(h, return_aux=return_aux,
+                         presence_extra=presence_extra)
+
+
+class TokenUpsamplingStem(nn.Module):
+    """Convert a 16x16 patch-level feature map (e.g. TerraMind/THOR token
+    grid) to a 256x256 pixel-level feature map at ``out_ch`` channels.
+
+    Pattern: cheap channel projection at low res (1x1 + 3x3) → bilinear
+    upsample by ``scale_factor`` (default 16) → spatial refinement
+    (two 3x3 ConvGNAct). Doing the projection BEFORE upsampling keeps the
+    memory cost low — we never materialize 16x the tokens at full
+    channel width.
+    """
+
+    def __init__(self, in_ch, out_ch=48, scale_factor=16, hidden_ch=None):
+        super().__init__()
+        hidden_ch = hidden_ch or max(out_ch * 2, 64)
+        self.calib = ChannelCalibration(in_ch)
+        self.proj = nn.Sequential(
+            ConvGNAct(in_ch, hidden_ch, kernel_size=1, padding=0),
+            ConvGNAct(hidden_ch, out_ch, kernel_size=3),
+        )
+        self.upsample = nn.Upsample(scale_factor=scale_factor, mode="bilinear",
+                                    align_corners=False)
+        self.refine = nn.Sequential(
+            ConvGNAct(out_ch, out_ch, kernel_size=3),
+            ConvGNAct(out_ch, out_ch, kernel_size=3),
+        )
+
+    def forward(self, x):
+        x = self.calib(x)
+        x = self.proj(x)
+        x = self.upsample(x)
+        x = self.refine(x)
+        return x
+
+
+class MultiGFMGatedLightUNet(nn.Module):
+    """4-modality GMU fusion: AE + Tessera + TerraMind + THOR.
+
+    Generalizes TesseraIoUFusionGatedLightUNet's bimodal Arevalo §2017
+    Figure 2(b) gate to the k=4 untied multimodal form (Figure 2a):
+
+        F_i, i ∈ {AE, TES, TM, THOR}                 (per-modality features)
+        N_i  = LayerNorm_per_modality(F_i)            (modern stability fix —
+                                                       prevents one stream's
+                                                       feature magnitudes
+                                                       from dominating gate
+                                                       logits)
+        H    = concat(N_AE, N_TES, N_TM, N_THOR)
+        G_i  = sigmoid(W_i · H + b_i)                 (independent gates,
+                                                       not constrained to
+                                                       sum to 1)
+        F_fused = Σ_i G_i ⊙ F_i
+
+    Init bias mirrors the bimodal warm-start convention but anchors AE:
+        b_AE   = +init_bias  → G_AE  ≈ 0.98 at t=0  (open: anchor modality)
+        b_TES  = -init_bias  → G_TES ≈ 0.02 at t=0  (closed: residual)
+        b_TM   = -init_bias  → G_TM  ≈ 0.02 at t=0  (closed: residual)
+        b_THOR = -init_bias  → G_THOR≈ 0.02 at t=0  (closed: residual)
+
+    So F_fused at t=0 ≈ 0.98 · F_AE — the model is essentially AE-only at
+    init. Tessera/TM/THOR each learn to seep in as residual corrections.
+    Identical hygiene to the bimodal champion (uw_gated_F = 0.5072).
+
+    Input shape contract:
+        forward(imgs) where imgs is a 2-tuple (pixel_imgs, token_imgs):
+            pixel_imgs : (B, ae_channels + tessera_channels, H, W)
+                         AE on channels [0:ae_channels],
+                         Tessera on channels [ae_channels:].
+            token_imgs : (B, tm_channels + thor_channels, h_tok, w_tok)
+                         TerraMind on channels [0:tm_channels],
+                         THOR on channels [tm_channels:].
+
+    Per-modality optional dropout (modality_dropout > 0): during
+    training, each non-anchor modality is independently zeroed per
+    sample with probability ``modality_dropout`` (inverted dropout
+    scaling), forcing AE to remain self-sufficient.
+    """
+
+    def __init__(self, n_classes=4,
+                 ae_channels=64, tessera_channels=128,
+                 terramind_channels=1536, thor_channels=1536,
+                 token_spatial=16, pixel_spatial=256,
+                 base_ch=48, height_specialist_depth=0,
+                 gate_init_bias=4.0, modality_dropout=0.0,
+                 enable_dirichlet=True, enable_cross_task_attn=False):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("MultiGFMGatedLightUNet assumes 4 output channels")
+        self.supports_aux_outputs = True
+        self.ae_channels = int(ae_channels)
+        self.tessera_channels = int(tessera_channels)
+        self.terramind_channels = int(terramind_channels)
+        self.thor_channels = int(thor_channels)
+        self.modality_dropout = float(modality_dropout)
+        if pixel_spatial % token_spatial != 0:
+            raise ValueError("pixel_spatial must be a multiple of token_spatial")
+        scale_factor = pixel_spatial // token_spatial
+
+        # AE drives the U-Net trunk (anchor modality).
+        self.alpha_unet = LightUNet(self.ae_channels, n_classes, base_ch=base_ch)
+        self.alpha_unet.head = nn.Identity()
+
+        # Tessera: pixel-level, compress 128 → base_ch via existing stem.
+        self.tessera_stem = TesseraCompressionStem(
+            self.tessera_channels, out_ch=base_ch,
+            hidden_ch=max(base_ch * 2, 96), hidden_depth=2,
+        )
+
+        # TerraMind / THOR: token-level (16x16), upsample to base_ch at 256x256.
+        self.terramind_stem = TokenUpsamplingStem(
+            self.terramind_channels, out_ch=base_ch, scale_factor=scale_factor,
+        )
+        self.thor_stem = TokenUpsamplingStem(
+            self.thor_channels, out_ch=base_ch, scale_factor=scale_factor,
+        )
+
+        # Per-modality feature normalization before gate input. Modern
+        # multimodal-fusion practice (post-2017): without it, a stream
+        # whose features have larger magnitude can dominate the gate
+        # logits even when the gate weights are well-calibrated. Use
+        # GroupNorm for parameter-efficiency and bf16 stability.
+        self.norm_ae = nn.GroupNorm(_group_count(base_ch), base_ch)
+        self.norm_tes = nn.GroupNorm(_group_count(base_ch), base_ch)
+        self.norm_tm = nn.GroupNorm(_group_count(base_ch), base_ch)
+        self.norm_thor = nn.GroupNorm(_group_count(base_ch), base_ch)
+
+        # Four independent gates, each a Conv1x1 over the concat of all
+        # four normalized streams. Bias init differentiates anchor vs
+        # residuals: AE open (sigmoid(+4) ≈ 0.98), others closed
+        # (sigmoid(-4) ≈ 0.02). Weight zero-init keeps the start state
+        # purely a function of the bias.
+        gate_in = 4 * base_ch
+        self.gate_ae = self._make_gate(gate_in, base_ch, +gate_init_bias)
+        self.gate_tes = self._make_gate(gate_in, base_ch, -gate_init_bias)
+        self.gate_tm = self._make_gate(gate_in, base_ch, -gate_init_bias)
+        self.gate_thor = self._make_gate(gate_in, base_ch, -gate_init_bias)
+
+        self.head = MultiTaskPredictionHead(
+            in_ch=base_ch,
+            out_channels=n_classes,
+            presence_extra_ch=0,
+            height_specialist_depth=height_specialist_depth,
+            enable_dirichlet=enable_dirichlet,
+            enable_cross_task_attn=enable_cross_task_attn,
+        )
+
+    @staticmethod
+    def _make_gate(in_ch, out_ch, init_bias):
+        gate = nn.Conv2d(in_ch, out_ch, kernel_size=1)
+        nn.init.zeros_(gate.weight)
+        nn.init.constant_(gate.bias, init_bias)
+        return gate
+
+    @staticmethod
+    def _drop_modality(feat, p, training):
+        if not training or p <= 0.0:
+            return feat
+        B = feat.size(0)
+        keep = (torch.rand(B, 1, 1, 1, device=feat.device) >= p).float()
+        return feat * keep / max(1e-6, 1.0 - p)
+
+    def forward(self, imgs, return_aux=False):
+        if not isinstance(imgs, (tuple, list)) or len(imgs) != 2:
+            raise ValueError(
+                "MultiGFMGatedLightUNet expects imgs as a 2-tuple "
+                "(pixel_imgs, token_imgs); got "
+                f"{type(imgs).__name__}"
+            )
+        pixel_imgs, token_imgs = imgs
+
+        ae = pixel_imgs[:, :self.ae_channels, :, :]
+        tessera = pixel_imgs[:, self.ae_channels:, :, :]
+        tm = token_imgs[:, :self.terramind_channels, :, :]
+        thor = token_imgs[:, self.terramind_channels:, :, :]
+
+        # Per-modality features at common (256, 256, base_ch).
+        f_ae = self.alpha_unet.forward_features(ae)
+        f_tes = self.tessera_stem(tessera)
+        f_tm = self.terramind_stem(tm)
+        f_thor = self.thor_stem(thor)
+
+        # Modality dropout on non-anchor streams only — keeps AE branch
+        # self-sufficient (the model must still produce reasonable
+        # predictions even when novel modalities are silenced).
+        f_tes = self._drop_modality(f_tes, self.modality_dropout, self.training)
+        f_tm = self._drop_modality(f_tm, self.modality_dropout, self.training)
+        f_thor = self._drop_modality(f_thor, self.modality_dropout, self.training)
+
+        # Normalize per-modality before computing gate logits.
+        n_ae = self.norm_ae(f_ae)
+        n_tes = self.norm_tes(f_tes)
+        n_tm = self.norm_tm(f_tm)
+        n_thor = self.norm_thor(f_thor)
+        gate_in = torch.cat([n_ae, n_tes, n_tm, n_thor], dim=1)
+
+        g_ae = torch.sigmoid(self.gate_ae(gate_in))
+        g_tes = torch.sigmoid(self.gate_tes(gate_in))
+        g_tm = torch.sigmoid(self.gate_tm(gate_in))
+        g_thor = torch.sigmoid(self.gate_thor(gate_in))
+
+        fused = (g_ae * f_ae + g_tes * f_tes
+                 + g_tm * f_tm + g_thor * f_thor)
+
+        return self.head(fused, return_aux=return_aux)
+
+
+class HierarchicalMultiGFMGatedLightUNet(nn.Module):
+    """Hierarchical 4-modality fusion grouped by temporal scope.
+
+    Replaces MultiGFMGatedLightUNet's flat 4-way Arevalo Figure 2(a) gate
+    with a 3-stage tree of bimodal Arevalo Figure 2(b) gates, encoding the
+    pretraining-time-scope prior:
+
+        Stage 1a (within-group, annual):
+            F_annual = G_annual ⊙ F_AE  + (1 - G_annual) ⊙ F_TES
+        Stage 1b (within-group, single-epoch):
+            F_epoch  = G_epoch  ⊙ F_TM  + (1 - G_epoch)  ⊙ F_THOR
+        Stage 2 (across-group):
+            F_fused  = G_final  ⊙ F_annual + (1 - G_final) ⊙ F_epoch
+
+    Each gate uses the bimodal form (the same one that gave us
+    uw_gated_F = 0.5072 between AE and Tessera). All three gates anchor
+    the "primary" side open at init via +bias and the secondary side
+    closed via the convex-combination structure:
+        Stage 1a:  G_annual ≈ 0.98 → F_annual ≈ F_AE
+        Stage 1b:  G_epoch  ≈ 0.98 → F_epoch  ≈ F_TM
+        Stage 2:   G_final  ≈ 0.98 → F_fused  ≈ F_annual ≈ F_AE
+
+    So the model is bit-near AE-only at t=0 (same warm-start hygiene as
+    every other gated_feature variant in this codebase) and learns
+    Tessera, TM, THOR as residual contributions in the order their
+    respective gates open. Modality dropout applies to non-anchor
+    streams identically to MultiGFMGatedLightUNet.
+    """
+
+    def __init__(self, n_classes=4,
+                 ae_channels=64, tessera_channels=128,
+                 terramind_channels=1536, thor_channels=1536,
+                 token_spatial=16, pixel_spatial=256,
+                 base_ch=48, height_specialist_depth=0,
+                 gate_init_bias=4.0, modality_dropout=0.0,
+                 enable_dirichlet=True, enable_cross_task_attn=False):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("HierarchicalMultiGFMGatedLightUNet assumes 4 output channels")
+        self.supports_aux_outputs = True
+        self.ae_channels = int(ae_channels)
+        self.tessera_channels = int(tessera_channels)
+        self.terramind_channels = int(terramind_channels)
+        self.thor_channels = int(thor_channels)
+        self.modality_dropout = float(modality_dropout)
+        if pixel_spatial % token_spatial != 0:
+            raise ValueError("pixel_spatial must be a multiple of token_spatial")
+        scale_factor = pixel_spatial // token_spatial
+
+        self.alpha_unet = LightUNet(self.ae_channels, n_classes, base_ch=base_ch)
+        self.alpha_unet.head = nn.Identity()
+        self.tessera_stem = TesseraCompressionStem(
+            self.tessera_channels, out_ch=base_ch,
+            hidden_ch=max(base_ch * 2, 96), hidden_depth=2,
+        )
+        self.terramind_stem = TokenUpsamplingStem(
+            self.terramind_channels, out_ch=base_ch, scale_factor=scale_factor,
+        )
+        self.thor_stem = TokenUpsamplingStem(
+            self.thor_channels, out_ch=base_ch, scale_factor=scale_factor,
+        )
+
+        # Three bimodal gates (same form as the gated_feature champion).
+        self.gate_annual = _build_fusion_gate(
+            base_ch, mode="simple", untied=False, init_bias=gate_init_bias
+        )
+        self.gate_epoch = _build_fusion_gate(
+            base_ch, mode="simple", untied=False, init_bias=gate_init_bias
+        )
+        self.gate_final = _build_fusion_gate(
+            base_ch, mode="simple", untied=False, init_bias=gate_init_bias
+        )
+
+        self.head = MultiTaskPredictionHead(
+            in_ch=base_ch,
+            out_channels=n_classes,
+            presence_extra_ch=0,
+            height_specialist_depth=height_specialist_depth,
+            enable_dirichlet=enable_dirichlet,
+            enable_cross_task_attn=enable_cross_task_attn,
+        )
+
+    def forward(self, imgs, return_aux=False):
+        if not isinstance(imgs, (tuple, list)) or len(imgs) != 2:
+            raise ValueError(
+                "HierarchicalMultiGFMGatedLightUNet expects imgs as a 2-tuple "
+                f"(pixel_imgs, token_imgs); got {type(imgs).__name__}"
+            )
+        pixel_imgs, token_imgs = imgs
+
+        ae = pixel_imgs[:, :self.ae_channels, :, :]
+        tessera = pixel_imgs[:, self.ae_channels:, :, :]
+        tm = token_imgs[:, :self.terramind_channels, :, :]
+        thor = token_imgs[:, self.terramind_channels:, :, :]
+
+        f_ae = self.alpha_unet.forward_features(ae)
+        f_tes = self.tessera_stem(tessera)
+        f_tm = self.terramind_stem(tm)
+        f_thor = self.thor_stem(thor)
+
+        if self.training and self.modality_dropout > 0.0:
+            f_tes = _maybe_drop_modality(f_tes, self.modality_dropout, True)
+            f_tm = _maybe_drop_modality(f_tm, self.modality_dropout, True)
+            f_thor = _maybe_drop_modality(f_thor, self.modality_dropout, True)
+
+        # Stage 1: within-group fusion.
+        f_annual = _apply_fusion_gate(self.gate_annual, f_ae, f_tes, untied=False)
+        f_epoch = _apply_fusion_gate(self.gate_epoch, f_tm, f_thor, untied=False)
+        # Stage 2: across-group fusion.
+        f_fused = _apply_fusion_gate(self.gate_final, f_annual, f_epoch, untied=False)
+
+        return self.head(f_fused, return_aux=return_aux)
 
 
 class EmbeddingRefiner(nn.Module):
@@ -876,7 +1601,12 @@ def infer_model_type(n_channels):
 
 def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 tessera_hidden_ch=None, tessera_hidden_depth=0,
-                height_specialist_depth=0, lightunet_base_ch=32):
+                height_specialist_depth=0, lightunet_base_ch=32,
+                fusion_mode="residual_presence",
+                gate_mode="simple", gate_untied=False,
+                modality_dropout=0.0,
+                multi_gfm_kwargs=None,
+                cross_task_attention=False):
     selected = model_type.lower()
 
     if selected == "auto":
@@ -895,7 +1625,40 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
         return HRNetEmbedding(n_channels=n_channels, n_classes=n_classes, width=18), selected
     if selected == "hrnet_w32":
         return HRNetEmbedding(n_channels=n_channels, n_classes=n_classes, width=32), selected
+    if selected == "multi_gfm":
+        kw = dict(multi_gfm_kwargs or {})
+        kw.setdefault("base_ch", lightunet_base_ch)
+        kw.setdefault("height_specialist_depth", height_specialist_depth)
+        kw.setdefault("modality_dropout", modality_dropout)
+        if fusion_mode == "hierarchical":
+            return HierarchicalMultiGFMGatedLightUNet(n_classes=n_classes, **kw), selected
+        return MultiGFMGatedLightUNet(n_classes=n_classes, **kw), selected
     if selected == "tessera_iou_fusion":
+        if fusion_mode == "gated_feature":
+            return TesseraIoUFusionGatedLightUNet(
+                n_channels=n_channels,
+                n_classes=n_classes,
+                tessera_presence_ch=tessera_presence_ch,
+                tessera_hidden_ch=tessera_hidden_ch,
+                tessera_hidden_depth=tessera_hidden_depth,
+                height_specialist_depth=height_specialist_depth,
+                base_ch=lightunet_base_ch,
+                gate_mode=gate_mode,
+                gate_untied=gate_untied,
+                modality_dropout=modality_dropout,
+                enable_cross_task_attn=cross_task_attention,
+            ), selected
+        if fusion_mode == "pyramid_gated":
+            return TesseraIoUFusionPyramidGatedLightUNet(
+                n_channels=n_channels,
+                n_classes=n_classes,
+                tessera_presence_ch=tessera_presence_ch,
+                height_specialist_depth=height_specialist_depth,
+                base_ch=lightunet_base_ch,
+                gate_mode=gate_mode,
+                gate_untied=gate_untied,
+                modality_dropout=modality_dropout,
+            ), selected
         return TesseraIoUFusionLightUNet(
             n_channels=n_channels,
             n_classes=n_classes,

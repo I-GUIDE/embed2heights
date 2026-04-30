@@ -20,10 +20,13 @@ from core.dataset import (
     find_embedding_files,
     find_multisource_file_pairs,
     find_multisource_embedding_files,
+    find_multi_gfm_file_pairs,
+    find_multi_gfm_embedding_files,
     normalize_core_id,
     submission_id,
     pick_dataset_class,
     MultiPixelEmbeddingDataset,
+    MultiGFMDataset,
     HEIGHT_NORM_CONSTANT,
 )
 
@@ -40,6 +43,7 @@ DEFAULTS = {
 MODEL_CHOICES = [
     "auto", "lightunet", "decoder", "decoder_residual", "token_neck",
     "embedding_refiner", "hrnet_w18", "hrnet_w32", "tessera_iou_fusion",
+    "multi_gfm",
 ]
 
 
@@ -65,6 +69,14 @@ def parse_args():
     parser.add_argument("--secondary-test-embeddings-dir", default=None,
                         help="Optional second pixel-aligned embedding dir to concatenate with "
                              "--test-embeddings-dir, e.g. Tessera with AlphaEarth.")
+    parser.add_argument("--terramind-s1-test-emb-dir", default=None,
+                        help="TerraMind S1 (16x16x768) test embeddings; required for multi_gfm.")
+    parser.add_argument("--terramind-s2-test-emb-dir", default=None,
+                        help="TerraMind S2 (16x16x768) test embeddings; required for multi_gfm.")
+    parser.add_argument("--thor-s1-test-emb-dir", default=None,
+                        help="THOR S1 (16x16x768) test embeddings; required for multi_gfm.")
+    parser.add_argument("--thor-s2-test-emb-dir", default=None,
+                        help="THOR S2 (16x16x768) test embeddings; required for multi_gfm.")
     parser.add_argument("--tessera-presence-ch", type=int, default=None,
                         help="Compressed Tessera channels used at training time. "
                              "Defaults to training_params.json when available, else 16.")
@@ -131,11 +143,48 @@ def resolve_tessera_model_kwargs(args, exp_dir):
             if args.lightunet_base_ch is not None
             else cfg.get("lightunet_base_ch", 32)
         ),
+        # Pulled from training_params.json so the architecture matches what
+        # was trained; no CLI flag since these must mirror training exactly.
+        "fusion_mode": cfg.get("fusion_mode", "residual_presence"),
+        "gate_mode": cfg.get("gate_mode", "simple"),
+        "gate_untied": bool(cfg.get("gate_untied", False)),
+        "modality_dropout": float(cfg.get("modality_dropout", 0.0)),
+        "cross_task_attention": bool(cfg.get("cross_task_attention", False)),
     }
+
+
+def _is_multi_gfm(args):
+    return args.model_type.lower() == "multi_gfm"
 
 
 def resolve_inputs(args):
     """Return a list of embedding paths (label-free) or (emb, label) tuples."""
+    if _is_multi_gfm(args):
+        for k in ("terramind_s1_test_emb_dir", "terramind_s2_test_emb_dir",
+                  "thor_s1_test_emb_dir", "thor_s2_test_emb_dir",
+                  "secondary_test_embeddings_dir"):
+            if not getattr(args, k):
+                raise RuntimeError(
+                    f"--model-type multi_gfm requires --{k.replace('_', '-')}"
+                )
+        finder = (find_multi_gfm_file_pairs
+                  if args.test_targets_dir
+                  else find_multi_gfm_embedding_files)
+        kwargs = dict(
+            ae_dir=args.test_embeddings_dir,
+            tessera_dir=args.secondary_test_embeddings_dir,
+            terramind_s1_dir=args.terramind_s1_test_emb_dir,
+            terramind_s2_dir=args.terramind_s2_test_emb_dir,
+            thor_s1_dir=args.thor_s1_test_emb_dir,
+            thor_s2_dir=args.thor_s2_test_emb_dir,
+        )
+        if args.test_targets_dir:
+            kwargs["tar_dir"] = args.test_targets_dir
+        pairs = finder(**kwargs)
+        if not pairs:
+            raise RuntimeError("No matching multi_gfm file pairs found.")
+        return pairs
+
     if args.secondary_test_embeddings_dir:
         if args.test_targets_dir:
             pairs = find_multisource_file_pairs(
@@ -181,28 +230,90 @@ def main():
     sample_emb_path = inputs[0][0] if isinstance(inputs[0], tuple) else inputs[0]
     with rasterio.open(sample_emb_path) as src:
         n_channels = src.count
-    if args.secondary_test_embeddings_dir:
+    if _is_multi_gfm(args):
+        with rasterio.open(inputs[0][1]) as src:
+            n_channels += src.count
+    elif args.secondary_test_embeddings_dir:
         with rasterio.open(inputs[0][1]) as src:
             n_channels += src.count
 
-    DatasetCls = MultiPixelEmbeddingDataset if args.secondary_test_embeddings_dir else pick_dataset_class(args.model_type, n_channels)
+    if _is_multi_gfm(args):
+        DatasetCls = MultiGFMDataset
+    elif args.secondary_test_embeddings_dir:
+        DatasetCls = MultiPixelEmbeddingDataset
+    else:
+        DatasetCls = pick_dataset_class(args.model_type, n_channels)
     if DatasetCls.__name__ == "LatentTokenDataset":
         test_ds = DatasetCls(inputs, patch_size=args.patch_size, scale_factor=16, is_train=False)
     else:
         test_ds = DatasetCls(inputs, patch_size=args.patch_size, is_train=False)
 
     sample_img, _, _ = test_ds[0]
+    multi_gfm_kwargs = None
+    if _is_multi_gfm(args):
+        # Probe channel widths for model construction.
+        sample = inputs[0]
+        with rasterio.open(sample[0]) as src:
+            ae_ch = src.count
+        with rasterio.open(sample[1]) as src:
+            tes_ch = src.count
+        with rasterio.open(sample[2]) as src:
+            tm_s1_ch = src.count
+            tok_h = src.height
+        with rasterio.open(sample[3]) as src:
+            tm_s2_ch = src.count
+        with rasterio.open(sample[4]) as src:
+            th_s1_ch = src.count
+        with rasterio.open(sample[5]) as src:
+            th_s2_ch = src.count
+        multi_gfm_kwargs = dict(
+            ae_channels=ae_ch,
+            tessera_channels=tes_ch,
+            terramind_channels=tm_s1_ch + tm_s2_ch,
+            thor_channels=th_s1_ch + th_s2_ch,
+            token_spatial=tok_h,
+            pixel_spatial=args.patch_size,
+        )
+
     tessera_kwargs = resolve_tessera_model_kwargs(args, exp_dir)
+    n_in = (sample_img[0].shape[0] if isinstance(sample_img, tuple)
+            else sample_img.shape[0])
     model, selected_model = build_model(
         args.model_type,
-        n_channels=sample_img.shape[0],
+        n_channels=n_in,
         n_classes=4,
+        multi_gfm_kwargs=multi_gfm_kwargs,
         **tessera_kwargs,
     )
     model = model.to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    # torch.compile wraps the model in _orig_mod; strip that prefix at load
+    # time so checkpoints from compiled training runs load into the plain
+    # (uncompiled) inference model.
+    state = torch.load(model_path, map_location=device)
+    state = {
+        (k[len("_orig_mod."):] if k.startswith("_orig_mod.") else k): v
+        for k, v in state.items()
+    }
+    # strict=False so checkpoints from earlier versions of the codebase
+    # (e.g., before optional heads like dirichlet_head were added) still
+    # load — missing keys for unused inference-time heads are harmless.
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        ignorable = [k for k in missing if "dirichlet_head" in k or "cross_task_attn" in k]
+        critical = [k for k in missing if k not in ignorable]
+        if critical:
+            raise RuntimeError(f"Missing critical keys in state_dict: {critical}")
+        if ignorable:
+            print(f"Note: ignored {len(ignorable)} missing keys for unused "
+                  f"optional heads (e.g. dirichlet_head, cross_task_attn).")
+    if unexpected:
+        raise RuntimeError(f"Unexpected keys in state_dict: {unexpected}")
     model.eval()
-    print(f"Loaded model: {selected_model} from {model_path} (input channels={sample_img.shape[0]})")
+    in_ch_desc = (
+        f"pixel={sample_img[0].shape[0]} token={sample_img[1].shape[0]}"
+        if isinstance(sample_img, tuple) else f"{sample_img.shape[0]}"
+    )
+    print(f"Loaded model: {selected_model} from {model_path} (input channels={in_ch_desc})")
     if args.thresholds is not None:
         print(f"Baking per-class thresholds into output: bld={args.thresholds[0]}, "
               f"veg={args.thresholds[1]}, wat={args.thresholds[2]}")
@@ -212,7 +323,10 @@ def main():
         pred_shape = None
         for i in tqdm(range(len(test_ds)), desc="Predicting"):
             img_tensor, _, _ = test_ds[i]
-            img_batch = img_tensor.unsqueeze(0).to(device)
+            if isinstance(img_tensor, tuple):
+                img_batch = tuple(t.unsqueeze(0).to(device) for t in img_tensor)
+            else:
+                img_batch = img_tensor.unsqueeze(0).to(device)
 
             output_batch = model(img_batch)
             pred = output_batch.squeeze().cpu().numpy().astype(np.float32)

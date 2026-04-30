@@ -4,6 +4,111 @@ import torch.nn.functional as F
 from math import exp
 
 
+class UncertaintyWeightedLoss(nn.Module):
+    """Homoscedastic uncertainty weighting (Kendall, Gal & Cipolla 2018).
+
+    Wraps an inner ImprovedCompositeLoss and replaces its hand-tuned
+    aux/presence/structure scalars with learned log-variances per task group.
+    The total per Kendall et al. is
+
+        L = sum_i 0.5 * exp(-s_i) * L_i + 0.5 * s_i
+
+    where s_i = log(sigma_i^2) is a learned scalar per task. The log-term
+    prevents the trivial "push all sigmas to infinity" minimum.
+
+    Task groupings:
+        presence : presence_bce + presence_tversky    (classification-like)
+        fraction : fraction_mae + tversky             (soft regression)
+        height   : height_boost + aux_height          (regression)
+
+    The inner loss still computes raw component values; this module only
+    re-weights them. So the existing component logging stays meaningful.
+    """
+
+    def __init__(self, inner_loss):
+        super().__init__()
+        self.inner = inner_loss
+        # Initialize at log_var=0 → variance=1 → effective weight=0.5 for all
+        # tasks. Letting the optimizer see all three from the same starting
+        # weight means we don't bake in the previous hand-tuned ordering.
+        self.log_var_presence = nn.Parameter(torch.zeros(()))
+        self.log_var_fraction = nn.Parameter(torch.zeros(()))
+        self.log_var_height = nn.Parameter(torch.zeros(()))
+
+    @staticmethod
+    def _uw(log_var, loss):
+        # 0.5 * exp(-s) * L + 0.5 * s
+        return 0.5 * torch.exp(-log_var) * loss + 0.5 * log_var
+
+    def forward(self, preds, targets, valid_mask=None):
+        # Run the inner loss to get raw per-component values. We will discard
+        # its hand-weighted total and reassemble using learned uncertainties.
+        _ignored_total, components = self.inner(preds, targets, valid_mask)
+
+        zero = torch.zeros((), device=self.log_var_presence.device,
+                           dtype=self.log_var_presence.dtype)
+
+        L_presence = (components.get("presence_bce", zero)
+                      + components.get("presence_tversky", zero))
+        L_fraction = (components.get("fraction_mae", zero)
+                      + components.get("tversky", zero))
+        L_height = (components.get("height_boost", zero)
+                    + components.get("aux_height", zero))
+
+        total = (self._uw(self.log_var_presence, L_presence)
+                 + self._uw(self.log_var_fraction, L_fraction)
+                 + self._uw(self.log_var_height, L_height))
+
+        # Annotate components with the learned log-vars for logging/debug.
+        components = dict(components)
+        components["uw_log_var_presence"] = self.log_var_presence.detach()
+        components["uw_log_var_fraction"] = self.log_var_fraction.detach()
+        components["uw_log_var_height"] = self.log_var_height.detach()
+        components["uw_L_presence"] = L_presence.detach()
+        components["uw_L_fraction"] = L_fraction.detach()
+        components["uw_L_height"] = L_height.detach()
+        return total, components
+
+
+def dirichlet_simplex_nll(alpha, target_simplex, valid_mask, eps=1e-6):
+    """Dirichlet negative log-likelihood for continuous simplex targets.
+
+    For each pixel, the predicted distribution is Dir(α). The target is
+    a point on the C-simplex (target_simplex.sum(axis=1) == 1.0 per pixel).
+    The pdf-likelihood is
+
+        log p(y | α) = log Γ(α_0) - sum_c log Γ(α_c) + sum_c (α_c - 1) log y_c
+
+    so NLL = -log p(y | α). Targets clamped at eps to avoid log(0).
+
+    Args:
+        alpha:          (B, C, H, W), strictly positive (use softplus + eps).
+        target_simplex: (B, C, H, W), nonneg, columns sum to 1 along C-axis.
+        valid_mask:     (B, 1, H, W) ∈ {0, 1}; pixels with mask=0 contribute 0.
+    Returns scalar mean over valid pixels.
+    """
+    alpha_sum = alpha.sum(dim=1, keepdim=True)
+    log_y = torch.log(target_simplex.clamp_min(eps))
+    log_B = (torch.lgamma(alpha).sum(dim=1, keepdim=True)
+             - torch.lgamma(alpha_sum))
+    nll = log_B - ((alpha - 1.0) * log_y).sum(dim=1, keepdim=True)  # (B, 1, H, W)
+    valid_count = torch.sum(valid_mask) + 1e-6
+    return torch.sum(nll * valid_mask) / valid_count
+
+
+def make_simplex_targets(targets):
+    """Build a 4-class simplex from the 3 fractional channels of targets.
+
+    The dataset stores building/veg/water% in channels 0..2; the residual
+    (1 - sum) is treated as the 'background' class for the Dirichlet
+    formulation. Output sums to ~1 along channel axis (within numerical
+    floor of 0).
+    """
+    bvw = targets[:, :3, :, :].clamp(min=0.0)
+    bg = (1.0 - bvw.sum(dim=1, keepdim=True)).clamp(min=0.0)
+    return torch.cat([bvw, bg], dim=1)  # (B, 4, H, W)
+
+
 class TverskyLoss(nn.Module):
     """
     Tversky Loss for imbalanced segmentation.
@@ -79,7 +184,9 @@ class SSIMLoss(nn.Module):
         self.window_size = window_size
         self.size_average = size_average
         self.channel = 1
-        self.window = self.create_window(window_size, self.channel)
+        # Registered as buffer so .to(device) / autocast follow the module.
+        self.register_buffer("window", self.create_window(window_size, self.channel),
+                             persistent=False)
 
     def gaussian(self, window_size, sigma):
         gauss = torch.Tensor([exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)])
@@ -116,19 +223,13 @@ class SSIMLoss(nn.Module):
     def forward(self, img1, img2):
         (_, channel, _, _) = img1.size()
 
-        if channel == self.channel and self.window.data.type() == img1.data.type():
-            window = self.window
-        else:
-            window = self.create_window(self.window_size, channel)
-            if img1.is_cuda:
-                window = window.cuda(img1.get_device())
-            elif img1.device.type == 'mps':
-                window = window.to('mps')
-
-            window = window.type_as(img1)
+        if channel != self.channel or self.window.device != img1.device:
+            window = self.create_window(self.window_size, channel).to(
+                device=img1.device, dtype=self.window.dtype)
             self.window = window
             self.channel = channel
 
+        window = self.window.to(dtype=img1.dtype)
         return 1 - self._ssim(img1, img2, window, self.window_size, channel, self.size_average)
 
 
@@ -149,7 +250,9 @@ class ImprovedCompositeLoss(nn.Module):
                  veg_height_boost=0.0,
                  aux_veg_weight=1.0,
                  iou_loss_kind="tversky",
-                 focal_gamma=2.0, focal_alpha=0.25):
+                 focal_gamma=2.0, focal_alpha=0.25,
+                 aux_tversky_weight=0.0,
+                 dirichlet_weight=0.0):
         super().__init__()
         if loss_preset not in {"current", "no_ssim_grad", "presence_centered"}:
             raise ValueError(
@@ -184,6 +287,16 @@ class ImprovedCompositeLoss(nn.Module):
         self.iou_loss_kind = iou_loss_kind
         self.focal_gamma = float(focal_gamma)
         self.focal_alpha = float(focal_alpha)
+        # Under presence_centered the main Tversky on fractions is off by
+        # default (the presence head owns the IoU objective). Setting this
+        # > 0 re-enables it on the aux fraction map as an auxiliary term —
+        # a direct IoU surrogate on the main output channels.
+        self.aux_tversky_weight = float(aux_tversky_weight)
+        # Dirichlet auxiliary loss on the optional dirichlet head's output.
+        # 0 = disabled (default). > 0 = treats the 4-class fractional labels
+        # (B, V, W, Background) as a probability simplex and minimizes
+        # Dirichlet NLL on the predicted concentration parameters.
+        self.dirichlet_weight = float(dirichlet_weight)
 
         # Height is now normalized, so we weight all 4 channels equally in base MAE
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
@@ -296,7 +409,7 @@ class ImprovedCompositeLoss(nn.Module):
         # Pass the mask explicitly so invalid pixels are excluded from TP/FP/FN
         # (no dilution from zero-filled nodata regions).
         gm_bool = global_1ch.bool()
-        if self.loss_preset == "presence_centered":
+        if self.loss_preset == "presence_centered" and self.aux_tversky_weight == 0.0:
             loss_tversky = zero
         else:
             t_build = self.tversky(torch.relu(class_pred[:, 0, :, :]),
@@ -325,7 +438,13 @@ class ImprovedCompositeLoss(nn.Module):
             weighted_mae = self.w_mae * loss_mae
         weighted_ssim = self.w_ssim * loss_ssim
         weighted_grad = self.w_grad * loss_grad
-        weighted_tversky = self.w_structure * loss_tversky
+        # Under presence_centered, w_structure is reserved for height_boost —
+        # the main-fraction Tversky is off unless aux_tversky_weight is set,
+        # in which case the explicit aux weight owns the term.
+        if self.loss_preset == "presence_centered":
+            weighted_tversky = self.aux_tversky_weight * loss_tversky
+        else:
+            weighted_tversky = self.w_structure * loss_tversky
         weighted_height_boost = self.w_structure * loss_height_boost
         total_loss = weighted_mae + weighted_ssim + weighted_grad + \
             weighted_tversky + weighted_height_boost
@@ -409,6 +528,19 @@ class ImprovedCompositeLoss(nn.Module):
                 + self.aux_veg_weight * aux_height_vegetation_loss
             ) + self.presence_tversky_weight * presence_tversky_loss
 
+        # --- 6. Optional Dirichlet auxiliary loss on simplex ---
+        dirichlet_loss = zero
+        if (self.dirichlet_weight > 0.0
+                and aux_outputs is not None
+                and aux_outputs.get("dirichlet_alpha") is not None):
+            simplex_target = make_simplex_targets(targets)
+            dirichlet_loss = dirichlet_simplex_nll(
+                aux_outputs["dirichlet_alpha"],
+                simplex_target,
+                global_mask,
+            )
+            total_loss = total_loss + self.dirichlet_weight * dirichlet_loss
+
         aux_height_loss = (aux_height_building_loss
                            + self.aux_veg_weight * aux_height_vegetation_loss)
         components = {
@@ -423,6 +555,8 @@ class ImprovedCompositeLoss(nn.Module):
             "aux_height_building": aux_height_building_loss,
             "aux_height_vegetation": aux_height_vegetation_loss,
             "aux_height": aux_height_loss,
+            "dirichlet": dirichlet_loss,
+            "weighted_dirichlet": self.dirichlet_weight * dirichlet_loss,
             "weighted_mae": weighted_mae,
             "weighted_ssim": weighted_ssim,
             "weighted_grad": weighted_grad,
