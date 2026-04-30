@@ -471,6 +471,18 @@ class MultiTaskPredictionHead(nn.Module):
             ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
             nn.Conv2d(hidden_ch, 3, 1),
         )
+        # --- Learnable mapping from fractions logits to presence logits for alphaearth ---
+        self.presence_from_fraction = nn.Conv2d(3, 3, 1)
+        # for opt 5: presence head learns only a residual correction on top of fraction logits, so initialize to zero
+        nn.init.zeros_(self.presence_from_fraction.weight)
+        nn.init.zeros_(self.presence_from_fraction.bias)
+        self.presence_fraction_scale = nn.Parameter(torch.tensor(0.0))
+        # --- Presence head learning from concat shared features and fractions logits ---
+        self.presence_head_opt3 = nn.Sequential(
+            ConvGNAct(hidden_ch+3, hidden_ch, kernel_size=3),
+            nn.Conv2d(hidden_ch, 3, 1),
+        )
+
         if presence_extra_ch > 0:
             self.presence_delta_head = nn.Conv2d(presence_extra_ch, 3, 1)
             nn.init.zeros_(self.presence_delta_head.weight)
@@ -511,7 +523,24 @@ class MultiTaskPredictionHead(nn.Module):
         # Main presence classifier (submission channels 0-2). When an external
         # edge feature is provided, it learns only a zero-initialized residual
         # logit correction on top of the alpha-only logits.
-        alpha_presence_logits = self.presence_head(x)
+        # alpha_presence_logits = self.presence_head(x)
+        
+        # Test for using fractions to predict presence
+        # Option 1: Directly use fraction logits to predict presence logits (without learnable mapping)
+        # alpha_presence_logits = fraction_logits
+        # Option 2: Use a learnable mapping from fraction logits to presence logits
+        # alpha_presence_logits = self.presence_from_fraction(fraction_logits)
+        # Option 3: use shared feature and fraction logits together to predict presence logits
+        # presence_input = torch.cat([x, fraction_logits], dim=1)
+        # alpha_presence_logits = self.presence_head_opt3(presence_input)
+        # Option 4: Use fraction to calibrate presence logits 
+        # alpha_presence_logits = self.presence_head(x) + self.presence_from_fraction(fraction_logits)
+        # Option 5: presence head learns only a residual correction on top of fraction logits, so presence logits = fraction logits + learned residual
+        alpha_presence_logits = (
+            self.presence_head(x)
+            + self.presence_fraction_scale * self.presence_from_fraction(fraction_logits)
+        )
+        
         if presence_extra is not None:
             if self.presence_delta_head is None:
                 raise ValueError("presence_extra was provided but this head has no residual branch")
