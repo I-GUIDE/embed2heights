@@ -47,8 +47,9 @@ configs/
 
 tools/plot*
 
-logs/figures
+logs/*
 configs/*
 
 predict_tta.py
 slurm-*.out
+logs/*.pdf

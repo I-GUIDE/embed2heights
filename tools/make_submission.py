@@ -56,6 +56,12 @@ def parse_args():
                         "these per-class thresholds (pred > threshold). Channel 3 "
                         "(height) is left untouched. Cuts zip size ~4x without "
                         "changing IoU when thresholds match the server's 0.5.")
+    p.add_argument("--water-cc-min-size", type=int, default=0, metavar="K",
+                   help="Post-process water mask with an 8-connected-component filter: "
+                        "if the largest predicted water component on a patch has fewer "
+                        "than K pixels, clear the entire water mask on that patch. "
+                        "Only applied when --binarize-thresholds is set. K=0 disables. "
+                        "Recommended: 12 (val-tuned) or 16 (conservative).")
     return p.parse_args()
 
 
@@ -128,17 +134,38 @@ def main():
         pred_dir_in_tmp.mkdir()
 
         if args.binarize_thresholds is None:
+            if args.water_cc_min_size > 0:
+                print("WARN: --water-cc-min-size is only applied with --binarize-thresholds; ignoring.",
+                      file=sys.stderr)
             print(f"Staging {len(files)} files (no transform) to {pred_dir_in_tmp}")
             for npy in files:
                 shutil.copy2(npy, pred_dir_in_tmp / npy.name)
         else:
             thr = np.asarray(args.binarize_thresholds, dtype=np.float32)
             print(f"Binarizing class channels at thresholds {tuple(float(t) for t in thr)} (bld, veg, wat)")
+            cc_K = int(args.water_cc_min_size)
+            cc_struct = None
+            if cc_K > 0:
+                from scipy.ndimage import label as cc_label
+                cc_struct = np.ones((3, 3), dtype=np.uint8)
+                print(f"  + 8-connected water CC filter: clear water mask if largest component < {cc_K} px")
+                cc_cleared = 0
             for npy in files:
                 arr = np.load(npy).astype(np.float32)
                 for c in range(3):
                     arr[c] = (arr[c] > thr[c]).astype(np.float32)
+                if cc_K > 0:
+                    water_bin = arr[2].astype(np.uint8)
+                    if water_bin.any():
+                        comps, n = cc_label(water_bin, structure=cc_struct)
+                        if n > 0:
+                            sizes = np.bincount(comps.ravel())[1:]
+                            if sizes.max() < cc_K:
+                                arr[2] = 0.0
+                                cc_cleared += 1
                 np.save(pred_dir_in_tmp / npy.name, arr)
+            if cc_K > 0:
+                print(f"  CC filter cleared water on {cc_cleared}/{len(files)} patches")
 
         # Remove any pre-existing output zip so `zip` creates a fresh archive.
         if args.output.exists():

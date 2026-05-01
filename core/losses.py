@@ -149,7 +149,13 @@ class ImprovedCompositeLoss(nn.Module):
                  veg_height_boost=0.0,
                  aux_veg_weight=1.0,
                  iou_loss_kind="tversky",
-                 focal_gamma=2.0, focal_alpha=0.25):
+                 focal_gamma=2.0, focal_alpha=0.25,
+                 height_bin_aux_weight=0.0,
+                 height_bin_sigma_bins=1.5,
+                 building_smooth_weight=0.0,
+                 building_smooth_erode_px=1,
+                 building_smooth_thr=0.0,
+                 task="both"):
         super().__init__()
         if loss_preset not in {"current", "no_ssim_grad", "presence_centered"}:
             raise ValueError(
@@ -184,6 +190,29 @@ class ImprovedCompositeLoss(nn.Module):
         self.iou_loss_kind = iou_loss_kind
         self.focal_gamma = float(focal_gamma)
         self.focal_alpha = float(focal_alpha)
+        self.height_bin_aux_weight = float(height_bin_aux_weight)
+        self.height_bin_sigma_bins = float(height_bin_sigma_bins)
+        self.building_smooth_weight = float(building_smooth_weight)
+        self.building_smooth_erode_px = int(building_smooth_erode_px)
+        self.building_smooth_thr = float(building_smooth_thr)
+
+        # `task` selects which slice of the composite loss is active.
+        # "both"     = legacy multi-task training (every term contributes).
+        # "presence" = only IoU/presence terms; height terms are zeroed at the
+        #              total-loss level. Used by the dual-model split where
+        #              this run owns submission channels 0-2.
+        # "height"   = only height regression terms; presence terms are zeroed.
+        #              Used by the dual-model split where this run owns
+        #              submission channel 3.
+        # In both restricted modes, the model still emits a 4-channel output
+        # (the head's forward is unchanged), so unused channels exist but are
+        # ignored at submission-combine time. This keeps train/predict code
+        # untouched at the architecture level.
+        if task not in {"both", "presence", "height"}:
+            raise ValueError("task must be one of: both, presence, height")
+        self.task = task
+        self.train_presence = task in {"both", "presence"}
+        self.train_height = task in {"both", "height"}
 
         # Height is now normalized, so we weight all 4 channels equally in base MAE
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
@@ -216,6 +245,62 @@ class ImprovedCompositeLoss(nn.Module):
         loss = focal_weight * bce
         denom = torch.sum(mask) + 1e-6
         return torch.sum(loss * mask) / denom
+
+    def _height_bin_ce(self, logits, target_norm, mask, log_centers):
+        """Soft-target cross-entropy in log-height space.
+
+        AdaBins-style auxiliary supervision for the soft-bin head: places a
+        Gaussian over the K log-spaced bin centers at each valid pixel,
+        centered on the GT height (in log-meter space), and penalises the
+        predicted softmax via -sum(soft_target * log_softmax). Forces the
+        model to commit probability mass near the correct bin rather than
+        smearing across many bins (which would let the expectation collapse
+        to a regression-to-mean prediction). Heavy underprediction at tall
+        bins is the failure mode this is targeting.
+
+        logits:       (B, K, H, W) raw bin logits from the height head
+        target_norm:  (B, 1, H, W) GT height in normalized space (h / 30)
+        mask:         (B, 1, H, W) 1 on pixels to include, 0 elsewhere
+        log_centers:  (K,) log1p(meters) of each bin center
+        """
+        if mask is None or torch.sum(mask) <= 0 or logits is None or log_centers is None:
+            return torch.zeros((), device=logits.device if logits is not None else target_norm.device,
+                               dtype=logits.dtype if logits is not None else target_norm.dtype)
+
+        log_target = torch.log1p(target_norm * 30.0)               # (B, 1, H, W)
+        centers = log_centers.to(logits.device, logits.dtype).view(1, -1, 1, 1)  # (1, K, 1, 1)
+        # Bin width (uniform in log space) gives the unit for sigma_bins.
+        if log_centers.numel() >= 2:
+            bin_width = float((log_centers[1] - log_centers[0]).item())
+        else:
+            bin_width = 1.0
+        sigma = max(self.height_bin_sigma_bins * bin_width, 1e-3)
+
+        # Soft target: Gaussian centered at log_target on the K log-bin axis.
+        diff = centers - log_target                                # (B, K, H, W)
+        soft_target = torch.exp(-(diff * diff) / (2.0 * sigma * sigma))
+        soft_target = soft_target / (soft_target.sum(dim=1, keepdim=True) + 1e-8)
+
+        log_p = F.log_softmax(logits, dim=1)
+        ce = -(soft_target * log_p).sum(dim=1, keepdim=True)       # (B, 1, H, W)
+        return torch.sum(ce * mask) / (torch.sum(mask) + 1e-6)
+
+    def _building_interior_smoothness(self, height_pred, building_target, height_mask):
+        """L1 total-variation loss inside eroded GT building regions only."""
+        building = ((building_target > self.building_smooth_thr).float()
+                    * height_mask)
+        if self.building_smooth_erode_px > 0:
+            k = 2 * self.building_smooth_erode_px + 1
+            eroded = 1.0 - F.max_pool2d(1.0 - building, kernel_size=k,
+                                        stride=1, padding=self.building_smooth_erode_px)
+            building = eroded * height_mask
+
+        dx = torch.abs(height_pred[:, :, :, 1:] - height_pred[:, :, :, :-1])
+        dy = torch.abs(height_pred[:, :, 1:, :] - height_pred[:, :, :-1, :])
+        mask_x = building[:, :, :, 1:] * building[:, :, :, :-1]
+        mask_y = building[:, :, 1:, :] * building[:, :, :-1, :]
+        denom = torch.sum(mask_x) + torch.sum(mask_y) + 1e-6
+        return (torch.sum(dx * mask_x) + torch.sum(dy * mask_y)) / denom
 
     def forward(self, preds, targets, valid_mask=None):
         """
@@ -327,6 +412,25 @@ class ImprovedCompositeLoss(nn.Module):
         weighted_grad = self.w_grad * loss_grad
         weighted_tversky = self.w_structure * loss_tversky
         weighted_height_boost = self.w_structure * loss_height_boost
+
+        # --- Task gating ---
+        # When training a single-task split, zero out the contributions that
+        # belong to the other task BEFORE adding them into total_loss. We zero
+        # the *weighted* values (not the raw component values) so that the
+        # components dict still reports the raw model behaviour for logging,
+        # while total_loss reflects the active task only.
+        if not self.train_presence:
+            # Drop everything that supervises submission channels 0-2 (and
+            # the soft-fraction regression that targets the same labels).
+            weighted_mae = zero
+            weighted_ssim = zero
+            weighted_grad = zero
+            weighted_tversky = zero
+        if not self.train_height:
+            # Drop the height regression terms inside the main loss; the
+            # auxiliary aux_height_* terms are zeroed below in the aux block.
+            weighted_height_boost = zero
+
         total_loss = weighted_mae + weighted_ssim + weighted_grad + \
             weighted_tversky + weighted_height_boost
 
@@ -404,13 +508,76 @@ class ImprovedCompositeLoss(nn.Module):
                     aux_outputs["height_vegetation"], target_height, veg_height_mask
                 )
 
+            # Task gating: each aux term contributes only on its own side.
+            presence_loss_active = presence_loss if self.train_presence else zero
+            presence_tversky_active = (
+                presence_tversky_loss if self.train_presence else zero
+            )
+            aux_height_building_active = (
+                aux_height_building_loss if self.train_height else zero
+            )
+            aux_height_vegetation_active = (
+                aux_height_vegetation_loss if self.train_height else zero
+            )
+
             total_loss = total_loss + self.aux_weight * (
-                presence_loss + aux_height_building_loss
-                + self.aux_veg_weight * aux_height_vegetation_loss
-            ) + self.presence_tversky_weight * presence_tversky_loss
+                presence_loss_active + aux_height_building_active
+                + self.aux_veg_weight * aux_height_vegetation_active
+            ) + self.presence_tversky_weight * presence_tversky_active
+
+        # --- 6. Soft-bin (AdaBins-style) auxiliary CE on height ---
+        height_bin_ce = zero
+        if (aux_outputs is not None
+                and self.height_bin_aux_weight > 0
+                and "height_log_bin_centers" in aux_outputs):
+            log_centers = aux_outputs["height_log_bin_centers"]
+            target_height = targets[:, 3:4, :, :]
+            # Per-class masks match the aux height L1 supervision: building/
+            # vegetation specialists are trained ONLY on their class's pixels,
+            # base on all valid height pixels.
+            bld_height_mask = (targets[:, 0:1, :, :] > 0).float() * height_mask
+            veg_height_mask = (targets[:, 1:2, :, :] > 0).float() * height_mask
+            ce_base = self._height_bin_ce(
+                aux_outputs.get("height_base_logits"),
+                target_height, height_mask, log_centers,
+            )
+            ce_bld = self._height_bin_ce(
+                aux_outputs.get("height_building_logits"),
+                target_height, bld_height_mask, log_centers,
+            )
+            ce_veg = self._height_bin_ce(
+                aux_outputs.get("height_vegetation_logits"),
+                target_height, veg_height_mask, log_centers,
+            )
+            height_bin_ce = ce_base + ce_bld + self.aux_veg_weight * ce_veg
+            if self.train_height:
+                total_loss = total_loss + self.height_bin_aux_weight * height_bin_ce
+
+        # --- 7. Building-interior height smoothness ---
+        # Regularizes the submitted height channel only inside eroded GT
+        # building interiors. It does not touch building boundaries, so it
+        # targets patchy within-building height noise without encouraging
+        # cross-boundary blur.
+        building_smooth = zero
+        if self.building_smooth_weight > 0:
+            building_smooth = self._building_interior_smoothness(
+                preds[:, 3:4, :, :],
+                targets[:, 0:1, :, :],
+                height_mask,
+            )
+            if self.train_height:
+                total_loss = total_loss + self.building_smooth_weight * building_smooth
 
         aux_height_loss = (aux_height_building_loss
                            + self.aux_veg_weight * aux_height_vegetation_loss)
+        # Weighted components reflect what *actually* enters total_loss after
+        # task gating, so loss-curve plots don't mislead on single-task runs.
+        w_pres   = self.aux_weight if self.train_presence else 0.0
+        w_ptv    = self.presence_tversky_weight if self.train_presence else 0.0
+        w_axh    = self.aux_weight if self.train_height else 0.0
+        w_bince  = self.height_bin_aux_weight if self.train_height else 0.0
+        w_bsmooth = self.building_smooth_weight if self.train_height else 0.0
+
         components = {
             "mae": loss_mae,
             "fraction_mae": loss_fraction_mae,
@@ -423,13 +590,17 @@ class ImprovedCompositeLoss(nn.Module):
             "aux_height_building": aux_height_building_loss,
             "aux_height_vegetation": aux_height_vegetation_loss,
             "aux_height": aux_height_loss,
+            "height_bin_ce": height_bin_ce,
+            "building_smooth": building_smooth,
             "weighted_mae": weighted_mae,
             "weighted_ssim": weighted_ssim,
             "weighted_grad": weighted_grad,
             "weighted_tversky": weighted_tversky,
             "weighted_height_boost": weighted_height_boost,
-            "weighted_presence_bce": self.aux_weight * presence_loss,
-            "weighted_presence_tversky": self.presence_tversky_weight * presence_tversky_loss,
-            "weighted_aux_height": self.aux_weight * aux_height_loss,
+            "weighted_presence_bce": w_pres * presence_loss,
+            "weighted_presence_tversky": w_ptv * presence_tversky_loss,
+            "weighted_aux_height": w_axh * aux_height_loss,
+            "weighted_height_bin_ce": w_bince * height_bin_ce,
+            "weighted_building_smooth": w_bsmooth * building_smooth,
         }
         return total_loss, components

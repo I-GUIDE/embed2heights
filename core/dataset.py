@@ -11,8 +11,35 @@ HEIGHT_NORM_CONSTANT = 30.0
 
 # Backbones that consume pixel-aligned 256x256 embeddings. Everything else is
 # treated as 16x16 ViT tokens and routed through the upsampling decoder.
-PIXEL_MODEL_TYPES = ("lightunet", "embedding_refiner", "hrnet_w18", "hrnet_w32", "tessera_iou_fusion")
-TOKEN_MODEL_TYPES = ("decoder", "decoder_residual")
+PIXEL_MODEL_TYPES = (
+    "lightunet", "lightunet_presence_2plus1", "lightunet_presence_3way",
+    "lightunet_presence_shared3",
+    "lightunet_pp", "embedding_refiner", "hrnet_w18", "hrnet_w32",
+    "tessera_iou_fusion", "tessera_iou_fusion_unetpp",
+    "tessera_iou_fusion_presence_2plus1", "tessera_iou_fusion_presence_3way",
+    "tessera_iou_fusion_presence_shared3",
+    "tessera_iou_fusion_gated", "tessera_iou_fusion_gated_presence_2plus1",
+    "tessera_iou_fusion_gated_presence_3way",
+    "tessera_iou_fusion_gated_presence_shared3",
+    "tessera_token_shared_probe", "tessera_token_fusion_shared_probe",
+    "tessera_token_fusion_shared_probe_norm",
+    "tessera_token_height_residual_probe", "tessera_token_xattn_height_residual_probe",
+    "tessera_token_s2_nonwater_residual_decoder64",
+    "tessera_token_s2_all_residual_decoder64",
+    "tessera_token_s2_water_residual_decoder64",
+    "tessera_token_crosslevel_s2_bottleneck",
+    "tessera_token_crosslevel_s2_decoder64",
+    "tessera_token_crosslevel_s2_decoder64_presence_2plus1",
+    "tessera_token_crosslevel_s2_decoder64_presence_3way",
+    "tessera_token_crosslevel_s2_decoder64_presence_3way_deep",
+    "tessera_token_crosslevel_xattn_bottleneck",
+    "tessera_token_crosslevel_xattn_decoder64",
+    "tessera_token_crosslevel_xattn_bottleneck_decoder64",
+)
+TOKEN_MODEL_TYPES = (
+    "decoder", "decoder_residual", "token_neck", "token_neck_norm", "token_fusion_neck",
+    "token_fusion_neck_norm", "token_fusion_neck_xattn", "token_fusion_neck_xattn_norm",
+)
 
 _EMB_PREFIXES = ("gee_emb_", "tessera_emb_", "emb_", "s2_", "s1_")
 _EMB_SUFFIXES = ("_embedding", "_embeddings", "_quantized", "_merged")
@@ -142,6 +169,64 @@ def find_multisource_file_pairs(primary_emb_dir, secondary_emb_dir, tar_dir):
     return [(primary_files[cid], secondary_files[cid], label_files[cid]) for cid in common_ids]
 
 
+def find_trisource_file_pairs(primary_emb_dir, secondary_emb_dir, token_emb_dir, tar_dir):
+    """
+    Match two pixel-aligned sources, one token source, and labels by normalized core id.
+
+    Returns tuples of (primary_embedding, secondary_embedding, token_embedding, label).
+    """
+    primary_files = _index_embedding_dir(primary_emb_dir)
+    secondary_files = _index_embedding_dir(secondary_emb_dir)
+    token_files = _index_embedding_dir(token_emb_dir)
+    label_files = {
+        normalize_core_id(path): path
+        for path in glob.glob(os.path.join(tar_dir, "**", "label_*.tif"), recursive=True)
+    }
+
+    common_ids = sorted(set(primary_files) & set(secondary_files) & set(token_files) & set(label_files))
+    return [
+        (primary_files[cid], secondary_files[cid], token_files[cid], label_files[cid])
+        for cid in common_ids
+    ]
+
+
+def find_quadsource_file_pairs(primary_emb_dir, secondary_emb_dir, token_primary_dir,
+                               token_secondary_dir, tar_dir):
+    """
+    Match two pixel-aligned sources, two token sources, and labels by normalized core id.
+
+    Returns tuples of (primary_embedding, secondary_embedding, token_primary,
+    token_secondary, label). The token order is preserved for same-model S1/S2
+    fusion, so pass S1 as token_primary and S2 as token_secondary.
+    """
+    primary_files = _index_embedding_dir(primary_emb_dir)
+    secondary_files = _index_embedding_dir(secondary_emb_dir)
+    token_primary_files = _index_embedding_dir(token_primary_dir)
+    token_secondary_files = _index_embedding_dir(token_secondary_dir)
+    label_files = {
+        normalize_core_id(path): path
+        for path in glob.glob(os.path.join(tar_dir, "**", "label_*.tif"), recursive=True)
+    }
+
+    common_ids = sorted(
+        set(primary_files)
+        & set(secondary_files)
+        & set(token_primary_files)
+        & set(token_secondary_files)
+        & set(label_files)
+    )
+    return [
+        (
+            primary_files[cid],
+            secondary_files[cid],
+            token_primary_files[cid],
+            token_secondary_files[cid],
+            label_files[cid],
+        )
+        for cid in common_ids
+    ]
+
+
 def find_multisource_embedding_files(primary_emb_dir, secondary_emb_dir):
     """
     Match two label-free embedding dirs by normalized core id.
@@ -153,6 +238,48 @@ def find_multisource_embedding_files(primary_emb_dir, secondary_emb_dir):
     secondary_files = _index_embedding_dir(secondary_emb_dir)
     common_ids = sorted(set(primary_files) & set(secondary_files))
     return [(primary_files[cid], secondary_files[cid]) for cid in common_ids]
+
+
+def find_trisource_embedding_files(primary_emb_dir, secondary_emb_dir, token_emb_dir):
+    """
+    Match two pixel-aligned embedding dirs and one token embedding dir for inference.
+
+    Returns tuples of (primary_embedding, secondary_embedding, token_embedding).
+    """
+    primary_files = _index_embedding_dir(primary_emb_dir)
+    secondary_files = _index_embedding_dir(secondary_emb_dir)
+    token_files = _index_embedding_dir(token_emb_dir)
+    common_ids = sorted(set(primary_files) & set(secondary_files) & set(token_files))
+    return [(primary_files[cid], secondary_files[cid], token_files[cid]) for cid in common_ids]
+
+
+def find_quadsource_embedding_files(primary_emb_dir, secondary_emb_dir, token_primary_dir,
+                                    token_secondary_dir):
+    """
+    Match two pixel-aligned embedding dirs and two token embedding dirs for inference.
+
+    Returns tuples of (primary_embedding, secondary_embedding, token_primary,
+    token_secondary). The primary path is used for leaderboard submission ids.
+    """
+    primary_files = _index_embedding_dir(primary_emb_dir)
+    secondary_files = _index_embedding_dir(secondary_emb_dir)
+    token_primary_files = _index_embedding_dir(token_primary_dir)
+    token_secondary_files = _index_embedding_dir(token_secondary_dir)
+    common_ids = sorted(
+        set(primary_files)
+        & set(secondary_files)
+        & set(token_primary_files)
+        & set(token_secondary_files)
+    )
+    return [
+        (
+            primary_files[cid],
+            secondary_files[cid],
+            token_primary_files[cid],
+            token_secondary_files[cid],
+        )
+        for cid in common_ids
+    ]
 
 
 def save_split(split_path, train_pairs, val_pairs):
@@ -330,6 +457,325 @@ class MultiPixelEmbeddingDataset(Dataset):
         valid_mask = valid_mask[:, top:top + self.patch_size, left:left + self.patch_size]
 
         return torch.from_numpy(image), torch.from_numpy(target), torch.from_numpy(valid_mask)
+
+
+class MultiLatentTokenDataset(Dataset):
+    """
+    For same-grid token fusion, e.g. TerraMind/THOR S1 768ch@16x16 +
+    S2 768ch@16x16 -> 1536ch@16x16.
+
+    file_pairs may contain:
+      - (primary_token_path, secondary_token_path, label_path)
+      - (primary_token_path, secondary_token_path) for label-free inference
+    """
+    def __init__(self, file_pairs, patch_size=256, scale_factor=16, is_train=True):
+        self.patch_size = patch_size
+        self.scale_factor = scale_factor
+        self.is_train = is_train
+        self.file_pairs = file_pairs
+
+    def __len__(self):
+        return len(self.file_pairs)
+
+    def __getitem__(self, idx):
+        pair = self.file_pairs[idx]
+        if len(pair) == 3:
+            primary_path, secondary_path, tar_path = pair
+        elif len(pair) == 2:
+            primary_path, secondary_path = pair
+            tar_path = None
+        else:
+            raise ValueError("MultiLatentTokenDataset expects 2- or 3-item tuples")
+
+        with rasterio.open(primary_path) as src:
+            primary = clean_raster_array(src.read())
+        with rasterio.open(secondary_path) as src:
+            secondary = clean_raster_array(src.read())
+
+        if primary.shape[1:] != secondary.shape[1:]:
+            raise ValueError(
+                f"Token shapes do not align for {primary_path} and {secondary_path}: "
+                f"{primary.shape[1:]} vs {secondary.shape[1:]}"
+            )
+        image = np.concatenate([primary, secondary], axis=0)
+        emb_patch_size = self.patch_size // self.scale_factor
+
+        if tar_path is not None:
+            with rasterio.open(tar_path) as src:
+                raw_target = clean_raster_array(src.read())
+            global_valid = ~np.all(raw_target == 0, axis=0)
+            has_landcover = (raw_target[0] > 0) | (raw_target[1] > 0) | (raw_target[2] > 0)
+            ndsm_hole = (raw_target[3] == 0) & has_landcover
+            height_valid = global_valid & ~ndsm_hole
+            valid_mask = np.stack([global_valid, height_valid], axis=0).astype(np.float32)
+            target = raw_target
+            target[3, :, :] = np.maximum(target[3, :, :], 0.0) / HEIGHT_NORM_CONSTANT
+        else:
+            target = np.zeros((4, self.patch_size, self.patch_size), dtype=np.float32)
+            valid_mask = np.ones((2, self.patch_size, self.patch_size), dtype=np.float32)
+
+        _, h_emb, w_emb = image.shape
+        if h_emb < emb_patch_size or w_emb < emb_patch_size:
+            pad_h = max(0, emb_patch_size - h_emb)
+            pad_w = max(0, emb_patch_size - w_emb)
+            image = np.pad(image, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+            h_emb, w_emb = image.shape[1], image.shape[2]
+
+        _, h_tar, w_tar = target.shape
+        if h_tar < self.patch_size or w_tar < self.patch_size:
+            pad_h = max(0, self.patch_size - h_tar)
+            pad_w = max(0, self.patch_size - w_tar)
+            target = np.pad(target, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+            valid_mask = np.pad(
+                valid_mask,
+                ((0, 0), (0, pad_h), (0, pad_w)),
+                mode='constant',
+                constant_values=0,
+            )
+
+        if self.is_train:
+            top_emb = np.random.randint(0, h_emb - emb_patch_size + 1)
+            left_emb = np.random.randint(0, w_emb - emb_patch_size + 1)
+        else:
+            top_emb = (h_emb - emb_patch_size) // 2
+            left_emb = (w_emb - emb_patch_size) // 2
+
+        top_tar = top_emb * self.scale_factor
+        left_tar = left_emb * self.scale_factor
+
+        image = image[:, top_emb:top_emb + emb_patch_size, left_emb:left_emb + emb_patch_size]
+        target = target[:, top_tar:top_tar + self.patch_size, left_tar:left_tar + self.patch_size]
+        valid_mask = valid_mask[:, top_tar:top_tar + self.patch_size, left_tar:left_tar + self.patch_size]
+
+        return torch.from_numpy(image), torch.from_numpy(target), torch.from_numpy(valid_mask)
+
+
+class PixelTokenEmbeddingDataset(Dataset):
+    """
+    For probing one 16x16 token source against the AlphaEarth+Tessera champion.
+
+    file_pairs may contain:
+      - (primary_emb_path, secondary_emb_path, token_emb_path, label_path)
+      - (primary_emb_path, secondary_emb_path, token_emb_path) for label-free inference
+
+    Returns ((pixel_image, token_image), target, valid_mask), where pixel_image is
+    AlphaEarth+Tessera concatenated at 256x256 and token_image is 768x16x16 for
+    patch_size=256, scale_factor=16.
+    """
+    def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True):
+        self.patch_size = patch_size
+        self.scale_factor = scale_factor
+        self.is_train = is_train
+        self.file_pairs = file_pairs
+
+    def __len__(self):
+        return len(self.file_pairs)
+
+    def __getitem__(self, idx):
+        pair = self.file_pairs[idx]
+        if len(pair) == 4:
+            primary_path, secondary_path, token_path, tar_path = pair
+        elif len(pair) == 3:
+            primary_path, secondary_path, token_path = pair
+            tar_path = None
+        else:
+            raise ValueError("PixelTokenEmbeddingDataset expects 3- or 4-item tuples")
+
+        with rasterio.open(primary_path) as src:
+            primary = clean_raster_array(src.read())
+        with rasterio.open(secondary_path) as src:
+            secondary = clean_raster_array(src.read())
+        with rasterio.open(token_path) as src:
+            token = clean_raster_array(src.read())
+
+        if primary.shape[1:] != secondary.shape[1:]:
+            raise ValueError(
+                f"Embedding shapes do not align for {primary_path} and {secondary_path}: "
+                f"{primary.shape[1:]} vs {secondary.shape[1:]}"
+            )
+        pixel = np.concatenate([primary, secondary], axis=0)
+
+        if tar_path is not None:
+            with rasterio.open(tar_path) as src:
+                raw_target = clean_raster_array(src.read())
+            global_valid = ~np.all(raw_target == 0, axis=0)
+            has_landcover = (raw_target[0] > 0) | (raw_target[1] > 0) | (raw_target[2] > 0)
+            ndsm_hole = (raw_target[3] == 0) & has_landcover
+            height_valid = global_valid & ~ndsm_hole
+            valid_mask = np.stack([global_valid, height_valid], axis=0).astype(np.float32)
+            target = raw_target
+            target[3, :, :] = np.maximum(target[3, :, :], 0.0) / HEIGHT_NORM_CONSTANT
+        else:
+            target = np.zeros((4, self.patch_size, self.patch_size), dtype=np.float32)
+            valid_mask = np.ones((2, self.patch_size, self.patch_size), dtype=np.float32)
+
+        emb_patch_size = self.patch_size // self.scale_factor
+
+        _, h_pix, w_pix = pixel.shape
+        if h_pix < self.patch_size or w_pix < self.patch_size:
+            pad_h = max(0, self.patch_size - h_pix)
+            pad_w = max(0, self.patch_size - w_pix)
+            pixel = np.pad(pixel, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+            target = np.pad(target, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+            valid_mask = np.pad(valid_mask, ((0, 0), (0, pad_h), (0, pad_w)), mode='constant', constant_values=0)
+            h_pix, w_pix = pixel.shape[1], pixel.shape[2]
+
+        _, h_tok, w_tok = token.shape
+        if h_tok < emb_patch_size or w_tok < emb_patch_size:
+            pad_h = max(0, emb_patch_size - h_tok)
+            pad_w = max(0, emb_patch_size - w_tok)
+            token = np.pad(token, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+            h_tok, w_tok = token.shape[1], token.shape[2]
+
+        max_top_emb = min(h_tok - emb_patch_size, (h_pix - self.patch_size) // self.scale_factor)
+        max_left_emb = min(w_tok - emb_patch_size, (w_pix - self.patch_size) // self.scale_factor)
+        if max_top_emb < 0 or max_left_emb < 0:
+            raise ValueError(
+                f"Pixel/token shapes are incompatible for {primary_path} and {token_path}: "
+                f"pixel={pixel.shape[1:]}, token={token.shape[1:]}"
+            )
+
+        if self.is_train:
+            top_emb = np.random.randint(0, max_top_emb + 1)
+            left_emb = np.random.randint(0, max_left_emb + 1)
+        else:
+            top_emb = max_top_emb // 2
+            left_emb = max_left_emb // 2
+
+        top_pix = top_emb * self.scale_factor
+        left_pix = left_emb * self.scale_factor
+
+        pixel = pixel[:, top_pix:top_pix + self.patch_size, left_pix:left_pix + self.patch_size]
+        token = token[:, top_emb:top_emb + emb_patch_size, left_emb:left_emb + emb_patch_size]
+        target = target[:, top_pix:top_pix + self.patch_size, left_pix:left_pix + self.patch_size]
+        valid_mask = valid_mask[:, top_pix:top_pix + self.patch_size, left_pix:left_pix + self.patch_size]
+
+        return (
+            torch.from_numpy(pixel),
+            torch.from_numpy(token),
+        ), torch.from_numpy(target), torch.from_numpy(valid_mask)
+
+
+class PixelMultiTokenEmbeddingDataset(Dataset):
+    """
+    For probing same-model S1/S2 token fusion against the AlphaEarth+Tessera
+    champion.
+
+    file_pairs may contain:
+      - (primary_emb_path, secondary_emb_path, token_primary_path,
+         token_secondary_path, label_path)
+      - (primary_emb_path, secondary_emb_path, token_primary_path,
+         token_secondary_path) for label-free inference
+
+    Returns ((pixel_image, token_image), target, valid_mask), where pixel_image
+    is AlphaEarth+Tessera concatenated at 256x256 and token_image is
+    [S1, S2] channel-concatenated at 16x16.
+    """
+    def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True):
+        self.patch_size = patch_size
+        self.scale_factor = scale_factor
+        self.is_train = is_train
+        self.file_pairs = file_pairs
+
+    def __len__(self):
+        return len(self.file_pairs)
+
+    def __getitem__(self, idx):
+        pair = self.file_pairs[idx]
+        if len(pair) == 5:
+            primary_path, secondary_path, token_primary_path, token_secondary_path, tar_path = pair
+        elif len(pair) == 4:
+            primary_path, secondary_path, token_primary_path, token_secondary_path = pair
+            tar_path = None
+        else:
+            raise ValueError("PixelMultiTokenEmbeddingDataset expects 4- or 5-item tuples")
+
+        with rasterio.open(primary_path) as src:
+            primary = clean_raster_array(src.read())
+        with rasterio.open(secondary_path) as src:
+            secondary = clean_raster_array(src.read())
+        with rasterio.open(token_primary_path) as src:
+            token_primary = clean_raster_array(src.read())
+        with rasterio.open(token_secondary_path) as src:
+            token_secondary = clean_raster_array(src.read())
+
+        if primary.shape[1:] != secondary.shape[1:]:
+            raise ValueError(
+                f"Embedding shapes do not align for {primary_path} and {secondary_path}: "
+                f"{primary.shape[1:]} vs {secondary.shape[1:]}"
+            )
+        if token_primary.shape[1:] != token_secondary.shape[1:]:
+            raise ValueError(
+                f"Token shapes do not align for {token_primary_path} and {token_secondary_path}: "
+                f"{token_primary.shape[1:]} vs {token_secondary.shape[1:]}"
+            )
+        pixel = np.concatenate([primary, secondary], axis=0)
+        token = np.concatenate([token_primary, token_secondary], axis=0)
+
+        if tar_path is not None:
+            with rasterio.open(tar_path) as src:
+                raw_target = clean_raster_array(src.read())
+            global_valid = ~np.all(raw_target == 0, axis=0)
+            has_landcover = (raw_target[0] > 0) | (raw_target[1] > 0) | (raw_target[2] > 0)
+            ndsm_hole = (raw_target[3] == 0) & has_landcover
+            height_valid = global_valid & ~ndsm_hole
+            valid_mask = np.stack([global_valid, height_valid], axis=0).astype(np.float32)
+            target = raw_target
+            target[3, :, :] = np.maximum(target[3, :, :], 0.0) / HEIGHT_NORM_CONSTANT
+        else:
+            target = np.zeros((4, self.patch_size, self.patch_size), dtype=np.float32)
+            valid_mask = np.ones((2, self.patch_size, self.patch_size), dtype=np.float32)
+
+        emb_patch_size = self.patch_size // self.scale_factor
+
+        _, h_pix, w_pix = pixel.shape
+        if h_pix < self.patch_size or w_pix < self.patch_size:
+            pad_h = max(0, self.patch_size - h_pix)
+            pad_w = max(0, self.patch_size - w_pix)
+            pixel = np.pad(pixel, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+            target = np.pad(target, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+            valid_mask = np.pad(
+                valid_mask,
+                ((0, 0), (0, pad_h), (0, pad_w)),
+                mode='constant',
+                constant_values=0,
+            )
+            h_pix, w_pix = pixel.shape[1], pixel.shape[2]
+
+        _, h_tok, w_tok = token.shape
+        if h_tok < emb_patch_size or w_tok < emb_patch_size:
+            pad_h = max(0, emb_patch_size - h_tok)
+            pad_w = max(0, emb_patch_size - w_tok)
+            token = np.pad(token, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect')
+            h_tok, w_tok = token.shape[1], token.shape[2]
+
+        max_top_emb = min(h_tok - emb_patch_size, (h_pix - self.patch_size) // self.scale_factor)
+        max_left_emb = min(w_tok - emb_patch_size, (w_pix - self.patch_size) // self.scale_factor)
+        if max_top_emb < 0 or max_left_emb < 0:
+            raise ValueError(
+                f"Pixel/token shapes are incompatible for {primary_path} and {token_primary_path}: "
+                f"pixel={pixel.shape[1:]}, token={token.shape[1:]}"
+            )
+
+        if self.is_train:
+            top_emb = np.random.randint(0, max_top_emb + 1)
+            left_emb = np.random.randint(0, max_left_emb + 1)
+        else:
+            top_emb = max_top_emb // 2
+            left_emb = max_left_emb // 2
+
+        top_pix = top_emb * self.scale_factor
+        left_pix = left_emb * self.scale_factor
+
+        pixel = pixel[:, top_pix:top_pix + self.patch_size, left_pix:left_pix + self.patch_size]
+        token = token[:, top_emb:top_emb + emb_patch_size, left_emb:left_emb + emb_patch_size]
+        target = target[:, top_pix:top_pix + self.patch_size, left_pix:left_pix + self.patch_size]
+        valid_mask = valid_mask[:, top_pix:top_pix + self.patch_size, left_pix:left_pix + self.patch_size]
+
+        return (
+            torch.from_numpy(pixel),
+            torch.from_numpy(token),
+        ), torch.from_numpy(target), torch.from_numpy(valid_mask)
 
 # ---------------------------------------------------------
 # DATASET 2: Latent Token-Based (TerraMind, Thor)

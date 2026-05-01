@@ -21,9 +21,9 @@ emb2heights-backbone/
 │   ├── predict_dummy_metrics.py           # predict leaderboard values under each candidate formula
 │   └── *.ipynb                            # ad-hoc analysis notebooks
 ├── splits/               # saved train/val split JSONs (reproducible seed=42 split)
-├── runs/                 # experiment outputs (gitignored): model_best.pth, predictions/, etc.
+├── runs/                 # experiment outputs (gitignored): active/key runs plus history/ archive
 ├── submission/           # zipped test-set predictions ready to upload (gitignored)
-├── logs/                 # evaluation / experiment reports
+├── logs/                 # evaluation / experiment reports; start with logs/EXPERIMENT_INVENTORY.md, logs/EXPERIMENT_EVOLUTION.md, logs/HISTORY_MOVE_MANIFEST.md, and logs/JOB_ARCHIVE_MANIFEST.md
 ├── train.py              # single-experiment training
 ├── predict.py            # inference (val or test)
 └── evaluate.py           # compute the 5 leaderboard metrics on runs/*/predictions
