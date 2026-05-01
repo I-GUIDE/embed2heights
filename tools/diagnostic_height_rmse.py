@@ -84,8 +84,106 @@ def summarize(name, arr):
             f"std={arr.std():7.3f}  p5/50/95={p[0]:6.2f}/{p[2]:6.2f}/{p[4]:6.2f}")
 
 
+def per_bin_breakdown(gt, diff, edges):
+    """Per-bin n / rmse / mae / bias / variance of residuals diff = pred - gt.
+
+    `bias = mean(diff)`, `var = var(diff)`, so `rmse^2 = bias^2 + var`.
+    Returns a dict with numpy arrays of length len(edges)-1 (NaN where empty).
+    """
+    nbin = len(edges) - 1
+    out = {
+        "edges": np.asarray(edges, dtype=np.float64),
+        "n": np.zeros(nbin, dtype=np.int64),
+        "rmse": np.full(nbin, np.nan, dtype=np.float64),
+        "mae": np.full(nbin, np.nan, dtype=np.float64),
+        "bias": np.full(nbin, np.nan, dtype=np.float64),
+        "var": np.full(nbin, np.nan, dtype=np.float64),
+    }
+    if gt.size == 0:
+        return out
+    for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
+        m = (gt >= lo) & (gt < hi)
+        if not m.any():
+            continue
+        d = diff[m].astype(np.float64)
+        out["n"][i] = d.size
+        out["rmse"][i] = float(np.sqrt(np.mean(d**2)))
+        out["mae"][i] = float(np.mean(np.abs(d)))
+        out["bias"][i] = float(np.mean(d))
+        out["var"][i] = float(np.var(d))
+    return out
+
+
+def plot_per_bin_breakdown(buckets, out_path, title):
+    """Two-row figure, one column per class:
+      Row 0 — per-bin RMSE / MAE / |bias| (with pixel-count overlay).
+      Row 1 — bias^2 vs variance contribution to RMSE^2 (stacked bars).
+    Reading: tall bins where the RED stack (variance) dominates are at the
+    noise/capacity floor — reweighting won't help. Tall bins where the GREEN
+    stack (bias^2) dominates are mean-pulled — LDS/balanced sampler can move
+    the needle.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        print(f"WARN: matplotlib unavailable; skipping plot: {exc}")
+        return None
+
+    n_cls = len(buckets)
+    fig, axes = plt.subplots(2, n_cls, figsize=(6.2 * n_cls, 8.5), squeeze=False)
+
+    for col, (cls_name, br) in enumerate(buckets.items()):
+        centers = 0.5 * (br["edges"][:-1] + br["edges"][1:])
+        widths = np.diff(br["edges"]) * 0.85
+        ok = br["n"] > 0
+        if not ok.any():
+            for r in range(2):
+                axes[r, col].set_visible(False)
+            continue
+
+        ax = axes[0, col]
+        ax.plot(centers[ok], br["rmse"][ok], "o-", color="C3", lw=1.7, label="RMSE")
+        ax.plot(centers[ok], br["mae"][ok],  "s-", color="C0", lw=1.4, label="MAE")
+        ax.plot(centers[ok], np.abs(br["bias"][ok]), "^-", color="C2", lw=1.4, label="|bias|")
+        ax.set_title(f"{cls_name}: per-bin error vs GT height")
+        ax.set_ylabel("error (m)")
+        ax.grid(alpha=0.3)
+        ax.legend(loc="upper left", fontsize=9)
+        ax2 = ax.twinx()
+        ax2.bar(centers[ok], br["n"][ok], width=widths[ok],
+                color="grey", alpha=0.18, edgecolor="none")
+        ax2.set_yscale("log")
+        ax2.set_ylabel("n pixels (log)", color="grey")
+
+        ax = axes[1, col]
+        bias2 = br["bias"][ok] ** 2
+        var = br["var"][ok]
+        ax.bar(centers[ok], bias2, width=widths[ok],
+               color="C2", alpha=0.75, label="bias² (loss/sampler can fix)")
+        ax.bar(centers[ok], var, width=widths[ok], bottom=bias2,
+               color="C3", alpha=0.75, label="variance (noise / capacity floor)")
+        ax.plot(centers[ok], br["rmse"][ok] ** 2, "k--", lw=1.2, label="RMSE² (=bias²+var)")
+        ax.set_xlabel("GT height bin (m)")
+        ax.set_ylabel("MSE contribution (m²)")
+        ax.set_title(f"{cls_name}: bias²+variance decomposition")
+        ax.grid(alpha=0.3)
+        ax.legend(loc="upper left", fontsize=9)
+
+    fig.suptitle(title)
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    fig.savefig(out_path, dpi=130)
+    plt.close(fig)
+    return out_path
+
+
 def main():
-    exp_name = "alphaearth_tessera_iou_fusion_E_specialist_d2"
+    exp_name = (
+        sys.argv[1]
+        if len(sys.argv) > 1
+        else "alphaearth_tessera_iou_fusion_E_specialist_d2"
+    )
     pred_dir = os.path.join(REPO_DIR, "runs", exp_name, "predictions")
     labels_dir = "/projects/bcrm/emb2height/data/train/labels"
     split_file = os.path.join(REPO_DIR, "splits", "split.json")
@@ -207,6 +305,31 @@ def main():
 
     print()
     print("=" * 78)
+    print("RMSE by GT height bin")
+    print("=" * 78)
+
+    def dump_bins(name, gt, diff):
+        if gt.size == 0:
+            print(f"  {name}: empty")
+            return
+        bins = [0, 2, 5, 10, 20, 40, np.inf]
+        labels = ["0-2", "2-5", "5-10", "10-20", "20-40", "40+"]
+        print(f"  {name}:")
+        for lo, hi, lab in zip(bins[:-1], bins[1:], labels):
+            m = (gt >= lo) & (gt < hi)
+            if not m.any():
+                continue
+            vals = diff[m]
+            print(
+                f"    {lab:<5}m  n={vals.size:>10,d}  "
+                f"rmse={rmse(vals):6.3f}  bias={vals.mean():7.3f}"
+            )
+
+    dump_bins("building", bld_gt, bld_diff)
+    dump_bins("vegetation", veg_gt, veg_diff)
+
+    print()
+    print("=" * 78)
     print("Per-image RMSE distribution — what drives the sample-averaged metric?")
     print("=" * 78)
 
@@ -226,6 +349,41 @@ def main():
     dump_per_img("building per-image RMSE", rmse_b_per_img)
     dump_per_img("vegetation per-image RMSE", rmse_v_per_img)
     dump_per_img("full-image per-image RMSE", rmse_all_per_img)
+
+    # Long-tail diagnostic: is per-bin error driven by systematic bias (which
+    # reweighting / LDS / balanced sampler can fix) or by residual variance
+    # (label noise + model capacity, which they cannot)?
+    #   RMSE^2 = bias^2 + variance  on  diff = pred - gt
+    # If bias^2 dominates in tall bins → loss/sampler tricks will help.
+    # If variance dominates → you've hit a noise / capacity floor.
+    fine_edges = np.concatenate(
+        [np.arange(0, 40, 2.0), np.array([40.0, 50.0, 60.0, 80.0])]
+    )
+    veg_bd = per_bin_breakdown(veg_gt, veg_diff, fine_edges)
+    bld_bd = per_bin_breakdown(bld_gt, bld_diff, fine_edges)
+
+    print()
+    print("=" * 78)
+    print("Bias / variance decomposition per GT-height bin (vegetation, fine bins)")
+    print("=" * 78)
+    print(f"  {'bin (m)':<11}  {'n':>10}  {'rmse':>7}  {'mae':>7}  {'bias':>7}  {'std_res':>8}")
+    for i, (lo, hi) in enumerate(zip(fine_edges[:-1], fine_edges[1:])):
+        if veg_bd["n"][i] == 0:
+            continue
+        print(
+            f"  [{lo:>4.1f},{hi:>5.1f})  {veg_bd['n'][i]:>10,d}  "
+            f"{veg_bd['rmse'][i]:>7.3f}  {veg_bd['mae'][i]:>7.3f}  "
+            f"{veg_bd['bias'][i]:>7.3f}  {np.sqrt(veg_bd['var'][i]):>8.3f}"
+        )
+
+    fig_path = os.path.join(REPO_DIR, "runs", exp_name, "height_per_bin_breakdown.png")
+    plot_per_bin_breakdown(
+        {"vegetation": veg_bd, "building": bld_bd},
+        fig_path,
+        title=f"{exp_name} — per-bin error structure (long-tail diagnostic)",
+    )
+    if fig_path:
+        print(f"\nSaved figure: {fig_path}")
 
     # Save JSON
     out = {
@@ -250,6 +408,13 @@ def main():
                                std=float(other_gt.std() if other_gt.size else 0)),
             "all_valid":  dict(n=int(all_gt.size), mean=float(all_gt.mean() if all_gt.size else 0),
                                std=float(all_gt.std() if all_gt.size else 0)),
+        },
+        "per_bin_breakdown": {
+            "edges": fine_edges.tolist(),
+            "vegetation": {k: (v.tolist() if hasattr(v, "tolist") else v)
+                           for k, v in veg_bd.items() if k != "edges"},
+            "building":   {k: (v.tolist() if hasattr(v, "tolist") else v)
+                           for k, v in bld_bd.items() if k != "edges"},
         },
     }
     out_path = os.path.join(REPO_DIR, "runs", exp_name, "height_rmse_diagnostic.json")

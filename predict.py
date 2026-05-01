@@ -20,10 +20,17 @@ from core.dataset import (
     find_embedding_files,
     find_multisource_file_pairs,
     find_multisource_embedding_files,
+    find_trisource_file_pairs,
+    find_trisource_embedding_files,
+    find_quadsource_file_pairs,
+    find_quadsource_embedding_files,
     normalize_core_id,
     submission_id,
     pick_dataset_class,
     MultiPixelEmbeddingDataset,
+    MultiLatentTokenDataset,
+    PixelTokenEmbeddingDataset,
+    PixelMultiTokenEmbeddingDataset,
     HEIGHT_NORM_CONSTANT,
 )
 
@@ -38,8 +45,42 @@ DEFAULTS = {
 }
 
 MODEL_CHOICES = [
-    "auto", "lightunet", "decoder", "decoder_residual", "token_neck",
-    "embedding_refiner", "hrnet_w18", "hrnet_w32", "tessera_iou_fusion",
+    "auto", "lightunet", "lightunet_presence_2plus1", "lightunet_presence_3way",
+    "lightunet_presence_shared3",
+    "lightunet_pp", "decoder", "decoder_residual",
+    "token_neck", "token_neck_norm", "token_fusion_neck", "token_fusion_neck_norm",
+    "token_fusion_neck_xattn", "token_fusion_neck_xattn_norm",
+    "embedding_refiner", "hrnet_w18", "hrnet_w32", "tessera_iou_fusion", "tessera_iou_fusion_unetpp",
+    "tessera_iou_fusion_presence_2plus1", "tessera_iou_fusion_presence_3way",
+    "tessera_iou_fusion_presence_shared3",
+    "tessera_iou_fusion_gated", "tessera_iou_fusion_gated_presence_2plus1",
+    "tessera_iou_fusion_gated_presence_3way",
+    "tessera_iou_fusion_gated_presence_shared3",
+    "tessera_token_shared_probe", "tessera_token_fusion_shared_probe",
+    "tessera_token_fusion_shared_probe_norm", "tessera_token_height_residual_probe",
+    "tessera_token_xattn_height_residual_probe",
+    "tessera_token_s2_nonwater_residual_decoder64",
+    "tessera_token_s2_all_residual_decoder64",
+    "tessera_token_s2_water_residual_decoder64",
+    "tessera_token_crosslevel_s2_bottleneck",
+    "tessera_token_crosslevel_s2_decoder64",
+    "tessera_token_crosslevel_s2_decoder64_presence_2plus1",
+    "tessera_token_crosslevel_s2_decoder64_presence_3way",
+    "tessera_token_crosslevel_s2_decoder64_presence_3way_deep",
+    "tessera_token_crosslevel_s2_bottleneck_decoder64_presence_3way_deep",
+    "tessera_token_crosslevel_s2_decoder64_decoder128_presence_3way_deep",
+    "tessera_token_crosslevel_s2_decoder64_presence_3way_deep_water_bypass",
+    "tessera_token_crosslevel_s2_decoder64_presence_3way_deep_terramind_gated",
+    "tessera_token_crosslevel_s2_decoder64_presence_3way_deep_terramind_gated_tessera_gated",
+    "tessera_token_crosslevel_s2_decoder64_presence_3way_deep_terramind_gated_hada_tessera_gated",
+    "tessera_token_crosslevel_s2_bottleneck_decoder64_decoder128_presence_3way_deep_terramind_gated",
+    "tessera_token_crosslevel_s2_bottleneck_decoder64_decoder128_presence_3way_deep_terramind_gated_norm",
+    "tessera_token_crosslevel_s2_bottleneck_decoder64_decoder128_presence_3way_deep_terramind_gated_tessera_gated",
+    "tessera_token_crosslevel_s2_dpt_film_3way_deep_norm",
+    "dpt_compact_token_only", "dpt_compact_token_only_3way_deep",
+    "tessera_token_crosslevel_xattn_bottleneck",
+    "tessera_token_crosslevel_xattn_decoder64",
+    "tessera_token_crosslevel_xattn_bottleneck_decoder64",
 ]
 
 
@@ -65,6 +106,13 @@ def parse_args():
     parser.add_argument("--secondary-test-embeddings-dir", default=None,
                         help="Optional second pixel-aligned embedding dir to concatenate with "
                              "--test-embeddings-dir, e.g. Tessera with AlphaEarth.")
+    parser.add_argument("--token-test-embeddings-dir", default=None,
+                        help="Optional 16x16 token embedding dir for shared-probe fusion with "
+                             "AlphaEarth+Tessera. Requires --secondary-test-embeddings-dir.")
+    parser.add_argument("--secondary-token-test-embeddings-dir", default=None,
+                        help="Optional second 16x16 token embedding dir for same-model S1/S2 "
+                             "shared-probe fusion. Requires --token-test-embeddings-dir and "
+                             "--secondary-test-embeddings-dir.")
     parser.add_argument("--tessera-presence-ch", type=int, default=None,
                         help="Compressed Tessera channels used at training time. "
                              "Defaults to training_params.json when available, else 16.")
@@ -78,9 +126,37 @@ def parse_args():
                         help="Depth of per-class height specialist projections used at "
                              "training time. Defaults to training_params.json when "
                              "available, else 0.")
+    parser.add_argument("--height-gate-source", default=None,
+                        choices=["alpha", "fused"],
+                        help="Height routing logits used at training time. Defaults to "
+                             "training_params.json when available, else alpha.")
+    parser.add_argument("--height-hidden-ch", type=int, default=None,
+                        help="Internal height trunk width used at training time. "
+                             "Defaults to training_params.json when available.")
+    parser.add_argument("--height-trunk-depth", type=int, default=None,
+                        help="Height trunk depth used at training time. Defaults to "
+                             "training_params.json when available, else 2.")
+    parser.add_argument("--height-independent-branches", action=argparse.BooleanOptionalAction,
+                        default=None,
+                        help="Whether training used separate base/building/vegetation "
+                             "height trunks. Defaults to training_params.json when "
+                             "available, else false.")
     parser.add_argument("--lightunet-base-ch", type=int, default=None,
                         help="LightUNet base channel width used at training time. "
                              "Defaults to training_params.json when available, else 32.")
+    parser.add_argument("--lightunet-norm-kind", default=None, choices=["bn", "gn"],
+                        help="LightUNet normalization kind used at training time. "
+                             "Defaults to training_params.json when available, else 'bn'.")
+    parser.add_argument("--height-head-kind", default=None,
+                        choices=["linear", "softbin"],
+                        help="Height head parameterization used at training time. "
+                             "Defaults to training_params.json when available, else linear.")
+    parser.add_argument("--height-n-bins", type=int, default=None,
+                        help="Soft-bin K used at training time. Defaults to "
+                             "training_params.json when available, else 64.")
+    parser.add_argument("--height-bin-max-m", type=float, default=None,
+                        help="Soft-bin max meters used at training time. Defaults to "
+                             "training_params.json when available, else 80.0.")
     parser.add_argument("--test-targets-dir", default=None,
                         help="Optional directory of label .tif files. When omitted, "
                              "runs label-free inference (competition test set).")
@@ -126,16 +202,109 @@ def resolve_tessera_model_kwargs(args, exp_dir):
             if args.height_specialist_depth is not None
             else cfg.get("height_specialist_depth", 0)
         ),
+        "height_gate_source": (
+            args.height_gate_source
+            if args.height_gate_source is not None
+            else cfg.get("height_gate_source", "alpha")
+        ),
+        "height_hidden_ch": (
+            args.height_hidden_ch
+            if args.height_hidden_ch is not None
+            else cfg.get("height_hidden_ch", None)
+        ),
+        "height_trunk_depth": (
+            args.height_trunk_depth
+            if args.height_trunk_depth is not None
+            else cfg.get("height_trunk_depth", 2)
+        ),
+        "height_independent_branches": (
+            args.height_independent_branches
+            if args.height_independent_branches is not None
+            else cfg.get("height_independent_branches", False)
+        ),
         "lightunet_base_ch": (
             args.lightunet_base_ch
             if args.lightunet_base_ch is not None
             else cfg.get("lightunet_base_ch", 32)
         ),
+        "lightunet_norm_kind": (
+            args.lightunet_norm_kind
+            if args.lightunet_norm_kind is not None
+            else cfg.get("lightunet_norm_kind", "bn")
+        ),
+        "height_head_kind": (
+            args.height_head_kind
+            if args.height_head_kind is not None
+            else cfg.get("height_head_kind", "linear")
+        ),
+        "height_n_bins": (
+            args.height_n_bins
+            if args.height_n_bins is not None
+            else cfg.get("height_n_bins", 64)
+        ),
+        "height_bin_max_m": (
+            args.height_bin_max_m
+            if args.height_bin_max_m is not None
+            else cfg.get("height_bin_max_m", 80.0)
+        ),
+        "gate_mode": cfg.get("gate_mode", "simple"),
+        "gate_untied": cfg.get("gate_untied", False),
+        "gate_init_bias": cfg.get("gate_init_bias", 4.0),
+        "modality_dropout": cfg.get("modality_dropout", 0.0),
     }
 
 
 def resolve_inputs(args):
     """Return a list of embedding paths (label-free) or (emb, label) tuples."""
+    if args.secondary_token_test_embeddings_dir:
+        if not args.token_test_embeddings_dir or not args.secondary_test_embeddings_dir:
+            raise RuntimeError(
+                "--secondary-token-test-embeddings-dir requires "
+                "--token-test-embeddings-dir and --secondary-test-embeddings-dir"
+            )
+        if args.test_targets_dir:
+            pairs = find_quadsource_file_pairs(
+                args.test_embeddings_dir,
+                args.secondary_test_embeddings_dir,
+                args.token_test_embeddings_dir,
+                args.secondary_token_test_embeddings_dir,
+                args.test_targets_dir,
+            )
+            if not pairs:
+                raise RuntimeError("No matching quad-source file pairs found. Check embedding and target dirs.")
+            return pairs
+        pairs = find_quadsource_embedding_files(
+            args.test_embeddings_dir,
+            args.secondary_test_embeddings_dir,
+            args.token_test_embeddings_dir,
+            args.secondary_token_test_embeddings_dir,
+        )
+        if not pairs:
+            raise RuntimeError("No matching quad-source .tif files found. Check embedding dirs.")
+        return pairs
+
+    if args.token_test_embeddings_dir:
+        if not args.secondary_test_embeddings_dir:
+            raise RuntimeError("--token-test-embeddings-dir requires --secondary-test-embeddings-dir")
+        if args.test_targets_dir:
+            pairs = find_trisource_file_pairs(
+                args.test_embeddings_dir,
+                args.secondary_test_embeddings_dir,
+                args.token_test_embeddings_dir,
+                args.test_targets_dir,
+            )
+            if not pairs:
+                raise RuntimeError("No matching tri-source file pairs found. Check embedding and target dirs.")
+            return pairs
+        pairs = find_trisource_embedding_files(
+            args.test_embeddings_dir,
+            args.secondary_test_embeddings_dir,
+            args.token_test_embeddings_dir,
+        )
+        if not pairs:
+            raise RuntimeError("No matching tri-source .tif files found. Check embedding dirs.")
+        return pairs
+
     if args.secondary_test_embeddings_dir:
         if args.test_targets_dir:
             pairs = find_multisource_file_pairs(
@@ -165,6 +334,16 @@ def resolve_inputs(args):
     return emb_files
 
 
+def move_to_device(batch, device):
+    if torch.is_tensor(batch):
+        return batch.to(device)
+    if isinstance(batch, tuple):
+        return tuple(move_to_device(item, device) for item in batch)
+    if isinstance(batch, list):
+        return [move_to_device(item, device) for item in batch]
+    raise TypeError(f"Unsupported batch type: {type(batch)!r}")
+
+
 def main():
     args = parse_args()
     device = select_device()
@@ -181,12 +360,39 @@ def main():
     sample_emb_path = inputs[0][0] if isinstance(inputs[0], tuple) else inputs[0]
     with rasterio.open(sample_emb_path) as src:
         n_channels = src.count
-    if args.secondary_test_embeddings_dir:
+    if args.secondary_token_test_embeddings_dir:
+        with rasterio.open(inputs[0][1]) as src:
+            pixel_channels = n_channels + src.count
+        with rasterio.open(inputs[0][2]) as src:
+            token_channels = src.count
+        with rasterio.open(inputs[0][3]) as src:
+            token_channels += src.count
+        n_channels = (pixel_channels, token_channels)
+    elif args.token_test_embeddings_dir:
+        with rasterio.open(inputs[0][1]) as src:
+            pixel_channels = n_channels + src.count
+        with rasterio.open(inputs[0][2]) as src:
+            token_channels = src.count
+        n_channels = (pixel_channels, token_channels)
+    elif args.secondary_test_embeddings_dir:
         with rasterio.open(inputs[0][1]) as src:
             n_channels += src.count
 
-    DatasetCls = MultiPixelEmbeddingDataset if args.secondary_test_embeddings_dir else pick_dataset_class(args.model_type, n_channels)
+    if args.secondary_token_test_embeddings_dir:
+        DatasetCls = PixelMultiTokenEmbeddingDataset
+    elif args.token_test_embeddings_dir:
+        DatasetCls = PixelTokenEmbeddingDataset
+    else:
+        if args.secondary_test_embeddings_dir and args.model_type.lower() in {
+            "token_fusion_neck", "token_fusion_neck_norm",
+            "token_fusion_neck_xattn", "token_fusion_neck_xattn_norm",
+        }:
+            DatasetCls = MultiLatentTokenDataset
+        else:
+            DatasetCls = MultiPixelEmbeddingDataset if args.secondary_test_embeddings_dir else pick_dataset_class(args.model_type, n_channels)
     if DatasetCls.__name__ == "LatentTokenDataset":
+        test_ds = DatasetCls(inputs, patch_size=args.patch_size, scale_factor=16, is_train=False)
+    elif DatasetCls.__name__ in {"PixelTokenEmbeddingDataset", "PixelMultiTokenEmbeddingDataset", "MultiLatentTokenDataset"}:
         test_ds = DatasetCls(inputs, patch_size=args.patch_size, scale_factor=16, is_train=False)
     else:
         test_ds = DatasetCls(inputs, patch_size=args.patch_size, is_train=False)
@@ -195,14 +401,23 @@ def main():
     tessera_kwargs = resolve_tessera_model_kwargs(args, exp_dir)
     model, selected_model = build_model(
         args.model_type,
-        n_channels=sample_img.shape[0],
+        n_channels=(
+            (sample_img[0].shape[0], sample_img[1].shape[0])
+            if isinstance(sample_img, (tuple, list))
+            else sample_img.shape[0]
+        ),
         n_classes=4,
         **tessera_kwargs,
     )
     model = model.to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
-    print(f"Loaded model: {selected_model} from {model_path} (input channels={sample_img.shape[0]})")
+    input_channels = (
+        (sample_img[0].shape[0], sample_img[1].shape[0])
+        if isinstance(sample_img, (tuple, list))
+        else sample_img.shape[0]
+    )
+    print(f"Loaded model: {selected_model} from {model_path} (input channels={input_channels})")
     if args.thresholds is not None:
         print(f"Baking per-class thresholds into output: bld={args.thresholds[0]}, "
               f"veg={args.thresholds[1]}, wat={args.thresholds[2]}")
@@ -212,7 +427,11 @@ def main():
         pred_shape = None
         for i in tqdm(range(len(test_ds)), desc="Predicting"):
             img_tensor, _, _ = test_ds[i]
-            img_batch = img_tensor.unsqueeze(0).to(device)
+            if isinstance(img_tensor, (tuple, list)):
+                img_batch = tuple(t.unsqueeze(0) for t in img_tensor)
+            else:
+                img_batch = img_tensor.unsqueeze(0)
+            img_batch = move_to_device(img_batch, device)
 
             output_batch = model(img_batch)
             pred = output_batch.squeeze().cpu().numpy().astype(np.float32)
