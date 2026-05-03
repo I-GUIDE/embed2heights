@@ -26,7 +26,7 @@ from sklearn.model_selection import train_test_split
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
 
-from core.dataset import normalize_core_id  # noqa: E402
+from core.data.discovery import normalize_core_id  # noqa: E402
 
 DEFAULT_LABELS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "data", "train", "labels"))
 DEFAULT_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "..", "splits")

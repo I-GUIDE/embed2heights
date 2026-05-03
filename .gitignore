@@ -1,5 +1,7 @@
 # Data (downloaded via eotdl, large GeoTIFF files)
 data/
+!core/data/
+!core/data/*.py
 
 # Experiment outputs (checkpoints, loss curves, predictions)
 runs/
@@ -35,21 +37,39 @@ Thumbs.db
 
 
 # logs
-!logs/GOAL.md
 # logs/train/*
 submission/
 .claude
 .codex
 run.sbatch
 configs/
+!configs/
+!configs/*.yml
+!configs/*.md
+!configs/active/
+!configs/active/*.yml
+!configs/legacy/
+!configs/legacy/*.yml
+!configs/legacy/*.md
 *.sbatch
+!sample.sbatch
 *.out
 
 tools/plot*
 
 logs/*
+!logs/BEST_RESULT.md
+!logs/GOAL.md
 configs/*
+!configs/*.yml
+!configs/*.md
+!configs/active/
+!configs/active/*.yml
+!configs/legacy/
+!configs/legacy/*.yml
+!configs/legacy/*.md
 
-predict_tta.py
 slurm-*.out
 logs/*.pdf
+
+tools/*.ipynb

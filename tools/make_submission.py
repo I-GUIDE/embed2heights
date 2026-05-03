@@ -1,189 +1,240 @@
 """
-Package a directory of test-set .npy predictions into a leaderboard submission
-zip. The zip has a single top-level folder `predictions/` containing every
-.npy, matching the format verified in logs/METRIC_PROBE_REPORT.md.
+Build a leaderboard submission zip from prediction files.
 
-Typical use:
-    # 1. Run inference on the test embeddings
-    python predict.py --experiment-name lightunet_alphaearth_v3head \\
-        --model-type lightunet \\
-        --test-embeddings-dir /u/dingqi2/workspace/esa/data/test/alphaearth_test_emb \\
-        --predictions-dir runs/lightunet_alphaearth_v3head/test_predictions_alphaearth
+The script can run the complete post-processing path:
+  1. optionally ensemble multiple test prediction dirs,
+  2. optionally sweep thresholds on a labeled validation prediction dir,
+  3. binarize channels 0-2 and save the binarized predictions,
+  4. package the required `predictions/*.npy` zip layout.
 
-    # 2a. Continuous submission (keeps class channels as-is — large ~800 MB zip)
+Existing direct packaging still works:
     python tools/make_submission.py \\
-        --pred-dir runs/lightunet_alphaearth_v3head/test_predictions_alphaearth \\
-        --output   runs/lightunet_alphaearth_v3head/submission_base.zip
+        --pred-dir runs/my_exp/test_predictions_alphaearth \\
+        --output runs/my_exp/submission.zip
 
-    # 2b. Binarized submission (class channels -> {0, 1} at given thresholds;
-    #     height stays float32. Smaller zip, and identical IoU when thresholds
-    #     are 0.5,0.5,0.5 because the server uses pred > 0.5.)
+Complete pipeline example:
     python tools/make_submission.py \\
-        --pred-dir runs/lightunet_alphaearth_v3head/test_predictions_alphaearth \\
-        --binarize-thresholds 0.5 0.5 0.5 \\
-        --output   runs/lightunet_alphaearth_v3head/submission_binary05.zip
-
-The script sanity-checks:
-  - expected file count (default 946 — override with --expected-count)
-  - each .npy has shape [4, H, W] with float32 / float64 dtype
-  - channels 0-2 values in [0, 1]; channel 3 non-negative
+        --ensemble-inputs runs/a/test_predictions runs/b/test_predictions \\
+        --ensemble-output-dir runs/ens/test_predictions \\
+        --sweep-ensemble-inputs runs/a/predictions runs/b/predictions \\
+        --binarized-output-dir runs/ens/test_predictions_binary \\
+        --output runs/ens/submission.zip
 """
 
 import argparse
-import io
+import json
 import sys
-import zipfile
+import tempfile
 from pathlib import Path
-
-import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPT_DIR))
 
+from core.inference.calibration import (  # noqa: E402
+    format_metrics,
+    sweep_thresholds,
+    write_threshold_report,
+)
+from core.inference.ensemble import (  # noqa: E402
+    ensemble_mean,
+    ensemble_weighted,
+    load_weighted_ensemble_spec,
+)
+from core.inference.postprocess import binarize_predictions  # noqa: E402
+from core.inference.submission import (  # noqa: E402
+    package_submission,
+    validate_prediction_dir,
+)
+
+
+DEFAULT_LABELS_DIR = SCRIPT_DIR.parent / "data" / "train" / "labels"
+
 
 def parse_args():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--pred-dir", type=Path, required=True,
-                   help="Directory of test-set .npy predictions (one per patch).")
-    p.add_argument("--output", type=Path, required=True, help="Output submission .zip path.")
-    p.add_argument("--expected-count", type=int, default=946,
-                   help="Expected number of .npy files (default 946; pass 0 to skip check).")
-    p.add_argument("--skip-validation", action="store_true",
-                   help="Skip per-file shape/range validation (faster).")
-    p.add_argument("--binarize-thresholds", type=float, nargs=3, default=None,
-                   metavar=("BLD", "VEG", "WAT"),
-                   help="If set, threshold class channels (0-2) to {0.0, 1.0} using "
-                        "these per-class thresholds (pred > threshold). Channel 3 "
-                        "(height) is left untouched. Cuts zip size ~4x without "
-                        "changing IoU when thresholds match the server's 0.5.")
-    p.add_argument("--water-cc-min-size", type=int, default=0, metavar="K",
-                   help="Post-process water mask with an 8-connected-component filter: "
-                        "if the largest predicted water component on a patch has fewer "
-                        "than K pixels, clear the entire water mask on that patch. "
-                        "Only applied when --binarize-thresholds is set. K=0 disables. "
-                        "Recommended: 12 (val-tuned) or 16 (conservative).")
-    return p.parse_args()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    source = parser.add_argument_group("prediction source")
+    source.add_argument("--pred-dir", type=Path, default=None,
+                        help="Existing test prediction directory to package.")
+    source.add_argument("--ensemble-inputs", type=Path, nargs="+", default=None,
+                        help="Two or more test prediction dirs to mean-ensemble before packaging.")
+    source.add_argument("--ensemble-spec", type=Path, default=None,
+                        help="Weighted ensemble JSON spec. Mutually exclusive with --ensemble-inputs.")
+    source.add_argument("--ensemble-output-dir", type=Path, default=None,
+                        help="Where to save ensembled test predictions. Required for persistent ensemble output; "
+                             "otherwise a temporary dir is used.")
+
+    thresholds = parser.add_argument_group("thresholds and binarization")
+    thresholds.add_argument("--thresholds", "--binarize-thresholds", type=float, nargs=3, default=None,
+                            metavar=("BLD", "VEG", "WAT"),
+                            help="Explicit per-class thresholds for channels 0-2.")
+    thresholds.add_argument("--sweep-pred-dir", type=Path, default=None,
+                            help="Validation prediction dir used to sweep thresholds when --thresholds is omitted.")
+    thresholds.add_argument("--sweep-ensemble-inputs", type=Path, nargs="+", default=None,
+                            help="Validation prediction dirs to mean-ensemble before threshold sweep.")
+    thresholds.add_argument("--sweep-ensemble-spec", type=Path, default=None,
+                            help="Weighted ensemble JSON spec for validation predictions before threshold sweep.")
+    thresholds.add_argument("--sweep-ensemble-output-dir", type=Path, default=None,
+                            help="Where to save the validation ensemble used for threshold sweep. "
+                                 "If omitted, a temporary dir is used.")
+    thresholds.add_argument("--labels-dir", type=Path, default=DEFAULT_LABELS_DIR)
+    thresholds.add_argument("--split-file", type=Path, default=None,
+                            help="Optional JSON with a 'val' key for threshold sweep.")
+    thresholds.add_argument("--grid-start", type=float, default=0.05)
+    thresholds.add_argument("--grid-stop", type=float, default=0.90)
+    thresholds.add_argument("--grid-step", type=float, default=0.025)
+    thresholds.add_argument("--threshold-report", type=Path, default=None,
+                            help="Optional JSON report path for swept thresholds.")
+    thresholds.add_argument("--binarized-output-dir", type=Path, default=None,
+                            help="Where to save binarized predictions. If thresholds are set and this is omitted, "
+                                 "a temporary dir is used for packaging only.")
+    thresholds.add_argument("--no-binarize", action="store_true",
+                            help="Package continuous predictions even if threshold sweep inputs are provided.")
+    thresholds.add_argument("--water-cc-min-size", type=int, default=0, metavar="K",
+                            help="Optional 8-connected water-mask filter after binarization. K=0 disables.")
+
+    package = parser.add_argument_group("package")
+    package.add_argument("--output", type=Path, required=True, help="Output submission .zip path.")
+    package.add_argument("--expected-count", type=int, default=946,
+                         help="Expected number of .npy files. Pass 0 to skip.")
+    package.add_argument("--skip-validation", action="store_true",
+                         help="Skip sample shape/range validation before packaging.")
+    return parser.parse_args()
 
 
-def validate_one(path):
-    arr = np.load(path)
-    if arr.ndim != 3 or arr.shape[0] != 4:
-        raise ValueError(f"{path.name}: expected shape [4, H, W], got {arr.shape}")
-    if arr.dtype not in (np.float32, np.float64):
-        raise ValueError(f"{path.name}: expected float dtype, got {arr.dtype}")
-    # Only sample ranges — full check is too slow on 946 patches
-    cls = arr[:3]
-    if cls.min() < -1e-4 or cls.max() > 1 + 1e-4:
-        print(f"  WARN  {path.name}: class channels outside [0,1] — min={cls.min():.4f} max={cls.max():.4f}",
-              file=sys.stderr)
-    if arr[3].min() < -1e-4:
-        print(f"  WARN  {path.name}: height channel has negative values — min={arr[3].min():.4f}",
-              file=sys.stderr)
-    return arr.shape
+def resolve_prediction_source(args, tmp_path: Path) -> Path:
+    sources = sum(value is not None for value in (args.pred_dir, args.ensemble_inputs, args.ensemble_spec))
+    if sources != 1:
+        raise ValueError("Provide exactly one of --pred-dir, --ensemble-inputs, or --ensemble-spec.")
+    if args.ensemble_inputs and args.ensemble_spec:
+        raise ValueError("--ensemble-inputs and --ensemble-spec are mutually exclusive.")
+
+    if args.pred_dir is not None:
+        if not args.pred_dir.is_dir():
+            raise FileNotFoundError(f"--pred-dir does not exist: {args.pred_dir}")
+        return args.pred_dir
+
+    output_dir = args.ensemble_output_dir or (tmp_path / "ensemble_predictions")
+    if args.ensemble_inputs is not None:
+        count = ensemble_mean(args.ensemble_inputs, output_dir)
+        print(f"Ensembled {count} files by mean: {output_dir}")
+        return output_dir
+
+    inputs, channel_weights = load_weighted_ensemble_spec(args.ensemble_spec)
+    count = ensemble_weighted(inputs, channel_weights, output_dir)
+    print(f"Ensembled {count} files with weighted spec {args.ensemble_spec}: {output_dir}")
+    return output_dir
+
+
+def resolve_sweep_prediction_dir(args, tmp_path):
+    sources = sum(value is not None for value in (
+        args.sweep_pred_dir,
+        args.sweep_ensemble_inputs,
+        args.sweep_ensemble_spec,
+    ))
+    if sources == 0:
+        return None
+    if sources != 1:
+        raise ValueError("Provide at most one of --sweep-pred-dir, --sweep-ensemble-inputs, or --sweep-ensemble-spec.")
+
+    if args.sweep_pred_dir is not None:
+        return args.sweep_pred_dir
+
+    output_dir = args.sweep_ensemble_output_dir or (tmp_path / "sweep_ensemble_predictions")
+    if args.sweep_ensemble_inputs is not None:
+        count = ensemble_mean(args.sweep_ensemble_inputs, output_dir)
+        print(f"Ensembled {count} validation files by mean for threshold sweep: {output_dir}")
+        return output_dir
+
+    inputs, channel_weights = load_weighted_ensemble_spec(args.sweep_ensemble_spec)
+    count = ensemble_weighted(inputs, channel_weights, output_dir)
+    print(f"Ensembled {count} validation files with weighted spec for threshold sweep: {output_dir}")
+    return output_dir
+
+
+def resolve_thresholds(args, tmp_path):
+    if args.no_binarize:
+        return None
+    if args.thresholds is not None:
+        return tuple(float(value) for value in args.thresholds)
+    sweep_pred_dir = resolve_sweep_prediction_dir(args, tmp_path)
+    if sweep_pred_dir is None:
+        return None
+
+    result = sweep_thresholds(
+        pred_dir=sweep_pred_dir,
+        labels_dir=args.labels_dir,
+        split_file=args.split_file,
+        grid_start=args.grid_start,
+        grid_stop=args.grid_stop,
+        grid_step=args.grid_step,
+    )
+    print(
+        "Swept thresholds: "
+        f"bld={result.per_class_thresholds[0]:.3f} "
+        f"veg={result.per_class_thresholds[1]:.3f} "
+        f"wat={result.per_class_thresholds[2]:.3f}"
+    )
+    print(f"Validation score @ thresholds: {format_metrics(result.per_class_metrics)}")
+    if args.threshold_report:
+        write_threshold_report(result, args.threshold_report, sweep_pred_dir)
+        print(f"Wrote threshold report: {args.threshold_report}")
+    return result.per_class_thresholds
+
+
+def write_manifest(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
 
 
 def main():
     args = parse_args()
 
-    if not args.pred_dir.is_dir():
-        raise FileNotFoundError(f"--pred-dir does not exist: {args.pred_dir}")
-
-    files = sorted(args.pred_dir.glob("*.npy"))
-    if not files:
-        raise FileNotFoundError(f"No .npy files in {args.pred_dir}")
-
-    print(f"Found {len(files)} .npy files in {args.pred_dir}")
-    if args.expected_count > 0 and len(files) != args.expected_count:
-        print(f"ERROR: expected {args.expected_count} files for submission, got {len(files)}", file=sys.stderr)
-        print(f"       (pass --expected-count 0 to skip this check)", file=sys.stderr)
-        sys.exit(1)
-
-    if not args.skip_validation:
-        print("Validating a sample of files...")
-        sample_idxs = [0, len(files) // 2, len(files) - 1]
-        shapes = set()
-        for i in sample_idxs:
-            shape = validate_one(files[i])
-            shapes.add(shape)
-        print(f"  sample shapes: {shapes}")
-
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-
-    # We always materialize the (possibly transformed) files into a temp
-    # `predictions/` subdirectory and then shell out to the system `zip`
-    # command (Info-ZIP). Python's zipfile module produces archives whose
-    # ZipInfo fields (no UT extra timestamps, placeholder 1980 date_time,
-    # lower create_version) have been observed to hang strict server-side
-    # parsers — the known-working submissions were all created by Info-ZIP
-    # via the `zip` CLI. Shelling out gives us byte-pattern-identical
-    # output to those working zips.
-    import shutil
-    import subprocess
-    import tempfile
-
-    zip_cli = shutil.which("zip")
-    if zip_cli is None:
-        raise RuntimeError(
-            "/usr/bin/zip (Info-ZIP) not found on PATH. "
-            "This tool requires it to produce a server-compatible archive."
-        )
-
     with tempfile.TemporaryDirectory(prefix="make_submission_") as tmpd:
         tmp_path = Path(tmpd)
-        pred_dir_in_tmp = tmp_path / "predictions"
-        pred_dir_in_tmp.mkdir()
+        pred_dir = resolve_prediction_source(args, tmp_path)
+        thresholds = resolve_thresholds(args, tmp_path)
 
-        if args.binarize_thresholds is None:
-            if args.water_cc_min_size > 0:
-                print("WARN: --water-cc-min-size is only applied with --binarize-thresholds; ignoring.",
-                      file=sys.stderr)
-            print(f"Staging {len(files)} files (no transform) to {pred_dir_in_tmp}")
-            for npy in files:
-                shutil.copy2(npy, pred_dir_in_tmp / npy.name)
-        else:
-            thr = np.asarray(args.binarize_thresholds, dtype=np.float32)
-            print(f"Binarizing class channels at thresholds {tuple(float(t) for t in thr)} (bld, veg, wat)")
-            cc_K = int(args.water_cc_min_size)
-            cc_struct = None
-            if cc_K > 0:
-                from scipy.ndimage import label as cc_label
-                cc_struct = np.ones((3, 3), dtype=np.uint8)
-                print(f"  + 8-connected water CC filter: clear water mask if largest component < {cc_K} px")
-                cc_cleared = 0
-            for npy in files:
-                arr = np.load(npy).astype(np.float32)
-                for c in range(3):
-                    arr[c] = (arr[c] > thr[c]).astype(np.float32)
-                if cc_K > 0:
-                    water_bin = arr[2].astype(np.uint8)
-                    if water_bin.any():
-                        comps, n = cc_label(water_bin, structure=cc_struct)
-                        if n > 0:
-                            sizes = np.bincount(comps.ravel())[1:]
-                            if sizes.max() < cc_K:
-                                arr[2] = 0.0
-                                cc_cleared += 1
-                np.save(pred_dir_in_tmp / npy.name, arr)
-            if cc_K > 0:
-                print(f"  CC filter cleared water on {cc_cleared}/{len(files)} patches")
+        package_dir = pred_dir
+        if thresholds is not None:
+            package_dir = args.binarized_output_dir or (tmp_path / "binarized_predictions")
+            count = binarize_predictions(
+                pred_dir=pred_dir,
+                output_dir=package_dir,
+                thresholds=thresholds,
+                water_cc_min_size=args.water_cc_min_size,
+            )
+            print(
+                f"Binarized {count} files at "
+                f"({thresholds[0]:.3f}, {thresholds[1]:.3f}, {thresholds[2]:.3f}): {package_dir}"
+            )
+        elif args.binarized_output_dir is not None:
+            print("WARN: --binarized-output-dir was provided but no thresholds were set; packaging continuous predictions.")
 
-        # Remove any pre-existing output zip so `zip` creates a fresh archive.
-        if args.output.exists():
-            args.output.unlink()
+        if not args.skip_validation:
+            shapes = validate_prediction_dir(package_dir, expected_count=args.expected_count, sample_only=True)
+            print(f"Validated sample shapes: {shapes}")
 
-        print(f"Zipping via {zip_cli} -r ...")
-        proc = subprocess.run(
-            [zip_cli, "-r", "-q", str(args.output.absolute()), "predictions"],
-            cwd=tmp_path,
-            capture_output=True,
-            text=True,
+        package_submission(package_dir, args.output)
+        size_mb = args.output.stat().st_size / (1024 * 1024)
+        print(f"Submission written: {args.output} ({size_mb:.1f} MB)")
+        print("Internal layout: predictions/<id>.npy")
+
+        manifest_path = args.output.with_suffix(".manifest.json")
+        write_manifest(
+            manifest_path,
+            {
+                "source_pred_dir": str(pred_dir),
+                "packaged_pred_dir": str(package_dir),
+                "output": str(args.output),
+                "thresholds": list(thresholds) if thresholds is not None else None,
+                "water_cc_min_size": args.water_cc_min_size,
+                "expected_count": args.expected_count,
+            },
         )
-        if proc.returncode != 0:
-            raise RuntimeError(f"zip failed (rc={proc.returncode}):\n{proc.stderr}")
-
-    size_mb = args.output.stat().st_size / (1024 * 1024)
-    print(f"\nSubmission written: {args.output}  ({size_mb:.1f} MB, {len(files)} entries + 1 dir)")
-    print(f"Internal layout: predictions/<id>.npy")
+        print(f"Wrote manifest: {manifest_path}")
 
 
 if __name__ == "__main__":

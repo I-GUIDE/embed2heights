@@ -26,7 +26,7 @@ import numpy as np
 SCRIPT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPT_DIR))
 
-from core.dataset import submission_id  # noqa: E402
+from core.data.discovery import submission_id  # noqa: E402
 
 DEFAULT_TEST_DIR = Path("/u/dingqi2/workspace/esa/data/test/alphaearth_test_emb")
 
