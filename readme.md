@@ -8,9 +8,9 @@ Baselines for the **ESA Embed2Heights** competition. Each model predicts a 4-cha
 emb2heights-backbone/
 ├── core/
 │   ├── data/          # data discovery, datasets, and training loader assembly
-│   ├── config/        # YAML recipe and CLI config helpers
+│   ├── config.py      # YAML recipe and CLI config helpers
 │   ├── engine/        # device, seed, checkpoint, and train-loop helpers
-│   ├── inference/     # prediction/TTA, ensemble, calibration, postprocess, submission helpers
+│   ├── inference/     # prediction/TTA, ensemble, calibration, transforms, submission helpers
 │   ├── metrics.py     # leaderboard metric implementation
 │   ├── models/        # model package: blocks, backbones, heads, fusion, registry, factory
 │   ├── losses/        # supervised loss primitives and ImprovedCompositeLoss

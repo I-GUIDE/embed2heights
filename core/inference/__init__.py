@@ -1,11 +1,15 @@
 """Inference helpers."""
 
 from .calibration import (
+    apply_height_affine_array,
+    apply_water_cc_filter,
+    binarize_predictions,
     build_oof_report,
     collect_oof_records,
     eval_records,
     fit_params,
     format_metrics,
+    largest_component_size,
     run_nested_oof_cv,
     sweep_thresholds,
     write_threshold_report,
@@ -16,18 +20,12 @@ from .ensemble import (
     index_prediction_dir,
     load_weighted_ensemble_spec,
 )
-from .postprocess import prediction_to_numpy
-from .postprocess import (
-    apply_height_affine_array,
-    apply_water_cc_filter,
-    binarize_predictions,
-    largest_component_size,
-)
 from .predict import (
     batched,
     input_channels,
     invert_tensor,
     predict_batch,
+    prediction_to_numpy,
     transform_input,
     transform_tensor,
     tta_views,

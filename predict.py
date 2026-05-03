@@ -38,8 +38,8 @@ from core.inference import (
     tta_views,
     write_prediction_config,
 )
-from core.config.train import DEFAULTS as TRAIN_DEFAULTS
-from core.config.train import MODEL_CHOICES
+from core.config import DEFAULTS as TRAIN_DEFAULTS
+from core.config import MODEL_CHOICES
 
 
 TTA_CHOICES = ("none", "flip", "d4")
