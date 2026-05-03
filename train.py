@@ -24,7 +24,7 @@ from core.engine import (
     write_history_record,
 )
 from core.models import build_model
-from core.config.train import (
+from core.config import (
     RAW_COMPONENTS,
     WEIGHTED_COMPONENTS,
     parse_args,

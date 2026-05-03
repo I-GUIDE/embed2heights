@@ -9,7 +9,7 @@ except ImportError:
     yaml = None
 
 
-REPO_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CONFIG_PATH = os.path.join(REPO_DIR, "configs", "defaults.yml")
 
 MODEL_CHOICES = ["ae_only", "ae_tessera_gated", "xfusion_crosslevel", "auto"]

@@ -31,6 +31,7 @@ SCRIPT_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPT_DIR))
 
 from core.inference.calibration import (  # noqa: E402
+    binarize_predictions,
     format_metrics,
     sweep_thresholds,
     write_threshold_report,
@@ -40,7 +41,6 @@ from core.inference.ensemble import (  # noqa: E402
     ensemble_weighted,
     load_weighted_ensemble_spec,
 )
-from core.inference.postprocess import binarize_predictions  # noqa: E402
 from core.inference.submission import (  # noqa: E402
     package_submission,
     validate_prediction_dir,
