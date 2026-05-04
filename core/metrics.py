@@ -1,5 +1,5 @@
 """
-Leaderboard metric helpers — shared by evaluate.py and the tools/ scripts.
+Leaderboard metric helpers shared by evaluation and tuning scripts.
 
 Metric formulas were verified by the 2026-04-17 all-zero probe (see
 logs/METRIC_PROBE_REPORT.md) and are the single source of truth for both
@@ -12,7 +12,7 @@ import os
 
 import numpy as np
 
-from .dataset import normalize_core_id
+from core.data.discovery import normalize_core_id
 
 
 # Channel indices (same layout for pred and label)
@@ -46,7 +46,7 @@ def binary_iou(pred_mask, true_mask):
     Per-image positive-class IoU with the leaderboard empty-case convention:
       - Both pred and gt empty -> 1.0 (perfect agreement on absence)
       - Exactly one empty      -> 0.0
-      - Otherwise              -> |pred ∩ gt| / |pred ∪ gt|
+      - Otherwise              -> |pred intersection gt| / |pred union|
 
     Matches sklearn's jaccard_score(zero_division=1.0).
     """

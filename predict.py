@@ -1,141 +1,169 @@
-"""
-Load a trained model and write per-patch predictions as .npy files.
+"""Load an active checkpoint and write per-patch .npy predictions."""
 
-Two modes:
-  - Paired (validation): --test-targets-dir given, filenames use `core_id.npy`.
-  - Label-free (test set submission): no --test-targets-dir, filenames include
-    the year suffix required by the leaderboard (`<core>_<region>_<year>.npy`).
-"""
-import os
-import json
 import argparse
+import json
+import os
+
 import numpy as np
-import torch
 import rasterio
+import torch
 from tqdm.auto import tqdm
 
-from core.model import build_model
-from core.dataset import (
-    find_file_pairs,
-    find_embedding_files,
-    find_multisource_file_pairs,
-    find_multisource_embedding_files,
-    normalize_core_id,
-    submission_id,
-    pick_dataset_class,
+try:
+    import yaml
+except ImportError:
+    yaml = None
+
+from core.data.datasets import (
     MultiPixelEmbeddingDataset,
-    HEIGHT_NORM_CONSTANT,
+    PixelTokenEmbeddingDataset,
+    pick_dataset_class,
 )
+from core.data.discovery import (
+    find_embedding_files,
+    find_file_pairs,
+    find_multisource_embedding_files,
+    find_multisource_file_pairs,
+    find_trisource_embedding_files,
+    find_trisource_file_pairs,
+)
+from core.models import build_model
+from core.engine import move_to_device, select_device
+from core.inference import (
+    batched,
+    input_channels,
+    predict_batch,
+    prediction_output_id,
+    prediction_to_numpy,
+    tta_views,
+    write_prediction_config,
+)
+from core.config import DEFAULTS as TRAIN_DEFAULTS
+from core.config import MODEL_CHOICES
 
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULTS = {
-    "experiment_name": "terramind_decoder_run01",
-    "base_dir": os.path.join(SCRIPT_DIR, "runs"),
-    "model_type": "decoder_residual",
-    "patch_size": 256,
-    "max_samples": 0,
-}
-
-MODEL_CHOICES = [
-    "auto", "lightunet", "decoder", "decoder_residual", "token_neck",
-    "embedding_refiner", "hrnet_w18", "hrnet_w32", "tessera_iou_fusion",
-]
-
-
-def select_device():
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+TTA_CHOICES = ("none", "flip", "d4")
+CONFIG_SECTIONS = ("data", "model", "training", "runtime")
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--experiment-name", default=DEFAULTS["experiment_name"])
-    parser.add_argument("--base-dir", default=DEFAULTS["base_dir"],
+    parser.add_argument("--experiment-name", default="run01")
+    parser.add_argument("--base-dir", default=TRAIN_DEFAULTS["output_dir"],
                         help="Root directory containing experiment subfolders.")
-    parser.add_argument("--model-type", default=DEFAULTS["model_type"], choices=MODEL_CHOICES,
-                        help="Model architecture used during training.")
+    parser.add_argument("--model-type", default=None, choices=MODEL_CHOICES,
+                        help="Override model type. Defaults to resolved_config.yml, else auto.")
     parser.add_argument("--model-path", default=None,
-                        help="Path to the .pth checkpoint. Defaults to <base-dir>/<experiment-name>/model_best.pth.")
-    parser.add_argument("--test-embeddings-dir", required=True,
-                        help="Directory containing embedding .tif files.")
+                        help="Defaults to <base-dir>/<experiment-name>/model_best.pth.")
+    parser.add_argument("--test-embeddings-dir", required=True)
     parser.add_argument("--secondary-test-embeddings-dir", default=None,
-                        help="Optional second pixel-aligned embedding dir to concatenate with "
-                             "--test-embeddings-dir, e.g. Tessera with AlphaEarth.")
-    parser.add_argument("--tessera-presence-ch", type=int, default=None,
-                        help="Compressed Tessera channels used at training time. "
-                             "Defaults to training_params.json when available, else 16.")
-    parser.add_argument("--tessera-hidden-ch", type=int, default=None,
-                        help="Tessera compressor hidden width used at training time. "
-                             "Defaults to training_params.json when available.")
-    parser.add_argument("--tessera-hidden-depth", type=int, default=None,
-                        help="Extra Tessera compressor hidden depth used at training time. "
-                             "Defaults to training_params.json when available, else 0.")
-    parser.add_argument("--height-specialist-depth", type=int, default=None,
-                        help="Depth of per-class height specialist projections used at "
-                             "training time. Defaults to training_params.json when "
-                             "available, else 0.")
-    parser.add_argument("--lightunet-base-ch", type=int, default=None,
-                        help="LightUNet base channel width used at training time. "
-                             "Defaults to training_params.json when available, else 32.")
+                        help="Second pixel-aligned embedding dir, e.g. Tessera.")
+    parser.add_argument("--token-test-embeddings-dir", default=None,
+                        help="Optional 16x16 token embedding dir for xfusion.")
     parser.add_argument("--test-targets-dir", default=None,
-                        help="Optional directory of label .tif files. When omitted, "
-                             "runs label-free inference (competition test set).")
+                        help="When omitted, writes label-free submission ids with year suffix.")
     parser.add_argument("--predictions-dir", default=None,
-                        help="Output directory for .npy predictions. Defaults to <base-dir>/<experiment-name>/predictions.")
-    parser.add_argument("--patch-size", type=int, default=DEFAULTS["patch_size"])
-    parser.add_argument("--max-samples", type=int, default=DEFAULTS["max_samples"],
+                        help="Defaults to <base-dir>/<experiment-name>/predictions.")
+    parser.add_argument("--patch-size", type=int, default=TRAIN_DEFAULTS["patch_size"])
+    parser.add_argument("--max-samples", type=int, default=0,
                         help="Limit inference to N samples (0 = all).")
     parser.add_argument("--thresholds", type=float, nargs=3, default=None,
                         metavar=("BLD", "VEG", "WAT"),
-                        help="Optional per-class thresholds to bake into the output. "
-                             "When set, class channels (0-2) are written as {0.0, 1.0} "
-                             "using pred > threshold. Default keeps raw sigmoid probs "
-                             "(recommended — lets you sweep thresholds later).")
+                        help="Optional per-class thresholds baked into channels 0-2.")
+    parser.add_argument("--tta", default="none", choices=TTA_CHOICES,
+                        help="Test-time augmentation mode. 'flip' uses identity + h/v flips; "
+                             "'d4' uses rotations plus mirrored rotations.")
     return parser.parse_args()
 
 
-def resolve_tessera_model_kwargs(args, exp_dir):
-    cfg = {}
+def load_legacy_training_params(exp_dir):
     cfg_path = os.path.join(exp_dir, "training_params.json")
-    if os.path.exists(cfg_path):
-        with open(cfg_path, "r") as f:
-            cfg = json.load(f)
+    if not os.path.exists(cfg_path):
+        return {}
+    with open(cfg_path, "r") as f:
+        return json.load(f)
 
+
+def flatten_run_config(config):
+    flat = {}
+    for section in CONFIG_SECTIONS:
+        values = config.get(section, {})
+        if isinstance(values, dict):
+            flat.update(values)
+    flat["_config_source"] = "resolved_config.yml"
+    flat["_source_config"] = config.get("source_config")
+    flat["_recipe"] = config.get("recipe", {})
+    return flat
+
+
+def load_training_config(exp_dir):
+    resolved_path = os.path.join(exp_dir, "resolved_config.yml")
+    if yaml is not None and os.path.exists(resolved_path):
+        with open(resolved_path, "r") as f:
+            loaded = yaml.safe_load(f) or {}
+        if isinstance(loaded, dict):
+            return flatten_run_config(loaded), loaded
+
+    flat = load_legacy_training_params(exp_dir)
+    flat["_config_source"] = "legacy training_params.json" if flat else "defaults"
+    flat["_source_config"] = flat.get("source_config")
+    flat["_recipe"] = {}
+    return flat, None
+
+
+def model_kwargs_from_run_config(cfg):
+    model_type = str(cfg.get("model_type", "")).lower()
+    default_base_ch = 32 if model_type in {"lightunet", "ae_only"} else TRAIN_DEFAULTS["lightunet_base_ch"]
     return {
-        "tessera_presence_ch": (
-            args.tessera_presence_ch
-            if args.tessera_presence_ch is not None
-            else cfg.get("tessera_presence_ch", 16)
+        "tessera_presence_ch": cfg.get("tessera_presence_ch", TRAIN_DEFAULTS["tessera_presence_ch"]),
+        "tessera_hidden_ch": cfg.get("tessera_hidden_ch", TRAIN_DEFAULTS["tessera_hidden_ch"]),
+        "tessera_hidden_depth": cfg.get("tessera_hidden_depth", TRAIN_DEFAULTS["tessera_hidden_depth"]),
+        "height_specialist_depth": cfg.get("height_specialist_depth", TRAIN_DEFAULTS["height_specialist_depth"]),
+        "height_gate_source": cfg.get("height_gate_source", TRAIN_DEFAULTS["height_gate_source"]),
+        "height_hidden_ch": cfg.get("height_hidden_ch", TRAIN_DEFAULTS["height_hidden_ch"]),
+        "height_trunk_depth": cfg.get("height_trunk_depth", TRAIN_DEFAULTS["height_trunk_depth"]),
+        "height_independent_branches": cfg.get(
+            "height_independent_branches", TRAIN_DEFAULTS["height_independent_branches"]
         ),
-        "tessera_hidden_ch": (
-            args.tessera_hidden_ch
-            if args.tessera_hidden_ch is not None
-            else cfg.get("tessera_hidden_ch", None)
-        ),
-        "tessera_hidden_depth": (
-            args.tessera_hidden_depth
-            if args.tessera_hidden_depth is not None
-            else cfg.get("tessera_hidden_depth", 0)
-        ),
-        "height_specialist_depth": (
-            args.height_specialist_depth
-            if args.height_specialist_depth is not None
-            else cfg.get("height_specialist_depth", 0)
-        ),
-        "lightunet_base_ch": (
-            args.lightunet_base_ch
-            if args.lightunet_base_ch is not None
-            else cfg.get("lightunet_base_ch", 32)
-        ),
+        "lightunet_base_ch": cfg.get("lightunet_base_ch", default_base_ch),
+        "lightunet_norm_kind": cfg.get("lightunet_norm_kind", TRAIN_DEFAULTS["lightunet_norm_kind"]),
+        "height_head_kind": cfg.get("height_head_kind", TRAIN_DEFAULTS["height_head_kind"]),
+        "height_n_bins": cfg.get("height_n_bins", TRAIN_DEFAULTS["height_n_bins"]),
+        "height_bin_max_m": cfg.get("height_bin_max_m", TRAIN_DEFAULTS["height_bin_max_m"]),
+        "gate_mode": cfg.get("gate_mode", TRAIN_DEFAULTS["gate_mode"]),
+        "gate_untied": cfg.get("gate_untied", TRAIN_DEFAULTS["gate_untied"]),
+        "gate_init_bias": cfg.get("gate_init_bias", TRAIN_DEFAULTS["gate_init_bias"]),
+        "modality_dropout": cfg.get("modality_dropout", TRAIN_DEFAULTS["modality_dropout"]),
+        "presence_head_kind": cfg.get("presence_head_kind", TRAIN_DEFAULTS["presence_head_kind"]),
+        "presence_head_depth": cfg.get("presence_head_depth", TRAIN_DEFAULTS["presence_head_depth"]),
+        "presence_branch_ch": cfg.get("presence_branch_ch", TRAIN_DEFAULTS["presence_branch_ch"]),
     }
 
 
 def resolve_inputs(args):
-    """Return a list of embedding paths (label-free) or (emb, label) tuples."""
+    """Return embedding paths, or tuples ending in labels for validation mode."""
+    if args.token_test_embeddings_dir:
+        if not args.secondary_test_embeddings_dir:
+            raise RuntimeError("--token-test-embeddings-dir requires --secondary-test-embeddings-dir")
+        if args.test_targets_dir:
+            pairs = find_trisource_file_pairs(
+                args.test_embeddings_dir,
+                args.secondary_test_embeddings_dir,
+                args.token_test_embeddings_dir,
+                args.test_targets_dir,
+            )
+            if not pairs:
+                raise RuntimeError("No matching tri-source file pairs found.")
+            return pairs
+        pairs = find_trisource_embedding_files(
+            args.test_embeddings_dir,
+            args.secondary_test_embeddings_dir,
+            args.token_test_embeddings_dir,
+        )
+        if not pairs:
+            raise RuntimeError("No matching tri-source .tif files found.")
+        return pairs
+
     if args.secondary_test_embeddings_dir:
         if args.test_targets_dir:
             pairs = find_multisource_file_pairs(
@@ -144,25 +172,51 @@ def resolve_inputs(args):
                 args.test_targets_dir,
             )
             if not pairs:
-                raise RuntimeError("No matching multi-source file pairs found. Check embedding and target dirs.")
+                raise RuntimeError("No matching multi-source file pairs found.")
             return pairs
         pairs = find_multisource_embedding_files(
             args.test_embeddings_dir,
             args.secondary_test_embeddings_dir,
         )
         if not pairs:
-            raise RuntimeError("No matching multi-source .tif files found. Check embedding dirs.")
+            raise RuntimeError("No matching multi-source .tif files found.")
         return pairs
 
     if args.test_targets_dir:
         pairs = find_file_pairs(args.test_embeddings_dir, args.test_targets_dir)
         if not pairs:
-            raise RuntimeError("No matching file pairs found. Check --test-embeddings-dir and --test-targets-dir.")
+            raise RuntimeError("No matching file pairs found.")
         return pairs
     emb_files = find_embedding_files(args.test_embeddings_dir)
     if not emb_files:
         raise RuntimeError(f"No .tif files found in {args.test_embeddings_dir}")
     return emb_files
+
+
+def infer_channels_and_dataset(args, inputs):
+    sample_emb_path = inputs[0][0] if isinstance(inputs[0], tuple) else inputs[0]
+    with rasterio.open(sample_emb_path) as src:
+        n_channels = src.count
+
+    if args.token_test_embeddings_dir:
+        with rasterio.open(inputs[0][1]) as src:
+            pixel_channels = n_channels + src.count
+        with rasterio.open(inputs[0][2]) as src:
+            token_channels = src.count
+        return (pixel_channels, token_channels), PixelTokenEmbeddingDataset
+
+    if args.secondary_test_embeddings_dir:
+        with rasterio.open(inputs[0][1]) as src:
+            n_channels += src.count
+        return n_channels, MultiPixelEmbeddingDataset
+
+    return n_channels, pick_dataset_class(args.model_type or "auto", n_channels)
+
+
+def build_dataset(dataset_cls, inputs, patch_size):
+    if dataset_cls.__name__ == "PixelTokenEmbeddingDataset":
+        return dataset_cls(inputs, patch_size=patch_size, scale_factor=16, is_train=False)
+    return dataset_cls(inputs, patch_size=patch_size, is_train=False)
 
 
 def main():
@@ -174,66 +228,75 @@ def main():
     predictions_dir = args.predictions_dir or os.path.join(exp_dir, "predictions")
     os.makedirs(predictions_dir, exist_ok=True)
 
+    train_cfg, train_config_raw = load_training_config(exp_dir)
+    model_type = args.model_type or train_cfg.get("model_type", "auto")
+
     inputs = resolve_inputs(args)
     if args.max_samples > 0:
         inputs = inputs[:args.max_samples]
 
-    sample_emb_path = inputs[0][0] if isinstance(inputs[0], tuple) else inputs[0]
-    with rasterio.open(sample_emb_path) as src:
-        n_channels = src.count
-    if args.secondary_test_embeddings_dir:
-        with rasterio.open(inputs[0][1]) as src:
-            n_channels += src.count
-
-    DatasetCls = MultiPixelEmbeddingDataset if args.secondary_test_embeddings_dir else pick_dataset_class(args.model_type, n_channels)
-    if DatasetCls.__name__ == "LatentTokenDataset":
-        test_ds = DatasetCls(inputs, patch_size=args.patch_size, scale_factor=16, is_train=False)
-    else:
-        test_ds = DatasetCls(inputs, patch_size=args.patch_size, is_train=False)
-
+    n_channels, dataset_cls = infer_channels_and_dataset(args, inputs)
+    test_ds = build_dataset(dataset_cls, inputs, args.patch_size)
     sample_img, _, _ = test_ds[0]
-    tessera_kwargs = resolve_tessera_model_kwargs(args, exp_dir)
+
     model, selected_model = build_model(
-        args.model_type,
-        n_channels=sample_img.shape[0],
+        model_type,
+        n_channels=input_channels(sample_img),
         n_classes=4,
-        **tessera_kwargs,
+        **model_kwargs_from_run_config(train_cfg),
     )
     model = model.to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
-    print(f"Loaded model: {selected_model} from {model_path} (input channels={sample_img.shape[0]})")
+
+    print(f"Loaded model: {selected_model} from {model_path} (input channels={input_channels(sample_img)})")
     if args.thresholds is not None:
-        print(f"Baking per-class thresholds into output: bld={args.thresholds[0]}, "
+        print(f"Baking thresholds into output: bld={args.thresholds[0]}, "
               f"veg={args.thresholds[1]}, wat={args.thresholds[2]}")
+    views = tta_views(args.tta)
+    if args.tta != "none":
+        print(f"TTA enabled: {args.tta} ({len(views)} views)")
+    print(f"Training config source: {train_cfg.get('_config_source')}")
 
     print(f"Running inference on {len(test_ds)} samples...")
     with torch.no_grad():
         pred_shape = None
         for i in tqdm(range(len(test_ds)), desc="Predicting"):
             img_tensor, _, _ = test_ds[i]
-            img_batch = img_tensor.unsqueeze(0).to(device)
+            img_batch = move_to_device(batched(img_tensor), device)
 
-            output_batch = model(img_batch)
-            pred = output_batch.squeeze().cpu().numpy().astype(np.float32)
-
-            # Model emits height / HEIGHT_NORM_CONSTANT; rescale to meters.
-            pred[3] = pred[3] * HEIGHT_NORM_CONSTANT
-
-            if args.thresholds is not None:
-                for c, t in enumerate(args.thresholds):
-                    pred[c] = (pred[c] > t).astype(np.float32)
+            pred = prediction_to_numpy(
+                predict_batch(model, img_batch, views),
+                thresholds=args.thresholds,
+            )
 
             emb_path = test_ds.file_pairs[i][0]
-            # Submission format keeps the year suffix; val mode normalizes it
-            # away so predictions can be matched to labels by core id.
-            out_id = submission_id(emb_path) if args.test_targets_dir is None else normalize_core_id(emb_path)
+            out_id = prediction_output_id(
+                emb_path,
+                label_mode=args.test_targets_dir is not None,
+            )
             np.save(os.path.join(predictions_dir, f"{out_id}.npy"), pred)
             pred_shape = pred.shape
 
     print(f"Predictions saved to: {predictions_dir}")
     if pred_shape is not None:
         print(f"Output shape per file: {pred_shape}  [building%, veg%, water%, height_m]")
+    prediction_config_path = os.path.join(predictions_dir, "prediction_config.json")
+    write_prediction_config(
+        prediction_config_path,
+        args=args,
+        exp_dir=exp_dir,
+        model_path=model_path,
+        predictions_dir=predictions_dir,
+        selected_model=selected_model,
+        n_channels=n_channels,
+        dataset_cls=dataset_cls,
+        train_cfg=train_cfg,
+        train_config_raw=train_config_raw,
+        sample_count=len(test_ds),
+        pred_shape=pred_shape,
+    )
+    print(f"Prediction config saved to: {prediction_config_path}")
 
 
 if __name__ == "__main__":

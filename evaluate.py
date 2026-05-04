@@ -29,7 +29,7 @@ from core.metrics import (
     binary_iou, compute_weighted_score,
     build_label_map, load_val_ids,
 )
-from core.dataset import normalize_core_id
+from core.data.discovery import normalize_core_id
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
