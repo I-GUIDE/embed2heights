@@ -76,18 +76,18 @@ Pass `splits/split.json` to `train.py` via `--split-file` to reuse it.
 New experiments are constrained to three strategy families. Fork one recipe and
 change only the field you are actively testing.
 
+> **Note:** `--config` YAML loading is not yet wired into `train.py`. Use CLI
+> flags directly (or the provided SLURM scripts). The YAML files in
+> `configs/active/` serve as the canonical parameter reference for each recipe.
+
 ```bash
-python train.py --config configs/active/ae_tessera_gated.yml
-python train.py --config configs/active/xfusion_crosslevel.yml
-python train.py --config configs/active/ae_only_baseline.yml
+# ae_tessera_gated champion (uw_gated_F recipe — see configs/active/uw_gated_F.yml)
+sbatch run_uw_gated_F_5fold.bash        # trains all 5 group-stratified folds
+sbatch run_uw_gated_F_submit.bash       # predict + sweep thresholds + binarize + zip
 ```
 
-Each run writes a merged `resolved_config.yml`, execution metadata, and a
-compact metrics summary under `runs/<experiment_name>/`.
-
 Artifacts go to `runs/<experiment_name>/`: `model_best.pth`, `model_last.pth`,
-`loss_curve.png`, `loss_history.jsonl`, `resolved_config.yml`,
-`run_metadata.json`, `metrics_summary.json`.
+`loss_curve.png`, `loss_history.jsonl`, `training_params.json`.
 
 There is **no multi-baseline driver script** — launch a shell loop or slurm array to sweep over multiple backbones/sources.
 
@@ -138,7 +138,7 @@ python evaluate.py --val-only                     # restrict to each experiment'
 python evaluate.py --pred-threshold 0.3           # non-default prediction binarization
 ```
 
-The metric formulas were reverse-engineered by the 2026-04-17 dummy-probe submission (see [logs/METRIC_PROBE_REPORT.md](logs/METRIC_PROBE_REPORT.md)) and are shared between `evaluate.py` and the `tools/` scripts via `core/metrics.py`.
+The metric formulas are implemented in `core/metrics.py` and shared between `evaluate.py` and the `tools/` scripts.
 
 ### 6. Ensembles & threshold tuning
 
@@ -163,8 +163,9 @@ python tools/make_submission.py \
 
 | Strategy recipe | Purpose | Internal model type |
 |---|---|---|
-| `active/ae_tessera_gated.yml` | Main two-modal AlphaEarth + Tessera line | `ae_tessera_gated` |
-| `active/xfusion_crosslevel.yml` | Main three-modal TerraMind-S2 + AlphaEarth + Tessera line | `xfusion_crosslevel` |
+| `active/uw_gated_F.yml` | **Champion** — simple GMU, 5-fold OOF mean 0.4999, leaderboard ~0.48 | `ae_tessera_gated` |
+| `active/ae_tessera_gated.yml` | Two-modal AlphaEarth + Tessera base config | `ae_tessera_gated` |
+| `active/xfusion_crosslevel.yml` | Three-modal TerraMind-S2 + AlphaEarth + Tessera line | `xfusion_crosslevel` |
 | `active/ae_only_baseline.yml` | Fallback and sanity-check line | `ae_only` |
 
 Live model code is intentionally limited to these active families. Very old

@@ -56,15 +56,14 @@ done
 # ── 2. Ensemble test predictions ───────────────────────────────────────────
 ENSEMBLE_DIR="${SUBMIT_BASE}/uw_gated_F_5fold_ensemble"
 echo "=== [ENSEMBLE test] ==="
-python tools/ensemble_predictions.py \
-    --input-dirs \
+python tools/ensemble.py mean \
+    --inputs \
         "${SUBMIT_BASE}/preds_uwgF_fold0" \
         "${SUBMIT_BASE}/preds_uwgF_fold1" \
         "${SUBMIT_BASE}/preds_uwgF_fold2" \
         "${SUBMIT_BASE}/preds_uwgF_fold3" \
         "${SUBMIT_BASE}/preds_uwgF_fold4" \
-    --output-dir "$ENSEMBLE_DIR" \
-    --expected-count 946
+    --output-dir "$ENSEMBLE_DIR"
 
 # ── 3. Predict val (OOF, paired) per fold for threshold sweep ──────────────
 for FOLD in 0 1 2 3 4; do
