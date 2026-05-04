@@ -562,12 +562,8 @@ class MultiTaskPredictionHead(nn.Module):
         height_presence_prob = torch.sigmoid(alpha_presence_logits)
         p_b = height_presence_prob[:, 0:1, :, :]
         p_v = height_presence_prob[:, 1:2, :, :]
-        if self.use_bkg:
-            # Calibrated "any non-bkg present" from the simplex; replaces the
-            # independence-product 1 - (1-p_b)(1-p_v) in the no-bkg path.
-            p_fg = (1.0 - fractions[:, 3:4, :, :]).clamp(0.0, 1.0)
-        else:
-            p_fg = 1.0 - (1.0 - p_b) * (1.0 - p_v)           # P(any of {b,v} present)
+        
+        p_fg = 1.0 - (1.0 - p_b) * (1.0 - p_v)           # P(any of {b,v} present)
         denom = p_b + p_v + 1e-6
         w_b = p_b / denom
         w_v = p_v / denom
