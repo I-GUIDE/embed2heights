@@ -54,6 +54,8 @@ configs/
 *.sbatch
 !sample.sbatch
 *.out
+run_uw_gated_F_submit.bash
+run_uw_gated_F_seeds.bash
 
 tools/plot*
 

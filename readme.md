@@ -107,13 +107,6 @@ The leaderboard requires **binarized** predictions (ch0-2 as `{0, 1}`, ch3 conti
 Binarization at the right thresholds is what compresses the zip from ~879 MB → ~221 MB.
 
 ```bash
-# Full 5-fold submission pipeline (predict test + sweep thresholds + binarize + zip)
-sbatch run_uw_gated_F_submit.bash
-```
-
-Or manually:
-
-```bash
 # 1. Ensemble test predictions
 python tools/ensemble.py mean \
     --inputs runs/fold0/test_preds runs/fold1/test_preds ... \
