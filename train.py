@@ -184,6 +184,10 @@ def parse_args():
     p.add_argument("--epochs",         type=int,   default=DEFAULTS["epochs"])
     p.add_argument("--lr",             type=float, default=DEFAULTS["lr"])
     p.add_argument("--weight-decay",   type=float, default=DEFAULTS["weight_decay"])
+    p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
+                   help="Apply torch.compile(mode='default') + channels_last + high matmul "
+                        "precision. Balanced speedup (~20-30%%) without the long kernel search "
+                        "of max-autotune. Requires PyTorch >= 2.0.")
     p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=DEFAULTS["amp"],
                    help="Use CUDA automatic mixed precision when available.")
     p.add_argument("--data-parallel", action="store_true",
@@ -742,6 +746,7 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "presence_tversky_weight": args.presence_tversky_weight,
         "fraction_mae_weight": args.fraction_mae_weight,
         "amp":             use_amp,
+        "compile":         getattr(args, "compile", False),
         "data_parallel":   args.data_parallel,
         "grad_accum":      args.grad_accum_steps,
         "num_workers":     args.num_workers,
@@ -945,6 +950,11 @@ def main():
             strict=args.init_pretrain_strict,
         )
     model = model.to(device)
+    if getattr(args, "compile", False) and device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+        model = model.to(memory_format=torch.channels_last)
+        model = torch.compile(model, mode="default")
+        print("torch.compile enabled (mode='default')")
     if args.data_parallel:
         if device.type != "cuda" or torch.cuda.device_count() < 2:
             print(
