@@ -72,6 +72,8 @@ MODEL_CHOICES = [
     "tessera_token_crosslevel_xattn_bottleneck",
     "tessera_token_crosslevel_xattn_decoder64",
     "tessera_token_crosslevel_xattn_bottleneck_decoder64",
+    # Active strategy aliases (registry.py)
+    "ae_only", "ae_tessera_gated", "xfusion_crosslevel",
 ]
 LOSS_PRESET_CHOICES = ["auto", "current", "no_ssim_grad", "presence_centered"]
 
