@@ -977,25 +977,19 @@ def main():
     resolved_loss_preset = resolve_loss_preset(args)
     loss_lambdas = effective_loss_lambdas(args)
     criterion = ImprovedCompositeLoss(
-        lambdas=loss_lambdas,
+        weight_mae=loss_lambdas[0],
+        weight_height_boost=loss_lambdas[3],
         aux_weight=args.aux_weight,
         loss_preset=resolved_loss_preset,
-        presence_tversky_weight=args.presence_tversky_weight,
-        fraction_mae_weight=args.fraction_mae_weight,
+        weight_presence_tversky=args.presence_tversky_weight,
+        weight_fraction_mae=args.fraction_mae_weight,
         height_loss_kind=args.height_loss_kind,
         huber_delta=args.huber_delta,
         build_height_boost=args.build_height_boost,
         veg_height_boost=args.veg_height_boost,
         aux_veg_weight=args.aux_veg_weight,
-        iou_loss_kind=args.iou_loss_kind,
-        focal_gamma=args.focal_gamma,
-        focal_alpha=args.focal_alpha,
         height_bin_aux_weight=args.height_bin_aux_weight,
         height_bin_sigma_bins=args.height_bin_sigma_bins,
-        building_smooth_weight=args.building_smooth_weight,
-        building_smooth_erode_px=args.building_smooth_erode_px,
-        building_smooth_thr=args.building_smooth_thr,
-        task=args.task,
     ).to(device)
     print(
         "Using loss: "
