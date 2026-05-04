@@ -246,7 +246,19 @@ def main():
         **model_kwargs_from_run_config(train_cfg),
     )
     model = model.to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    raw_sd = torch.load(model_path, map_location=device)
+    # Remap legacy key names: UpsampleBlock renamed self.norm → self.bn
+    sd = {k.replace(".norm.", ".bn."): v for k, v in raw_sd.items()}
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    if unexpected:
+        print(f"  WARN: {len(unexpected)} unexpected checkpoint keys (ignored): {unexpected[:3]}...")
+    if missing:
+        bn_missing = [k for k in missing if "running_mean" in k or "running_var" in k or "num_batches" in k]
+        other_missing = [k for k in missing if k not in bn_missing]
+        if bn_missing:
+            print(f"  INFO: {len(bn_missing)} BN running-stat keys not in checkpoint (legacy GroupNorm ckpt) — using defaults")
+        if other_missing:
+            print(f"  WARN: {len(other_missing)} non-stat keys missing: {other_missing[:3]}...")
     model.eval()
 
     print(f"Loaded model: {selected_model} from {model_path} (input channels={input_channels(sample_img)})")

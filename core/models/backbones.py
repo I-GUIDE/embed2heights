@@ -20,10 +20,10 @@ class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels, norm_kind="bn"):
         super().__init__()
         self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
             _light_norm(out_channels, norm_kind),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
             _light_norm(out_channels, norm_kind),
             nn.ReLU(inplace=True),
         )
@@ -36,7 +36,7 @@ class UpsampleBlock(nn.Module):
     def __init__(self, in_channels, out_channels, norm_kind="bn"):
         super().__init__()
         self.upsample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
         self.bn = _light_norm(out_channels, norm_kind)
         self.act = nn.ReLU(inplace=True)
 
