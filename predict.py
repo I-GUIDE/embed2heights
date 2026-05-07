@@ -247,6 +247,8 @@ def main():
     )
     model = model.to(device)
     raw_sd = torch.load(model_path, map_location=device)
+    # Strip torch.compile's _orig_mod. prefix if present (compiled checkpoint)
+    raw_sd = {k.removeprefix("_orig_mod."): v for k, v in raw_sd.items()}
     # Remap legacy key names: UpsampleBlock renamed self.norm → self.bn
     sd = {k.replace(".norm.", ".bn."): v for k, v in raw_sd.items()}
     missing, unexpected = model.load_state_dict(sd, strict=False)
