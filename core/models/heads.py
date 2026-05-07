@@ -349,10 +349,11 @@ class MultiTaskPredictionHead(nn.Module):
         p_b = height_presence_prob[:, 0:1, :, :]
         p_v = height_presence_prob[:, 1:2, :, :]
         p_fg = 1.0 - (1.0 - p_b) * (1.0 - p_v)           # P(any of {b,v} present)
-        denom = p_b + p_v + 1e-6
-        w_b = p_b / denom
-        w_v = p_v / denom
-        h_fg = w_b * building_height + w_v * vegetation_height
+        # denom = p_b + p_v + 1e-6
+        # w_b = p_b / denom
+        # w_v = p_v / denom
+        # h_fg = w_b * building_height + w_v * vegetation_height
+        h_fg = torch.max(building_height, vegetation_height)
         height = p_fg * h_fg + (1.0 - p_fg) * base_height
 
         # Submission: channels 0-2 are presence_prob (binary-aligned),
