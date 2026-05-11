@@ -73,7 +73,8 @@ MODEL_CHOICES = [
     "tessera_token_crosslevel_xattn_decoder64",
     "tessera_token_crosslevel_xattn_bottleneck_decoder64",
     # Active strategy aliases (registry.py)
-    "ae_only", "ae_tessera_gated", "xfusion_crosslevel",
+    "ae_only", "ae_tessera", "ae_tessera_gated", "ae_tessera_crossattn",
+    "xfusion_crosslevel",
 ]
 LOSS_PRESET_CHOICES = ["auto", "current", "no_ssim_grad", "presence_centered"]
 
@@ -169,9 +170,16 @@ def parse_args():
     p.add_argument("--tessera-hidden-depth", type=int, default=0,
                    help="Extra hidden 3x3 blocks inside the Tessera compressor. Increases "
                         "parameters without changing --tessera-presence-ch.")
-    p.add_argument("--gate-mode", choices=["simple", "rich"], default="simple",
-                   help="Fusion gate variant for tessera_iou_fusion_gated: simple = 1x1 "
-                        "conv, rich = Conv1x1 -> GN -> GELU -> Conv1x1.")
+    p.add_argument("--gate-mode",
+                   choices=["simple", "rich", "concat_mlp", "gated_mlp_residual",
+                            "addmul", "film"],
+                   default="simple",
+                   help="Fusion mode for tessera_iou_fusion_gated. simple/rich = "
+                        "tied sigmoid gate g·A+(1-g)·B (1x1 conv vs MLP gate). "
+                        "concat_mlp = full nonlinear MLP fusion (no gate). "
+                        "gated_mlp_residual = g·MLP(concat)+(1-g)·A. "
+                        "addmul = g_add·A+(1-g_add)·B + g_mul·(A⊙B) with multiplicative term. "
+                        "film = γ·A + β where γ,β are learned from B.")
     p.add_argument("--gate-untied", action="store_true",
                    help="Use untied gates (G_AE and G_TES independent) instead of tied "
                         "G/(1-G). Strictly more expressive (GMU Figure 2a).")
@@ -182,6 +190,42 @@ def parse_args():
                    help="Per-sample probability of zeroing the Tessera feature stream "
                         "during training. Inverted-dropout scaling. Keeps the AE branch "
                         "self-sufficient.")
+    p.add_argument("--geom-aug", action="store_true",
+                   help="Apply random D4 (h-flip/v-flip/transpose) augmentation to "
+                        "training patches. Only wired into PixelEmbeddingDataset and "
+                        "MultiPixelEmbeddingDataset (AE-only / AE+Tessera pixel paths).")
+    p.add_argument("--bidirectional-ctask", action="store_true",
+                   help="Enable bidirectional cross-task attention in ae_tessera_gated: "
+                        "height trunk features gate the presence head input via a "
+                        "zero-initialized 1x1 conv (identity at init, learned gate). "
+                        "No effect on ae_tessera_crossattn or ae_only.")
+    p.add_argument("--dual-presence", action="store_true",
+                   help="Add a parallel auxiliary presence branch (T-SwinUNet style). "
+                        "It runs on the bare shared trunk features (no FiLM, no bidir, "
+                        "no Tessera residual) and is supervised by the same BCE+Tversky. "
+                        "Pair with --dual-presence-consistency-weight to enable an "
+                        "IoU consistency loss between main and aux presence.")
+    p.add_argument("--ae-only-deep-sup-weight", type=float, default=0.0,
+                   help="Weight on CMGFNet-style deep supervision: a parallel "
+                        "lightweight head on pre-fusion AE features predicts 4 "
+                        "channels (presence + height) and is supervised with the "
+                        "same BCE+Tversky+height losses. 0.0 disables (no aux head "
+                        "is created in the model).")
+    p.add_argument("--dual-presence-consistency-weight", type=float, default=0.0,
+                   help="Weight for the soft-IoU consistency loss between main and "
+                        "aux presence outputs. 0.0 disables the consistency term "
+                        "(but the aux branch is still trained if --dual-presence is on).")
+    p.add_argument("--height-blend-mode", default="presence_gated",
+                   choices=["presence_gated", "max"],
+                   help="How to blend per-class height specialists into the submitted "
+                        "height channel. 'presence_gated' (legacy) = presence-weighted "
+                        "convex blend with base_height fallback. 'max' = "
+                        "max(building, vegetation, base) per pixel; decouples height "
+                        "from presence calibration so a confident specialist routes "
+                        "the pixel even if the presence head is uncertain.")
+    p.add_argument("--crossattn-n-heads", type=int, default=4,
+                   help="Number of attention heads for ae_tessera_crossattn bottleneck "
+                        "cross-attention. embed_dim=base_ch*8 must be divisible by this.")
     p.add_argument("--train-targets-dir",    default=DEFAULT_TRAIN_TAR)
     p.add_argument("--experiment-name",      default=DEFAULTS["experiment_name"])
     p.add_argument("--batch-size",     type=int,   default=DEFAULTS["batch_size"])
@@ -219,9 +263,12 @@ def parse_args():
                    default=DEFAULTS["fraction_mae_weight"],
                    help="Weak fraction MAE weight in --loss-preset presence_centered.")
     p.add_argument("--height-loss-kind", default="l1",
-                   choices=["l1", "huber", "mse"],
+                   choices=["l1", "huber", "mse", "berhu"],
                    help="Regression loss used for height_boost and aux class-height "
-                        "supervision. Default l1 matches legacy behavior.")
+                        "supervision. Default l1 matches legacy behavior. berhu = "
+                        "reverse Huber: L1 for small errors, quadratic for large ones "
+                        "(c = 0.2 * max per batch). Penalizes building-edge residuals "
+                        "more than L1 without the instability of pure MSE.")
     p.add_argument("--huber-delta", type=float, default=1.0,
                    help="Transition point for --height-loss-kind huber.")
     p.add_argument("--build-height-boost", type=float, default=5.0,
@@ -631,7 +678,12 @@ def make_dataloaders(args, device):
         train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, scale_factor=16, is_train=True)
         val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, scale_factor=16, is_train=False)
     else:
-        train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, is_train=True)
+        train_ds = DatasetCls(
+            train_pairs,
+            patch_size=args.patch_size,
+            is_train=True,
+            geom_aug=getattr(args, "geom_aug", False),
+        )
         val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, is_train=False)
 
     loader_kwargs = {
@@ -795,6 +847,11 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "gate_untied":         args.gate_untied,
         "gate_init_bias":      args.gate_init_bias,
         "modality_dropout":    args.modality_dropout,
+        "bidirectional_ctask": args.bidirectional_ctask,
+        "height_blend_mode":   args.height_blend_mode,
+        "dual_presence":       args.dual_presence,
+        "dual_presence_consistency_weight": args.dual_presence_consistency_weight,
+        "ae_only_deep_sup_weight": args.ae_only_deep_sup_weight,
         "height_loss_kind":    args.height_loss_kind,
         "huber_delta":         args.huber_delta,
         "build_height_boost":  args.build_height_boost,
@@ -947,6 +1004,11 @@ def main():
         gate_untied=args.gate_untied,
         gate_init_bias=args.gate_init_bias,
         modality_dropout=args.modality_dropout,
+        bidirectional_ctask=args.bidirectional_ctask,
+        crossattn_n_heads=args.crossattn_n_heads,
+        height_blend_mode=args.height_blend_mode,
+        dual_presence=args.dual_presence,
+        ae_only_supervision=(args.ae_only_deep_sup_weight > 0.0),
     )
     if args.init_from_pretrain:
         load_pretrain_weights(
@@ -990,6 +1052,8 @@ def main():
         aux_veg_weight=args.aux_veg_weight,
         height_bin_aux_weight=args.height_bin_aux_weight,
         height_bin_sigma_bins=args.height_bin_sigma_bins,
+        dual_presence_consistency_weight=args.dual_presence_consistency_weight,
+        ae_only_deep_sup_weight=args.ae_only_deep_sup_weight,
     ).to(device)
     print(
         "Using loss: "
