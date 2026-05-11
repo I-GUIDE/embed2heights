@@ -24,12 +24,14 @@ class ImprovedCompositeLoss(nn.Module):
                  height_loss_kind="l1", huber_delta=1.0,
                  build_height_boost=5.0, veg_height_boost=0.0,
                  aux_veg_weight=1.0, height_bin_aux_weight=0.0,
-                 height_bin_sigma_bins=1.5):
+                 height_bin_sigma_bins=1.5,
+                 dual_presence_consistency_weight=0.0,
+                 ae_only_deep_sup_weight=0.0):
         super().__init__()
         if loss_preset != "presence_centered":
             raise ValueError("loss_preset must be presence_centered")
-        if height_loss_kind not in {"l1", "huber", "mse"}:
-            raise ValueError("height_loss_kind must be one of: l1, huber, mse")
+        if height_loss_kind not in {"l1", "huber", "mse", "berhu"}:
+            raise ValueError("height_loss_kind must be one of: l1, huber, mse, berhu")
         self.loss_preset = loss_preset
         self.ssim = SSIMLoss(window_size=11)
         self.gdl = GradientDifferenceLoss()
@@ -52,6 +54,8 @@ class ImprovedCompositeLoss(nn.Module):
         self.aux_veg_weight = float(aux_veg_weight)
         self.height_bin_aux_weight = float(height_bin_aux_weight)
         self.height_bin_sigma_bins = float(height_bin_sigma_bins)
+        self.dual_presence_consistency_weight = float(dual_presence_consistency_weight)
+        self.ae_only_deep_sup_weight = float(ae_only_deep_sup_weight)
 
         self.task = "both"
         self.train_presence = True
@@ -60,12 +64,13 @@ class ImprovedCompositeLoss(nn.Module):
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
         self.fraction_mae_weights = torch.tensor([1.0, 1.0, 1.0]).float()
 
-    def _height_err(self, pred, target):
+    def _height_err(self, pred, target, valid_mask=None):
         return height_error(
             pred,
             target,
             kind=self.height_loss_kind,
             huber_delta=self.huber_delta,
+            valid_mask=valid_mask,
         )
 
     def _height_bin_ce(self, logits, target_norm, mask, log_centers):
@@ -153,7 +158,9 @@ class ImprovedCompositeLoss(nn.Module):
 
         build_presence_mask = (targets[:, 0, :, :] > 0.1).float() * height_1ch
         veg_presence_mask = (targets[:, 1, :, :] > 0.1).float() * height_1ch
-        height_err = self._height_err(preds[:, 3, :, :], targets[:, 3, :, :]) * height_1ch
+        height_err = self._height_err(
+            preds[:, 3, :, :], targets[:, 3, :, :], valid_mask=height_1ch
+        ) * height_1ch
 
         height_valid_count = torch.sum(height_1ch) + 1e-6
         per_pixel_weight = (1.0 + self.build_height_boost * build_presence_mask
@@ -228,7 +235,7 @@ class ImprovedCompositeLoss(nn.Module):
             veg_height_mask = (targets[:, 1:2, :, :] > 0).float() * height_mask
 
             def masked_height(pred, target, mask):
-                err = self._height_err(pred, target)
+                err = self._height_err(pred, target, valid_mask=mask)
                 return torch.sum(err * mask) / (torch.sum(mask) + 1e-6)
 
             if "height_building" in aux_outputs:
@@ -255,6 +262,76 @@ class ImprovedCompositeLoss(nn.Module):
                 presence_loss_active + aux_height_building_active
                 + self.aux_veg_weight * aux_height_vegetation_active
             ) + self.presence_tversky_weight * presence_tversky_active
+
+        # ── Dual-presence consistency (T-SwinUNet style) ─────────────────
+        # When the head exposes a parallel auxiliary presence branch, supervise
+        # it with the same BCE+Tversky AND add a soft-IoU consistency term
+        # between sigmoid(main) and sigmoid(aux). Regularizes the main head by
+        # forcing it to agree with a less-equipped sibling.
+        dual_aux_bce_loss = zero
+        dual_aux_tversky_loss = zero
+        dual_consistency_loss = zero
+        if (aux_outputs is not None
+                and aux_outputs.get("presence_logits_aux") is not None
+                and self.train_presence):
+            aux_logits = aux_outputs["presence_logits_aux"]
+            main_logits = aux_outputs["presence_logits"]
+
+            # Supervise the aux branch with the same losses as main.
+            dual_aux_bce_loss = masked_presence_bce(aux_logits)
+            aux_prob_full = torch.sigmoid(aux_logits)
+            ap_b = self.tversky(aux_prob_full[:, 0, :, :], presence_target[:, 0, :, :], valid_mask=gm_bool)
+            ap_v = self.tversky(aux_prob_full[:, 1, :, :], presence_target[:, 1, :, :], valid_mask=gm_bool)
+            ap_w = self.tversky(aux_prob_full[:, 2, :, :], presence_target[:, 2, :, :], valid_mask=gm_bool)
+            dual_aux_tversky_loss = (ap_b + ap_v + ap_w) / 3.0
+
+            # Soft-IoU consistency between main and aux, averaged over classes.
+            main_prob = torch.sigmoid(main_logits)
+            aux_prob = aux_prob_full
+            mask = gm_bool.float().unsqueeze(1) if gm_bool.dim() == 3 else gm_bool.float()
+            inter = (main_prob * aux_prob * mask).sum(dim=(2, 3))
+            mp = (main_prob * mask).sum(dim=(2, 3))
+            ap = (aux_prob * mask).sum(dim=(2, 3))
+            iou = inter / (mp + ap - inter + 1e-6)
+            dual_consistency_loss = (1.0 - iou).mean()
+
+            total_loss = (
+                total_loss
+                + self.aux_weight * (dual_aux_bce_loss + dual_aux_tversky_loss)
+                + self.dual_presence_consistency_weight * dual_consistency_loss
+            )
+
+        # ── AE-only deep supervision (CMGFNet L_RGB) ──────────────────────
+        # Supervise a parallel light prediction head on pre-fusion AE features
+        # with same BCE+Tversky (presence) and the same masked height loss.
+        ae_only_bce_loss = zero
+        ae_only_tversky_loss = zero
+        ae_only_height_loss = zero
+        if (aux_outputs is not None
+                and aux_outputs.get("ae_only_logits") is not None
+                and self.ae_only_deep_sup_weight > 0.0):
+            ae_logits_full = aux_outputs["ae_only_logits"]
+            ae_pres_logits = ae_logits_full[:, :3, :, :]
+            ae_height_logits = ae_logits_full[:, 3:4, :, :]
+
+            if self.train_presence:
+                ae_only_bce_loss = masked_presence_bce(ae_pres_logits)
+                ae_pres_prob = torch.sigmoid(ae_pres_logits)
+                ap_b = self.tversky(ae_pres_prob[:, 0, :, :], presence_target[:, 0, :, :], valid_mask=gm_bool)
+                ap_v = self.tversky(ae_pres_prob[:, 1, :, :], presence_target[:, 1, :, :], valid_mask=gm_bool)
+                ap_w = self.tversky(ae_pres_prob[:, 2, :, :], presence_target[:, 2, :, :], valid_mask=gm_bool)
+                ae_only_tversky_loss = (ap_b + ap_v + ap_w) / 3.0
+            if self.train_height:
+                # Softplus on logit so heights are non-negative, like main head.
+                ae_height_pred = F.softplus(ae_height_logits, threshold=20.0)
+                ae_only_height_err = self._height_err(
+                    ae_height_pred, target_height, valid_mask=height_mask
+                )
+                ae_only_height_loss = (ae_only_height_err * height_mask).sum() / (height_mask.sum() + 1e-6)
+
+            total_loss = total_loss + self.ae_only_deep_sup_weight * (
+                ae_only_bce_loss + ae_only_tversky_loss + ae_only_height_loss
+            )
 
         height_bin_ce_loss = zero
         if (aux_outputs is not None
@@ -309,5 +386,8 @@ class ImprovedCompositeLoss(nn.Module):
             "weighted_presence_tversky": w_ptv * presence_tversky_loss,
             "weighted_aux_height": w_axh * aux_height_loss,
             "weighted_height_bin_ce": w_bince * height_bin_ce_loss,
+            "dual_aux_bce": dual_aux_bce_loss,
+            "dual_aux_tversky": dual_aux_tversky_loss,
+            "dual_consistency": dual_consistency_loss,
         }
         return total_loss, components

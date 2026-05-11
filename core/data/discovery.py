@@ -6,7 +6,7 @@ import os
 import re
 
 
-_EMB_PREFIXES = ("gee_emb_", "tessera_emb_", "emb_", "s2_", "s1_")
+_EMB_PREFIXES = ("gee_emb_", "tessera_emb_", "tokens_", "emb_", "s2_", "s1_")
 _EMB_SUFFIXES = ("_embedding", "_embeddings", "_quantized", "_merged")
 _YEAR_RE = re.compile(r"_\d{4}$")
 

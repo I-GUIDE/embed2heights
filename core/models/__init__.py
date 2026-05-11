@@ -27,8 +27,10 @@ from .blocks import (
 from .backbones import DoubleConv, LightUNet, UpsampleBlock, _light_norm
 from .heads import MultiTaskPredictionHead
 from .pixel_fusion import (
+    TesseraCrossAttnLightUNet,
     TesseraCompressionStem,
     TesseraIoUFusionGatedLightUNet,
+    TesseraIoUFusionLightUNet,
     _apply_fusion_gate,
     _build_fusion_gate,
     _maybe_drop_modality,
@@ -52,8 +54,10 @@ __all__ = [
     "HEIGHT_NORM_CONSTANT",
     "LightUNet",
     "MultiTaskPredictionHead",
+    "TesseraCrossAttnLightUNet",
     "TesseraCompressionStem",
     "TesseraIoUFusionGatedLightUNet",
+    "TesseraIoUFusionLightUNet",
     "TesseraTokenCrossLevelFusionLightUNet",
     "TokenPyramidNeck",
     "TokenPyramidProvider",

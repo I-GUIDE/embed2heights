@@ -5,13 +5,20 @@ variants are recorded in logs rather than kept as live code.
 """
 
 from .backbones import LightUNet
-from .pixel_fusion import TesseraIoUFusionGatedLightUNet
+from .pixel_fusion import (
+    TesseraCrossAttnLightUNet,
+    TesseraIoUFusionGatedLightUNet,
+    TesseraIoUFusionLightUNet,
+)
 from .token_fusion import TesseraTokenCrossLevelFusionLightUNet
 
 
 ACTIVE_MODEL_ALIASES = {
     "ae_only": "lightunet",
+    # ae_tessera: the proven un-gated architecture (Tessera → presence head only)
+    "ae_tessera": "tessera_iou_fusion",
     "ae_tessera_gated": "tessera_iou_fusion_gated",
+    "ae_tessera_crossattn": "tessera_crossattn_bottleneck",
     "xfusion_crosslevel": "tessera_token_crosslevel_s2_decoder64_presence_3way_deep",
 }
 
@@ -43,7 +50,12 @@ def build_active_model(model_type, n_channels, n_classes, *,
                        modality_dropout=0.0,
                        presence_head_kind="shared",
                        presence_head_depth=1,
-                       presence_branch_ch=None):
+                       presence_branch_ch=None,
+                       bidirectional_ctask=False,
+                       crossattn_n_heads=4,
+                       height_blend_mode="presence_gated",
+                       dual_presence=False,
+                       ae_only_supervision=False):
     selected = canonical_model_type(model_type)
     if selected not in ACTIVE_MODEL_TYPES:
         return None
@@ -59,11 +71,46 @@ def build_active_model(model_type, n_channels, n_classes, *,
             selected,
         )
 
-    if selected == "tessera_iou_fusion_gated":
+    if selected == "tessera_iou_fusion":
         return (
-            TesseraIoUFusionGatedLightUNet(
+            TesseraIoUFusionLightUNet(
                 n_channels=n_channels,
                 n_classes=n_classes,
+                tessera_presence_ch=tessera_presence_ch,
+                tessera_hidden_ch=tessera_hidden_ch,
+                tessera_hidden_depth=tessera_hidden_depth,
+                height_specialist_depth=height_specialist_depth,
+                base_ch=lightunet_base_ch,
+                height_gate_source=height_gate_source,
+                height_hidden_ch=height_hidden_ch,
+                height_trunk_depth=height_trunk_depth,
+                height_independent_branches=height_independent_branches,
+                height_head_kind=height_head_kind,
+                height_n_bins=height_n_bins,
+                height_bin_max_m=height_bin_max_m,
+                norm_kind=lightunet_norm_kind,
+                presence_head_kind=presence_head_kind,
+                presence_head_depth=presence_head_depth,
+                presence_branch_ch=presence_branch_ch,
+                bidirectional_ctask=bidirectional_ctask,
+                height_blend_mode=height_blend_mode,
+                dual_presence=dual_presence,
+            ),
+            selected,
+        )
+
+    if selected == "tessera_iou_fusion_gated":
+        # n_channels may be int (pixel-only) or (pixel_channels, token_channels)
+        # when --token-train-embeddings-dir is supplied. Route accordingly.
+        if isinstance(n_channels, (tuple, list)):
+            _pixel_channels, _token_channels = n_channels
+        else:
+            _pixel_channels, _token_channels = n_channels, 0
+        return (
+            TesseraIoUFusionGatedLightUNet(
+                n_channels=_pixel_channels,
+                n_classes=n_classes,
+                token_channels=_token_channels,
                 tessera_presence_ch=tessera_presence_ch,
                 tessera_hidden_ch=tessera_hidden_ch,
                 tessera_hidden_depth=tessera_hidden_depth,
@@ -72,6 +119,36 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 gate_mode=gate_mode,
                 gate_untied=gate_untied,
                 gate_init_bias=gate_init_bias,
+                modality_dropout=modality_dropout,
+                height_gate_source=height_gate_source,
+                height_hidden_ch=height_hidden_ch,
+                height_trunk_depth=height_trunk_depth,
+                height_independent_branches=height_independent_branches,
+                height_head_kind=height_head_kind,
+                height_n_bins=height_n_bins,
+                height_bin_max_m=height_bin_max_m,
+                norm_kind=lightunet_norm_kind,
+                presence_head_kind=presence_head_kind,
+                presence_head_depth=presence_head_depth,
+                presence_branch_ch=presence_branch_ch,
+                bidirectional_ctask=bidirectional_ctask,
+                height_blend_mode=height_blend_mode,
+                dual_presence=dual_presence,
+                ae_only_supervision=ae_only_supervision,
+            ),
+            selected,
+        )
+
+    if selected == "tessera_crossattn_bottleneck":
+        return (
+            TesseraCrossAttnLightUNet(
+                n_channels=n_channels,
+                n_classes=n_classes,
+                tessera_hidden_ch=tessera_hidden_ch,
+                tessera_hidden_depth=tessera_hidden_depth,
+                height_specialist_depth=height_specialist_depth,
+                base_ch=lightunet_base_ch,
+                n_heads=crossattn_n_heads,
                 modality_dropout=modality_dropout,
                 height_gate_source=height_gate_source,
                 height_hidden_ch=height_hidden_ch,

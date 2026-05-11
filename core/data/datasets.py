@@ -12,9 +12,11 @@ HEIGHT_NORM_CONSTANT = 30.0
 # receives a token tensor through PixelTokenEmbeddingDataset.
 PIXEL_MODEL_TYPES = (
     "ae_only",
+    "ae_tessera",
     "ae_tessera_gated",
     "xfusion_crosslevel",
     "lightunet",
+    "tessera_iou_fusion",
     "tessera_iou_fusion_gated",
     "tessera_token_crosslevel_s2_decoder64_presence_3way_deep",
 )
@@ -81,6 +83,27 @@ def _sample_or_center_origin(height, width, crop_size, is_train):
     return (height - crop_size) // 2, (width - crop_size) // 2
 
 
+def _apply_d4_aug(*arrays):
+    """Random D4 (dihedral) transform applied consistently to every input.
+
+    Inputs are CHW float arrays sharing (H, W). Combines independent h-flip,
+    v-flip, and transpose to cover all 8 lattice symmetries — valid for
+    height regression because per-pixel scalar height is rotation/flip
+    invariant.
+    """
+    flags = np.random.randint(0, 2, size=3)
+    out = []
+    for a in arrays:
+        if flags[0]:
+            a = a[..., ::-1]
+        if flags[1]:
+            a = a[..., ::-1, :]
+        if flags[2]:
+            a = a.swapaxes(-2, -1)
+        out.append(np.ascontiguousarray(a))
+    return tuple(out)
+
+
 def pick_dataset_class(model_type, n_channels):
     """Resolve (model_type, n_channels) to the right Dataset subclass.
 
@@ -119,9 +142,10 @@ class PixelEmbeddingDataset(Dataset):
     For pixel-level embeddings (AlphaEarth 64ch, Tessera 128ch).
     file_pairs: list of (emb_path, label_path) tuples, OR list of emb_path strings (label-free mode).
     """
-    def __init__(self, file_pairs, patch_size=128, is_train=True):
+    def __init__(self, file_pairs, patch_size=128, is_train=True, geom_aug=False):
         self.patch_size = patch_size
         self.is_train = is_train
+        self.geom_aug = bool(geom_aug)
         if file_pairs and isinstance(file_pairs[0], str):
             self.file_pairs = [(p, None) for p in file_pairs]
         else:
@@ -150,6 +174,9 @@ class PixelEmbeddingDataset(Dataset):
         target = _crop_chw(target, top, left, self.patch_size)
         valid_mask = _crop_chw(valid_mask, top, left, self.patch_size)
 
+        if self.is_train and self.geom_aug:
+            image, target, valid_mask = _apply_d4_aug(image, target, valid_mask)
+
         return torch.from_numpy(image), torch.from_numpy(target), torch.from_numpy(valid_mask)
 
 
@@ -162,9 +189,10 @@ class MultiPixelEmbeddingDataset(Dataset):
       - (primary_emb_path, secondary_emb_path, label_path)
       - (primary_emb_path, secondary_emb_path) for label-free inference
     """
-    def __init__(self, file_pairs, patch_size=128, is_train=True):
+    def __init__(self, file_pairs, patch_size=128, is_train=True, geom_aug=False):
         self.patch_size = patch_size
         self.is_train = is_train
+        self.geom_aug = bool(geom_aug)
         self.file_pairs = file_pairs
 
     def __len__(self):
@@ -199,6 +227,9 @@ class MultiPixelEmbeddingDataset(Dataset):
         image = _crop_chw(image, top, left, self.patch_size)
         target = _crop_chw(target, top, left, self.patch_size)
         valid_mask = _crop_chw(valid_mask, top, left, self.patch_size)
+
+        if self.is_train and self.geom_aug:
+            image, target, valid_mask = _apply_d4_aug(image, target, valid_mask)
 
         return torch.from_numpy(image), torch.from_numpy(target), torch.from_numpy(valid_mask)
 

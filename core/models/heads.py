@@ -45,7 +45,9 @@ class MultiTaskPredictionHead(nn.Module):
                  height_trunk_depth=2, height_independent_branches=False,
                  height_head_kind="linear", height_n_bins=64,
                  height_bin_max_m=80.0, presence_head_kind="shared",
-                 presence_head_depth=1, presence_branch_ch=None):
+                 presence_head_depth=1, presence_branch_ch=None,
+                 bidirectional_ctask=False, height_blend_mode="presence_gated",
+                 dual_presence=False):
         super().__init__()
         if out_channels != 4:
             raise ValueError("MultiTaskPredictionHead assumes 4 output channels")
@@ -53,6 +55,8 @@ class MultiTaskPredictionHead(nn.Module):
             raise ValueError("height_gate_source must be one of: alpha, fused")
         if height_head_kind not in {"linear", "softbin"}:
             raise ValueError("height_head_kind must be one of: linear, softbin")
+        if height_blend_mode not in {"presence_gated", "max"}:
+            raise ValueError("height_blend_mode must be one of: presence_gated, max")
         if presence_head_kind not in {"shared", "split_water", "split_all", "shared_split_all"}:
             raise ValueError(
                 "presence_head_kind must be one of: shared, split_water, "
@@ -75,6 +79,9 @@ class MultiTaskPredictionHead(nn.Module):
         self.height_head_kind = height_head_kind
         self.height_n_bins = int(height_n_bins) if height_head_kind == "softbin" else 0
         self.height_bin_max_m = float(height_bin_max_m)
+        self.bidirectional_ctask = bool(bidirectional_ctask)
+        self.height_blend_mode = height_blend_mode
+        self.dual_presence = bool(dual_presence)
 
         # --- Deeper shared trunk: 2 layers + residual ---
         self.shared = nn.Sequential(
@@ -87,6 +94,15 @@ class MultiTaskPredictionHead(nn.Module):
             nn.GroupNorm(_group_count(hidden_ch), hidden_ch),
         )
         self.shared_act = nn.GELU()
+
+        # --- Bidirectional cross-task gate: height trunk → presence features ---
+        height_hidden_ch = height_hidden_ch or hidden_ch
+        if self.bidirectional_ctask:
+            self.height_to_pres_gate = nn.Conv2d(int(height_hidden_ch), hidden_ch, 1)
+            nn.init.zeros_(self.height_to_pres_gate.weight)
+            nn.init.zeros_(self.height_to_pres_gate.bias)
+        else:
+            self.height_to_pres_gate = None
 
         # --- Fraction head (auxiliary: soft coverage regression) ---
         self.fraction_head = nn.Sequential(
@@ -156,6 +172,17 @@ class MultiTaskPredictionHead(nn.Module):
                 })
         else:
             self.presence_delta_head = None
+
+        # --- Optional: parallel auxiliary presence branch (T-SwinUNet style) ---
+        # Shallower than the main branch (single 3x3 + 1x1) — meant to
+        # regularize the main head via an IoU-consistency loss.
+        if self.dual_presence:
+            self.presence_head_aux = nn.Sequential(
+                ConvGNAct(hidden_ch, presence_branch_ch, kernel_size=3),
+                nn.Conv2d(presence_branch_ch, 3, 1),
+            )
+        else:
+            self.presence_head_aux = None
 
         # --- FiLM conditioning: soft fractions modulate height features ---
         self.film_scale = nn.Conv2d(3, hidden_ch, 1)
@@ -275,17 +302,37 @@ class MultiTaskPredictionHead(nn.Module):
         fraction_logits = self.fraction_head(x)
         fractions = torch.sigmoid(fraction_logits)
 
-        # Main presence classifier (submission channels 0-2). When an external
-        # edge feature is provided, it learns only a zero-initialized residual
-        # logit correction on top of the alpha-only logits.
+        # FiLM conditioning uses soft fractions (fine-grained coverage signal)
+        scale = self.film_scale(fractions)
+        shift = self.film_shift(fractions)
+        h = x * (1.0 + scale) + shift
+
+        if self.height_independent_branches:
+            h_base = self.height_base_trunk(h)
+            h_building = self.height_building_trunk(h)
+            h_vegetation = self.height_vegetation_trunk(h)
+            h_shared = h_base
+        else:
+            h_shared = self.height_trunk(h)
+            h_base = h_shared
+            h_building = h_shared
+            h_vegetation = h_shared
+
+        # Bidirectional cross-task: height trunk features gate presence input
+        # F_presence ← x * (0.5 + σ(Conv1×1(h_height))), zero-init → identity at start
+        x_pres = x
+        if self.height_to_pres_gate is not None:
+            x_pres = x * (0.5 + torch.sigmoid(self.height_to_pres_gate(h_shared)))
+
+        # Main presence classifier (submission channels 0-2).
         if bypass_h is not None:
             alpha_presence_logits = torch.cat([
-                self.presence_head["building"](x),
-                self.presence_head["tree"](x),
+                self.presence_head["building"](x_pres),
+                self.presence_head["tree"](x_pres),
                 self.presence_head["water"](bypass_h),
             ], dim=1)
         else:
-            alpha_presence_logits = self._forward_presence_head(x)
+            alpha_presence_logits = self._forward_presence_head(x_pres)
         if presence_extra is not None:
             if self.presence_delta_head is None:
                 raise ValueError("presence_extra was provided but this head has no residual branch")
@@ -296,20 +343,12 @@ class MultiTaskPredictionHead(nn.Module):
             presence_logits = alpha_presence_logits
         presence_prob = torch.sigmoid(presence_logits)
 
-        # FiLM conditioning uses soft fractions (fine-grained coverage signal)
-        scale = self.film_scale(fractions)
-        shift = self.film_shift(fractions)
-        h = x * (1.0 + scale) + shift
-
-        if self.height_independent_branches:
-            h_base = self.height_base_trunk(h)
-            h_building = self.height_building_trunk(h)
-            h_vegetation = self.height_vegetation_trunk(h)
-        else:
-            h_shared = self.height_trunk(h)
-            h_base = h_shared
-            h_building = h_shared
-            h_vegetation = h_shared
+        # Auxiliary parallel presence branch (consistency-regularized; T-SwinUNet idea).
+        # Runs on the bare shared trunk features `x` (no FiLM, no bidir gate, no
+        # Tessera residual) so it gives a maximally diverse view of the same scene.
+        presence_logits_aux = (
+            self.presence_head_aux(x) if self.presence_head_aux is not None else None
+        )
 
         base_logits = self.height_base_proj(h_base)
         building_logits = self.height_building_delta_proj(h_building)
@@ -346,14 +385,24 @@ class MultiTaskPredictionHead(nn.Module):
             else alpha_presence_logits
         )
         height_presence_prob = torch.sigmoid(height_gate_logits)
-        p_b = height_presence_prob[:, 0:1, :, :]
-        p_v = height_presence_prob[:, 1:2, :, :]
-        p_fg = 1.0 - (1.0 - p_b) * (1.0 - p_v)           # P(any of {b,v} present)
-        denom = p_b + p_v + 1e-6
-        w_b = p_b / denom
-        w_v = p_v / denom
-        h_fg = w_b * building_height + w_v * vegetation_height
-        height = p_fg * h_fg + (1.0 - p_fg) * base_height
+        if self.height_blend_mode == "max":
+            # Decoupled from presence: take the max of class specialists.
+            # Background falls back to base_height (deltas → 0). Robust to
+            # presence-head miscalibration: pixel routing follows whichever
+            # specialist actually predicts a tall structure, not the gate.
+            height = torch.maximum(
+                torch.maximum(building_height, vegetation_height),
+                base_height,
+            )
+        else:
+            p_b = height_presence_prob[:, 0:1, :, :]
+            p_v = height_presence_prob[:, 1:2, :, :]
+            p_fg = 1.0 - (1.0 - p_b) * (1.0 - p_v)           # P(any of {b,v} present)
+            denom = p_b + p_v + 1e-6
+            w_b = p_b / denom
+            w_v = p_v / denom
+            h_fg = w_b * building_height + w_v * vegetation_height
+            height = p_fg * h_fg + (1.0 - p_fg) * base_height
 
         # Submission: channels 0-2 are presence_prob (binary-aligned),
         # channel 3 is the presence-gated specialist height.
@@ -370,6 +419,7 @@ class MultiTaskPredictionHead(nn.Module):
             "alpha_presence_logits": alpha_presence_logits,
             "alpha_presence_prob": height_presence_prob,
             "presence_delta_logits": presence_delta_logits,
+            "presence_logits_aux": presence_logits_aux,
             "height_base": base_height,
             "height_building": building_height,
             "height_vegetation": vegetation_height,

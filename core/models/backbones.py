@@ -81,24 +81,31 @@ class LightUNet(nn.Module):
             presence_branch_ch=presence_branch_ch,
         )
 
-    def forward_features(self, x):
+    def forward_encoder(self, x):
+        """Returns (bottleneck, skip_connections) for external bottleneck fusion."""
         x1 = self.inc(x)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
+        return x4, (x1, x2, x3)
 
+    def forward_decoder(self, x4, skips):
+        """Runs decoder from bottleneck + skip connections."""
+        x1, x2, x3 = skips
         x = self.up1(x4)
         x = torch.cat([x3, x], dim=1)
         x = self.conv1(x)
-
         x = self.up2(x)
         x = torch.cat([x2, x], dim=1)
         x = self.conv2(x)
-
         x = self.up3(x)
         x = torch.cat([x1, x], dim=1)
         x = self.conv3(x)
         return x
+
+    def forward_features(self, x):
+        x4, skips = self.forward_encoder(x)
+        return self.forward_decoder(x4, skips)
 
     def forward(self, x, return_aux=False):
         x = self.forward_features(x)

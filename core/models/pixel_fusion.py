@@ -1,17 +1,41 @@
 import torch
 import torch.nn as nn
 
+import torch.nn.functional as F
+
 from .blocks import ChannelCalibration, ConvGNAct, _group_count
-from .backbones import LightUNet
+from .backbones import DoubleConv, LightUNet
 from .heads import MultiTaskPredictionHead
 
 
 def _build_fusion_gate(channels, mode="simple", untied=False, init_bias=4.0):
-    n_out = 2 * channels if untied else channels
+    """Build the fusion module. Supports several blend formulations:
+
+    - simple/rich: tied (or untied) sigmoid gate; output = g·A + (1-g)·B.
+    - concat_mlp: full nonlinear mixing via 2-layer Conv1x1 MLP. No gate.
+    - gated_mlp_residual: g·MLP(concat) + (1-g)·A. Strictly more expressive
+      than simple because the transform branch can produce features outside
+      the convex hull of A,B. Init: g→0 so output starts as A (identity).
+    - addmul: g_add·A + (1-g_add)·B + g_mul·(A⊙B). Hadamard term captures
+      consensus/disagreement multiplicatively. Mul gate zero-init.
+    - film: γ·A + β where γ,β are functions of B; γ = 1 + δγ. Asymmetric:
+      B modulates A. δγ, β zero-init so output starts as A.
+    """
     if mode == "simple":
+        n_out = 2 * channels if untied else channels
         gate = nn.Conv2d(2 * channels, n_out, kernel_size=1)
-        final = gate
-    elif mode == "rich":
+        nn.init.zeros_(gate.weight)
+        if untied:
+            bias = torch.empty(n_out)
+            bias[:channels].fill_(init_bias)
+            bias[channels:].fill_(-init_bias)
+            gate.bias.data.copy_(bias)
+        else:
+            nn.init.constant_(gate.bias, init_bias)
+        return gate
+
+    if mode == "rich":
+        n_out = 2 * channels if untied else channels
         hidden = max(channels, 32)
         gate = nn.Sequential(
             nn.Conv2d(2 * channels, hidden, 1, bias=False),
@@ -19,30 +43,102 @@ def _build_fusion_gate(channels, mode="simple", untied=False, init_bias=4.0):
             nn.GELU(),
             nn.Conv2d(hidden, n_out, 1),
         )
-        final = gate[-1]
-    else:
-        raise ValueError(f"Unknown gate mode: {mode!r}")
+        nn.init.zeros_(gate[-1].weight)
+        if untied:
+            bias = torch.empty(n_out)
+            bias[:channels].fill_(init_bias)
+            bias[channels:].fill_(-init_bias)
+            gate[-1].bias.data.copy_(bias)
+        else:
+            nn.init.constant_(gate[-1].bias, init_bias)
+        return gate
 
-    nn.init.zeros_(final.weight)
     if untied:
-        bias = torch.empty(n_out)
-        bias[:channels].fill_(init_bias)
-        bias[channels:].fill_(-init_bias)
-        final.bias.data.copy_(bias)
-    else:
-        nn.init.constant_(final.bias, init_bias)
-    return gate
+        raise ValueError(f"gate_untied=True is only valid for simple/rich modes, got {mode!r}")
+
+    if mode == "concat_mlp":
+        hidden = max(channels, 32)
+        return nn.Sequential(
+            nn.Conv2d(2 * channels, hidden, 1, bias=False),
+            nn.GroupNorm(_group_count(hidden), hidden),
+            nn.GELU(),
+            nn.Conv2d(hidden, channels, 1),
+        )
+
+    if mode == "gated_mlp_residual":
+        hidden = max(channels, 32)
+        m = nn.ModuleDict({
+            "g": nn.Conv2d(2 * channels, channels, 1),
+            "f": nn.Sequential(
+                nn.Conv2d(2 * channels, hidden, 1, bias=False),
+                nn.GroupNorm(_group_count(hidden), hidden),
+                nn.GELU(),
+                nn.Conv2d(hidden, channels, 1),
+            ),
+        })
+        nn.init.zeros_(m["g"].weight)
+        nn.init.constant_(m["g"].bias, -init_bias)  # gate≈0 → output≈A initially
+        return m
+
+    if mode == "addmul":
+        m = nn.ModuleDict({
+            "add": nn.Conv2d(2 * channels, channels, 1),
+            "mul": nn.Conv2d(2 * channels, channels, 1),
+        })
+        nn.init.zeros_(m["add"].weight)
+        nn.init.constant_(m["add"].bias, init_bias)   # add gate≈1 → output≈A
+        nn.init.zeros_(m["mul"].weight)
+        nn.init.zeros_(m["mul"].bias)                  # mul gate=0.5 sigmoid → small but nonzero start
+        # Bias mul gate to start at zero contribution
+        nn.init.constant_(m["mul"].bias, -init_bias)   # sigmoid(-4)≈0.018 → near-zero mul start
+        return m
+
+    if mode == "film":
+        m = nn.ModuleDict({
+            "gamma": nn.Conv2d(channels, channels, 1),
+            "beta": nn.Conv2d(channels, channels, 1),
+        })
+        nn.init.zeros_(m["gamma"].weight)
+        nn.init.zeros_(m["gamma"].bias)
+        nn.init.zeros_(m["beta"].weight)
+        nn.init.zeros_(m["beta"].bias)
+        return m
+
+    raise ValueError(f"Unknown gate mode: {mode!r}")
 
 
-def _apply_fusion_gate(gate_module, ae_feat, tes_feat, untied):
-    raw = gate_module(torch.cat([ae_feat, tes_feat], dim=1))
-    if untied:
-        channels = ae_feat.size(1)
-        g_ae = torch.sigmoid(raw[:, :channels])
-        g_tes = torch.sigmoid(raw[:, channels:])
-        return g_ae * ae_feat + g_tes * tes_feat
-    gate = torch.sigmoid(raw)
-    return gate * ae_feat + (1.0 - gate) * tes_feat
+def _apply_fusion_gate(gate_module, ae_feat, tes_feat, untied, mode="simple"):
+    if mode in ("simple", "rich"):
+        raw = gate_module(torch.cat([ae_feat, tes_feat], dim=1))
+        if untied:
+            channels = ae_feat.size(1)
+            g_ae = torch.sigmoid(raw[:, :channels])
+            g_tes = torch.sigmoid(raw[:, channels:])
+            return g_ae * ae_feat + g_tes * tes_feat
+        gate = torch.sigmoid(raw)
+        return gate * ae_feat + (1.0 - gate) * tes_feat
+
+    if mode == "concat_mlp":
+        return gate_module(torch.cat([ae_feat, tes_feat], dim=1))
+
+    if mode == "gated_mlp_residual":
+        concat = torch.cat([ae_feat, tes_feat], dim=1)
+        g = torch.sigmoid(gate_module["g"](concat))
+        transformed = gate_module["f"](concat)
+        return g * transformed + (1.0 - g) * ae_feat
+
+    if mode == "addmul":
+        concat = torch.cat([ae_feat, tes_feat], dim=1)
+        g_add = torch.sigmoid(gate_module["add"](concat))
+        g_mul = torch.sigmoid(gate_module["mul"](concat))
+        return g_add * ae_feat + (1.0 - g_add) * tes_feat + g_mul * (ae_feat * tes_feat)
+
+    if mode == "film":
+        delta_gamma = gate_module["gamma"](tes_feat)
+        beta = gate_module["beta"](tes_feat)
+        return (1.0 + delta_gamma) * ae_feat + beta
+
+    raise ValueError(f"Unknown gate mode: {mode!r}")
 
 
 def _maybe_drop_modality(tes_feat, p, training):
@@ -72,6 +168,77 @@ class TesseraCompressionStem(nn.Module):
         return self.net(self.calib(x))
 
 
+class TesseraIoUFusionLightUNet(nn.Module):
+    """AlphaEarth LightUNet with a Tessera residual IoU correction branch.
+
+    Tessera feeds only the presence head (as a 16-ch residual correction),
+    while the AlphaEarth UNet trunk drives fractions, FiLM, and height.
+    This is the architecture that produced all good-performing gated_F and
+    ctaskattn runs. Restored for checkpoint compatibility and new experiments.
+    """
+
+    def __init__(self, n_channels, n_classes=4, alpha_channels=64,
+                 tessera_presence_ch=16, tessera_hidden_ch=None,
+                 tessera_hidden_depth=0, height_specialist_depth=0,
+                 base_ch=32, height_gate_source="alpha",
+                 height_hidden_ch=None, height_trunk_depth=2,
+                 height_independent_branches=False,
+                 height_head_kind="linear", height_n_bins=64,
+                 height_bin_max_m=80.0, norm_kind="bn",
+                 presence_head_kind="shared", presence_head_depth=1,
+                 presence_branch_ch=None, bidirectional_ctask=False,
+                 height_blend_mode="presence_gated",
+                 dual_presence=False):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("TesseraIoUFusionLightUNet assumes 4 output channels")
+        if n_channels <= alpha_channels:
+            raise ValueError(
+                "TesseraIoUFusionLightUNet expects concatenated AlphaEarth+Tessera "
+                f"input with >{alpha_channels} channels, got {n_channels}"
+            )
+        self.supports_aux_outputs = True
+        self.alpha_channels = alpha_channels
+        tessera_channels = n_channels - alpha_channels
+
+        self.alpha_unet = LightUNet(alpha_channels, n_classes, base_ch=base_ch,
+                                    norm_kind=norm_kind)
+        self.alpha_unet.head = nn.Identity()
+        self.tessera_stem = TesseraCompressionStem(
+            tessera_channels,
+            out_ch=tessera_presence_ch,
+            hidden_ch=tessera_hidden_ch,
+            hidden_depth=tessera_hidden_depth,
+        )
+        self.head = MultiTaskPredictionHead(
+            in_ch=base_ch,
+            out_channels=n_classes,
+            presence_extra_ch=tessera_presence_ch,
+            height_specialist_depth=height_specialist_depth,
+            height_gate_source=height_gate_source,
+            height_hidden_ch=height_hidden_ch,
+            height_trunk_depth=height_trunk_depth,
+            height_independent_branches=height_independent_branches,
+            height_head_kind=height_head_kind,
+            height_n_bins=height_n_bins,
+            height_bin_max_m=height_bin_max_m,
+            presence_head_kind=presence_head_kind,
+            presence_head_depth=presence_head_depth,
+            presence_branch_ch=presence_branch_ch,
+            bidirectional_ctask=bidirectional_ctask,
+            height_blend_mode=height_blend_mode,
+            dual_presence=dual_presence,
+        )
+
+    def forward(self, x, return_aux=False):
+        alpha = x[:, :self.alpha_channels, :, :]
+        tessera = x[:, self.alpha_channels:, :, :]
+
+        alpha_feat = self.alpha_unet.forward_features(alpha)
+        tessera_feat = self.tessera_stem(tessera)
+        return self.head(alpha_feat, return_aux=return_aux, presence_extra=tessera_feat)
+
+
 class TesseraIoUFusionGatedLightUNet(nn.Module):
     """Active AlphaEarth + Tessera model: gated trunk fusion plus optional
     presence residual.
@@ -88,7 +255,11 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
                  height_head_kind="linear", height_n_bins=64,
                  height_bin_max_m=80.0, norm_kind="bn",
                  presence_head_kind="shared", presence_head_depth=1,
-                 presence_branch_ch=None):
+                 presence_branch_ch=None, bidirectional_ctask=False,
+                 height_blend_mode="presence_gated",
+                 dual_presence=False,
+                 ae_only_supervision=False,
+                 token_channels=0):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TesseraIoUFusionGatedLightUNet assumes 4 output channels")
@@ -100,6 +271,7 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
         self.supports_aux_outputs = True
         self.alpha_channels = alpha_channels
         self.gate_untied = bool(gate_untied)
+        self.gate_mode = gate_mode
         self.modality_dropout = float(modality_dropout)
         tessera_channels = n_channels - alpha_channels
 
@@ -141,11 +313,49 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
             presence_head_kind=presence_head_kind,
             presence_head_depth=presence_head_depth,
             presence_branch_ch=presence_branch_ch,
+            bidirectional_ctask=bidirectional_ctask,
+            height_blend_mode=height_blend_mode,
+            dual_presence=dual_presence,
         )
 
+        # CMGFNet-style deep supervision: parallel light prediction head from
+        # pre-fusion AE features. 3 presence channels + 1 height channel.
+        # Supervised with same BCE+Tversky losses; not used for inference.
+        if ae_only_supervision:
+            self.ae_only_head = nn.Sequential(
+                ConvGNAct(base_ch, base_ch, kernel_size=3),
+                nn.Conv2d(base_ch, 4, kernel_size=1),
+            )
+        else:
+            self.ae_only_head = None
+
+        # Optional token-residual path: linear addition of token-derived
+        # features into the AE+Tessera gated-fused features. Zero-init scalar
+        # per-channel gate (sigmoid(-4) ≈ 0.018) so the path is near-identity
+        # at training start and can only learn to help.
+        self.token_channels = int(token_channels)
+        if self.token_channels > 0:
+            from .token_fusion import TokenPyramidNeck  # lazy import: avoid circular
+            self.token_neck = TokenPyramidNeck(
+                self.token_channels,
+                level_channels=(base_ch * 2, base_ch, base_ch, base_ch),
+            )
+            self.token_residual_proj = nn.Conv2d(base_ch, base_ch, 1)
+            nn.init.zeros_(self.token_residual_proj.weight)
+            nn.init.zeros_(self.token_residual_proj.bias)
+            self.token_residual_gate = nn.Parameter(torch.full((1, base_ch, 1, 1), -4.0))
+        else:
+            self.token_neck = None
+            self.token_residual_proj = None
+            self.token_residual_gate = None
+
     def forward(self, x, return_aux=False):
-        alpha = x[:, :self.alpha_channels, :, :]
-        tessera = x[:, self.alpha_channels:, :, :]
+        if isinstance(x, (tuple, list)):
+            pixel_x, token = x
+        else:
+            pixel_x, token = x, None
+        alpha = pixel_x[:, :self.alpha_channels, :, :]
+        tessera = pixel_x[:, self.alpha_channels:, :, :]
 
         alpha_feat = self.alpha_unet.forward_features(alpha)
         tessera_feat = self.tessera_feature_stem(tessera)
@@ -153,11 +363,142 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
             tessera_feat, self.modality_dropout, self.training
         )
         fused = _apply_fusion_gate(
-            self.gate_conv, alpha_feat, tessera_feat, untied=self.gate_untied
+            self.gate_conv, alpha_feat, tessera_feat,
+            untied=self.gate_untied, mode=self.gate_mode
         )
+
+        # Linear token-residual: project token-pyramid features (upsampled to
+        # AE resolution) through a 1x1 conv with a learned per-channel sigmoid
+        # gate that's zero-init biased to ~0.02. Adds zero contribution at
+        # step 0; gradient lets the model learn to incorporate token info.
+        if self.token_neck is not None and token is not None:
+            tpyr = self.token_neck(token)
+            t_feat = tpyr[128]
+            if t_feat.shape[-2:] != fused.shape[-2:]:
+                t_feat = F.interpolate(
+                    t_feat, size=fused.shape[-2:],
+                    mode="bilinear", align_corners=False,
+                )
+            t_res = self.token_residual_proj(t_feat)
+            fused = fused + torch.sigmoid(self.token_residual_gate) * t_res
+
         presence_extra = (
             self.presence_extra_proj(tessera_feat)
             if self.presence_extra_proj is not None else None
         )
-        return self.head(fused, return_aux=return_aux,
-                         presence_extra=presence_extra)
+        out = self.head(fused, return_aux=return_aux,
+                        presence_extra=presence_extra)
+        if return_aux and self.ae_only_head is not None and isinstance(out, dict):
+            out["ae_only_logits"] = self.ae_only_head(alpha_feat)
+        return out
+
+
+class TesseraCrossAttnLightUNet(nn.Module):
+    """AE encoder–Tessera cross-attention at the UNet bottleneck.
+
+    Architecture:
+      1. AE runs through LightUNet encoder → bottleneck (x4) + skip connections.
+      2. Tessera is compressed to base_ch at full resolution, then downsampled
+         (3× MaxPool + DoubleConv) to match the bottleneck spatial resolution.
+      3. Multi-head cross-attention fuses the two bottlenecks: AE is Q, Tessera
+         is K and V.  Residual connection preserves the AE bottleneck signal.
+      4. Fused bottleneck passes through the LightUNet decoder → prediction head.
+
+    Scales to N modalities: each additional source contributes its own K/V
+    and the AE Q attends to all of them jointly (just concatenate K, V).
+    """
+
+    def __init__(self, n_channels, n_classes=4, alpha_channels=64,
+                 tessera_hidden_ch=None, tessera_hidden_depth=0,
+                 height_specialist_depth=0, base_ch=32, n_heads=4,
+                 modality_dropout=0.0,
+                 height_gate_source="alpha", height_hidden_ch=None,
+                 height_trunk_depth=2, height_independent_branches=False,
+                 height_head_kind="linear", height_n_bins=64,
+                 height_bin_max_m=80.0, norm_kind="bn",
+                 presence_head_kind="shared", presence_head_depth=1,
+                 presence_branch_ch=None):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("TesseraCrossAttnLightUNet assumes 4 output channels")
+        if n_channels <= alpha_channels:
+            raise ValueError(
+                "TesseraCrossAttnLightUNet expects concatenated AlphaEarth+Tessera "
+                f"input with >{alpha_channels} channels, got {n_channels}"
+            )
+        self.supports_aux_outputs = True
+        self.alpha_channels = alpha_channels
+        self.modality_dropout = float(modality_dropout)
+        tessera_channels = n_channels - alpha_channels
+
+        self.alpha_unet = LightUNet(
+            alpha_channels, n_classes, base_ch=base_ch, norm_kind=norm_kind
+        )
+        self.alpha_unet.head = nn.Identity()
+
+        bottleneck_ch = base_ch * 8   # c4 from LightUNet encoder
+
+        self.tessera_stem = TesseraCompressionStem(
+            tessera_channels,
+            out_ch=base_ch,
+            hidden_ch=tessera_hidden_ch,
+            hidden_depth=tessera_hidden_depth,
+        )
+        # Mirror the LightUNet encoder's 3 downsampling stages to reach the
+        # same spatial resolution as the AE bottleneck (input / 8).
+        self.tessera_downsample = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConv(base_ch, base_ch * 2, norm_kind=norm_kind),
+            nn.MaxPool2d(2),
+            DoubleConv(base_ch * 2, base_ch * 4, norm_kind=norm_kind),
+            nn.MaxPool2d(2),
+            DoubleConv(base_ch * 4, bottleneck_ch, norm_kind=norm_kind),
+        )
+
+        # Cross-attention: AE bottleneck (Q) attends to Tessera bottleneck (K,V).
+        # batch_first=True → (B, seq_len, embed_dim) layout.
+        self.xattn = nn.MultiheadAttention(
+            embed_dim=bottleneck_ch,
+            num_heads=n_heads,
+            batch_first=True,
+        )
+        self.xattn_norm = nn.LayerNorm(bottleneck_ch)
+
+        self.head = MultiTaskPredictionHead(
+            in_ch=base_ch,
+            out_channels=n_classes,
+            height_specialist_depth=height_specialist_depth,
+            height_gate_source=height_gate_source,
+            height_hidden_ch=height_hidden_ch,
+            height_trunk_depth=height_trunk_depth,
+            height_independent_branches=height_independent_branches,
+            height_head_kind=height_head_kind,
+            height_n_bins=height_n_bins,
+            height_bin_max_m=height_bin_max_m,
+            presence_head_kind=presence_head_kind,
+            presence_head_depth=presence_head_depth,
+            presence_branch_ch=presence_branch_ch,
+        )
+
+    def forward(self, x, return_aux=False):
+        alpha = x[:, :self.alpha_channels, :, :]
+        tessera = x[:, self.alpha_channels:, :, :]
+
+        # AE encoder
+        x4, skips = self.alpha_unet.forward_encoder(alpha)
+        B, C, H, W = x4.shape
+
+        # Tessera to bottleneck resolution
+        tes_feat = self.tessera_stem(tessera)
+        tes_feat = _maybe_drop_modality(tes_feat, self.modality_dropout, self.training)
+        tes_bn = self.tessera_downsample(tes_feat)   # (B, C, H, W)
+
+        # Cross-attention at bottleneck: flatten spatial → (B, H*W, C)
+        q = x4.flatten(2).permute(0, 2, 1)
+        kv = tes_bn.flatten(2).permute(0, 2, 1)
+        attn_out, _ = self.xattn(q, kv, kv)
+        attn_out = self.xattn_norm(attn_out)
+        fused_x4 = x4 + attn_out.permute(0, 2, 1).reshape(B, C, H, W)
+
+        features = self.alpha_unet.forward_decoder(fused_x4, skips)
+        return self.head(features, return_aux=return_aux)

@@ -19,7 +19,11 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 height_bin_max_m=80.0, lightunet_norm_kind="bn",
                 gate_mode="simple", gate_untied=False, gate_init_bias=4.0,
                 modality_dropout=0.0, presence_head_kind="shared",
-                presence_head_depth=1, presence_branch_ch=None):
+                presence_head_depth=1, presence_branch_ch=None,
+                bidirectional_ctask=False, crossattn_n_heads=4,
+                height_blend_mode="presence_gated",
+                dual_presence=False,
+                ae_only_supervision=False):
     selected = model_type.lower()
     if selected == "auto":
         selected = infer_model_type(n_channels)
@@ -48,6 +52,11 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
         presence_head_kind=presence_head_kind,
         presence_head_depth=presence_head_depth,
         presence_branch_ch=presence_branch_ch,
+        bidirectional_ctask=bidirectional_ctask,
+        crossattn_n_heads=crossattn_n_heads,
+        height_blend_mode=height_blend_mode,
+        dual_presence=dual_presence,
+        ae_only_supervision=ae_only_supervision,
     )
     if active is not None:
         return active

@@ -4,13 +4,33 @@ import torch
 import torch.nn.functional as F
 
 
-def height_error(pred, target, *, kind, huber_delta):
-    """Elementwise height error under the configured regression loss."""
+def height_error(pred, target, *, kind, huber_delta, valid_mask=None):
+    """Elementwise height error under the configured regression loss.
+
+    valid_mask: optional bool/float tensor broadcastable to pred.  When
+    provided, BerHu's adaptive threshold c is estimated only from the
+    *valid* pixels so that padded/invalid regions (which can have large
+    arbitrary residuals) don't inflate c and wipe out the gradient signal
+    on the pixels we actually care about.
+    """
     diff = pred - target
     if kind == "l1":
         return torch.abs(diff)
     if kind == "mse":
         return diff * diff
+    if kind == "berhu":
+        abs_diff = torch.abs(diff)
+        with torch.no_grad():
+            if valid_mask is not None:
+                valid = abs_diff[valid_mask.bool()]
+                base = valid.max() if valid.numel() > 0 else abs_diff.max()
+            else:
+                base = abs_diff.max()
+            # Floor at 1.0 keeps c from collapsing when the batch is
+            # already well-fit, which would cause gradient spikes of 1/c.
+            c = (0.2 * base).clamp(min=1.0)
+        quadratic = (diff * diff + c * c) / (2.0 * c)
+        return torch.where(abs_diff <= c, abs_diff, quadratic)
 
     abs_diff = torch.abs(diff)
     delta = float(huber_delta)
