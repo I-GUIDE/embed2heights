@@ -12,7 +12,37 @@ except ImportError:
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CONFIG_PATH = os.path.join(REPO_DIR, "configs", "defaults.yml")
 
-MODEL_CHOICES = ["ae_only", "ae_tessera_gated", "xfusion_crosslevel", "auto"]
+MODEL_CHOICES = [
+    "ae_only",
+    "ae_tessera_gated",
+    "ae_tessera_unet_gated",
+    "ae_tessera_unet_hierarchical",
+    "xfusion_crosslevel",
+    "xfusion_gated_nonwater",
+    "xfusion_bottleneck_adaptive",
+    "xfusion_twogate_attention",
+    "xfusion_cqa_twogate_attention",
+    "xfusion_twogate_aligned_attention",
+    "xfusion_aligned_concat_attention",
+    "xfusion_aligned_grouped_concat_attention",
+    "xfusion_aligned_concat_aux",
+    "xfusion_twogate_grouped",
+    "xfusion_twogate_bn_attention",
+    "xfusion_per_modality",
+    "xfusion_task_router",
+    "xfusion_twogate_unet_attention",
+    "xfusion_per_modality_unet",
+    "xfusion_bn_attention_unet",
+    "xfusion_concat_attention",
+    "xfusion_concat_unet_attention",
+    "xfusion_residual_concat_attention",
+    "xfusion_residual_concat_unet_attention",
+    "xfusion_sixmodal_bottleneck",
+    "xfusion_error_router_height_only",
+    "xfusion_error_router_height_aux",
+    "xfusion_film_fusion",
+    "auto",
+]
 CONFIG_SECTIONS = ("data", "model", "training", "runtime")
 RECIPE_METADATA_KEYS = ("name", "description", "reference")
 
@@ -29,6 +59,15 @@ RAW_COMPONENTS = (
     "aux_height_vegetation",
     "height_bin_ce",
     "building_smooth",
+    "height_error_bce",
+    "delta_sparsity",
+    "token_aux",
+    "token_aux_fraction_mae",
+    "token_aux_height_boost",
+    "token_aux_presence_bce",
+    "token_aux_presence_tversky",
+    "token_aux_height_building",
+    "token_aux_height_vegetation",
 )
 
 WEIGHTED_COMPONENTS = (
@@ -42,6 +81,9 @@ WEIGHTED_COMPONENTS = (
     "weighted_aux_height",
     "weighted_height_bin_ce",
     "weighted_building_smooth",
+    "weighted_height_error_bce",
+    "weighted_delta_sparsity",
+    "weighted_token_aux",
 )
 
 
@@ -120,6 +162,20 @@ def parse_args():
                    help="Second pixel-aligned embedding dir, e.g. Tessera.")
     p.add_argument("--token-train-embeddings-dir",
                    help="Optional 16x16 token embedding dir for xfusion.")
+    p.add_argument("--secondary-token-train-embeddings-dir",
+                   help="Optional second 16x16 token embedding dir for xfusion.")
+    p.add_argument("--third-token-train-embeddings-dir",
+                   help="Optional third 16x16 token embedding dir for xfusion.")
+    p.add_argument("--fourth-token-train-embeddings-dir",
+                   help="Optional fourth 16x16 token embedding dir for xfusion.")
+    p.add_argument("--token-normalization",
+                   choices=("none", "train_channel_zscore"),
+                   help="Optional token source normalization applied after reading rasters.")
+    p.add_argument("--token-normalization-source-indices",
+                   help="Comma-separated 0-based token source indices to normalize. "
+                        "Empty means all token sources.")
+    p.add_argument("--token-normalization-stats-path",
+                   help="Path to token z-score stats .npz. Defaults to the run directory.")
     p.add_argument("--train-targets-dir")
     p.add_argument("--split-file",
                    help="Path to a JSON split file. Loaded if present, else saved there.")
@@ -136,6 +192,23 @@ def parse_args():
     p.add_argument("--data-parallel", action=argparse.BooleanOptionalAction)
     p.add_argument("--init-from-pretrain",
                    help="Optional self-supervised pretrain checkpoint.")
+    p.add_argument("--freeze-except",
+                   help="Freeze all params whose name does NOT contain this substring. "
+                        "Used for two-stage training: freeze pixel path, train token path only.")
+    p.add_argument("--freeze-epochs", type=int,
+                   help="Number of epochs to keep pixel path frozen (Stage 1). "
+                        "After this, all params are unfrozen for Stage 2 fine-tuning.")
+    p.add_argument("--stage2-lr", type=float,
+                   help="Learning rate for Stage 2 (all params unfrozen). "
+                        "Defaults to lr * 0.1 if not set.")
+    p.add_argument("--boundary-building-weight", type=float,
+                   help="Upweight BCE for background pixels within boundary_kernel_size "
+                        "of a GT building. 1.0 = disabled (default).")
+    p.add_argument("--boundary-kernel-size", type=int,
+                   help="Dilation kernel size (pixels) for boundary building weight.")
+    p.add_argument("--tversky-building-alpha", type=float,
+                   help="Tversky alpha (FP penalty) for building class only. "
+                        "Lower = more recall-focused. Default 0.3.")
 
     p.set_defaults(**DEFAULTS)
     p.set_defaults(**config_defaults)
@@ -170,6 +243,12 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "train_embeddings_dir": args.train_embeddings_dir,
             "secondary_train_embeddings_dir": args.secondary_train_embeddings_dir,
             "token_train_embeddings_dir": args.token_train_embeddings_dir,
+            "secondary_token_train_embeddings_dir": args.secondary_token_train_embeddings_dir,
+            "third_token_train_embeddings_dir": args.third_token_train_embeddings_dir,
+            "fourth_token_train_embeddings_dir": args.fourth_token_train_embeddings_dir,
+            "token_normalization": args.token_normalization,
+            "token_normalization_source_indices": args.token_normalization_source_indices,
+            "token_normalization_stats_path": args.token_normalization_stats_path,
             "train_targets_dir": args.train_targets_dir,
             "split_file": args.split_file,
             "patch_size": args.patch_size,
@@ -193,6 +272,12 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "gate_untied": args.gate_untied,
             "gate_init_bias": args.gate_init_bias,
             "modality_dropout": args.modality_dropout,
+            "use_token_extractor": args.use_token_extractor,
+            "token_extractor_mid_ch": args.token_extractor_mid_ch,
+            "token_query_grid": args.token_query_grid,
+            "token_calibration": args.token_calibration,
+            "token_gate_init_bias": args.token_gate_init_bias,
+            "token_aux_weight": args.token_aux_weight,
             "presence_head_kind": args.presence_head_kind,
             "presence_head_depth": args.presence_head_depth,
             "presence_branch_ch": args.presence_branch_ch,
@@ -202,8 +287,12 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "epochs": args.epochs,
             "lr": args.lr,
             "weight_decay": args.weight_decay,
+            "lr_scheduler": args.lr_scheduler,
             "seed": args.seed,
             "grad_accum_steps": args.grad_accum_steps,
+            "freeze_except": args.freeze_except,
+            "freeze_epochs": args.freeze_epochs,
+            "stage2_lr": args.stage2_lr,
             "loss_preset": "presence_centered",
             "weight_mae": args.weight_mae,
             "weight_presence_tversky": args.weight_presence_tversky,
@@ -217,6 +306,9 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "aux_veg_weight": args.aux_veg_weight,
             "height_bin_aux_weight": args.height_bin_aux_weight,
             "height_bin_sigma_bins": args.height_bin_sigma_bins,
+            "boundary_building_weight": args.boundary_building_weight,
+            "boundary_kernel_size": args.boundary_kernel_size,
+            "tversky_building_alpha": args.tversky_building_alpha,
         },
         "runtime": runtime,
     }
