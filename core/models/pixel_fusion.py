@@ -502,3 +502,167 @@ class TesseraCrossAttnLightUNet(nn.Module):
 
         features = self.alpha_unet.forward_decoder(fused_x4, skips)
         return self.head(features, return_aux=return_aux)
+
+
+class SimpleConcatFusion(nn.Module):
+    """Lightweight AE+Tessera fusion: no UNet, all-256x256, per-pixel.
+
+    AE → GroupNorm + 1x1 → 48ch
+    Tessera → ChannelCalibration + 1x1 → 80ch
+    concat → 128ch → ConvGNAct(96) → ConvGNAct(64) → MultiTaskPredictionHead
+    Hypothesis: the pretrained embeddings already encode spatial-spectral
+    features, so a heavy UNet backbone is redundant. ~16% of the gated model's
+    params. Risk is that lack of multi-scale context hurts large-building IoU.
+    """
+
+    def __init__(self, n_channels, n_classes=4, alpha_channels=64,
+                 ae_proj_ch=48, tessera_proj_ch=80,
+                 trunk_hidden=96, trunk_out=64,
+                 height_specialist_depth=0,
+                 height_gate_source="alpha", height_hidden_ch=None,
+                 height_trunk_depth=2, height_independent_branches=False,
+                 height_head_kind="linear", height_n_bins=64,
+                 height_bin_max_m=80.0,
+                 presence_head_kind="shared", presence_head_depth=1,
+                 presence_branch_ch=None, bidirectional_ctask=False,
+                 height_blend_mode="presence_gated",
+                 dual_presence=False):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("SimpleConcatFusion assumes 4 output channels")
+        if n_channels <= alpha_channels:
+            raise ValueError(
+                "SimpleConcatFusion expects AlphaEarth+Tessera concat input "
+                f">{alpha_channels} channels, got {n_channels}"
+            )
+        self.supports_aux_outputs = True
+        self.alpha_channels = alpha_channels
+        tessera_channels = n_channels - alpha_channels
+
+        # AE branch: GroupNorm + 1x1 projection
+        self.ae_norm = nn.GroupNorm(1, alpha_channels)
+        self.ae_proj = nn.Conv2d(alpha_channels, ae_proj_ch, kernel_size=1)
+
+        # Tessera branch: per-channel calibration + 1x1 projection
+        self.tessera_calib = ChannelCalibration(tessera_channels)
+        self.tessera_proj = nn.Conv2d(tessera_channels, tessera_proj_ch, kernel_size=1)
+
+        fused_ch = ae_proj_ch + tessera_proj_ch
+        self.trunk = nn.Sequential(
+            ConvGNAct(fused_ch, trunk_hidden, kernel_size=3),
+            ConvGNAct(trunk_hidden, trunk_out, kernel_size=3),
+        )
+
+        self.head = MultiTaskPredictionHead(
+            in_ch=trunk_out,
+            out_channels=n_classes,
+            height_specialist_depth=height_specialist_depth,
+            height_gate_source=height_gate_source,
+            height_hidden_ch=height_hidden_ch,
+            height_trunk_depth=height_trunk_depth,
+            height_independent_branches=height_independent_branches,
+            height_head_kind=height_head_kind,
+            height_n_bins=height_n_bins,
+            height_bin_max_m=height_bin_max_m,
+            presence_head_kind=presence_head_kind,
+            presence_head_depth=presence_head_depth,
+            presence_branch_ch=presence_branch_ch,
+            bidirectional_ctask=bidirectional_ctask,
+            height_blend_mode=height_blend_mode,
+            dual_presence=dual_presence,
+        )
+
+    def forward(self, x, return_aux=False):
+        ae = x[:, :self.alpha_channels, :, :]
+        tessera = x[:, self.alpha_channels:, :, :]
+
+        ae_feat = self.ae_proj(self.ae_norm(ae))
+        tessera_feat = self.tessera_proj(self.tessera_calib(tessera))
+
+        fused = torch.cat([ae_feat, tessera_feat], dim=1)
+        features = self.trunk(fused)
+        return self.head(features, return_aux=return_aux)
+
+
+class SimpleGatedFusion(nn.Module):
+    """Hybrid: teammate's no-UNet trunk + our gated fusion mechanism.
+
+    AE → GroupNorm + 1x1 → 64ch
+    Tessera → ChannelCalibration + 1x1 → 64ch
+    Gated mix → 64ch (sigmoid gate, init biases toward AE: sigmoid(4) ≈ 0.98)
+    ConvGNAct(64 → 96) → ConvGNAct(96 → 64) → MultiTaskPredictionHead
+    """
+
+    def __init__(self, n_channels, n_classes=4, alpha_channels=64,
+                 branch_ch=64, trunk_hidden=96, trunk_out=64,
+                 gate_init_bias=4.0,
+                 height_specialist_depth=0,
+                 height_gate_source="alpha", height_hidden_ch=None,
+                 height_trunk_depth=2, height_independent_branches=False,
+                 height_head_kind="linear", height_n_bins=64,
+                 height_bin_max_m=80.0,
+                 presence_head_kind="shared", presence_head_depth=1,
+                 presence_branch_ch=None, bidirectional_ctask=False,
+                 height_blend_mode="presence_gated",
+                 dual_presence=False):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("SimpleGatedFusion assumes 4 output channels")
+        if n_channels <= alpha_channels:
+            raise ValueError(
+                "SimpleGatedFusion expects AlphaEarth+Tessera concat input "
+                f">{alpha_channels} channels, got {n_channels}"
+            )
+        self.supports_aux_outputs = True
+        self.alpha_channels = alpha_channels
+        tessera_channels = n_channels - alpha_channels
+
+        # Branches → equal channel dim for gated mixing
+        self.ae_norm = nn.GroupNorm(1, alpha_channels)
+        self.ae_proj = nn.Conv2d(alpha_channels, branch_ch, kernel_size=1)
+        self.tessera_calib = ChannelCalibration(tessera_channels)
+        self.tessera_proj = nn.Conv2d(tessera_channels, branch_ch, kernel_size=1)
+
+        # Sigmoid gate, AE-dominant at init: g = sigmoid(b_init) ≈ 0.98.
+        # fused = g·ae + (1-g)·tessera. Gate is per-pixel per-channel,
+        # computed from concat([ae, tessera]).
+        self.gate = nn.Conv2d(2 * branch_ch, branch_ch, kernel_size=1)
+        nn.init.zeros_(self.gate.weight)
+        nn.init.constant_(self.gate.bias, gate_init_bias)
+
+        self.trunk = nn.Sequential(
+            ConvGNAct(branch_ch, trunk_hidden, kernel_size=3),
+            ConvGNAct(trunk_hidden, trunk_out, kernel_size=3),
+        )
+
+        self.head = MultiTaskPredictionHead(
+            in_ch=trunk_out,
+            out_channels=n_classes,
+            height_specialist_depth=height_specialist_depth,
+            height_gate_source=height_gate_source,
+            height_hidden_ch=height_hidden_ch,
+            height_trunk_depth=height_trunk_depth,
+            height_independent_branches=height_independent_branches,
+            height_head_kind=height_head_kind,
+            height_n_bins=height_n_bins,
+            height_bin_max_m=height_bin_max_m,
+            presence_head_kind=presence_head_kind,
+            presence_head_depth=presence_head_depth,
+            presence_branch_ch=presence_branch_ch,
+            bidirectional_ctask=bidirectional_ctask,
+            height_blend_mode=height_blend_mode,
+            dual_presence=dual_presence,
+        )
+
+    def forward(self, x, return_aux=False):
+        ae = x[:, :self.alpha_channels, :, :]
+        tessera = x[:, self.alpha_channels:, :, :]
+
+        ae_feat = self.ae_proj(self.ae_norm(ae))
+        tessera_feat = self.tessera_proj(self.tessera_calib(tessera))
+
+        g = torch.sigmoid(self.gate(torch.cat([ae_feat, tessera_feat], dim=1)))
+        fused = g * ae_feat + (1.0 - g) * tessera_feat
+
+        features = self.trunk(fused)
+        return self.head(features, return_aux=return_aux)

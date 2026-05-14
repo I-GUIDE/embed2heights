@@ -6,6 +6,8 @@ variants are recorded in logs rather than kept as live code.
 
 from .backbones import LightUNet
 from .pixel_fusion import (
+    SimpleConcatFusion,
+    SimpleGatedFusion,
     TesseraCrossAttnLightUNet,
     TesseraIoUFusionGatedLightUNet,
     TesseraIoUFusionLightUNet,
@@ -20,6 +22,10 @@ ACTIVE_MODEL_ALIASES = {
     "ae_tessera_gated": "tessera_iou_fusion_gated",
     "ae_tessera_crossattn": "tessera_crossattn_bottleneck",
     "xfusion_crosslevel": "tessera_token_crosslevel_s2_decoder64_presence_3way_deep",
+    # Lightweight per-pixel fusion: no UNet, ~16% params of gated.
+    "ae_tessera_simple": "simple_concat_fusion",
+    # Hybrid: lightweight trunk + our gated mixing.
+    "ae_tessera_simple_gated": "simple_gated_fusion",
 }
 
 ACTIVE_MODEL_TYPES = set(ACTIVE_MODEL_ALIASES) | set(ACTIVE_MODEL_ALIASES.values())
@@ -135,6 +141,53 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 height_blend_mode=height_blend_mode,
                 dual_presence=dual_presence,
                 ae_only_supervision=ae_only_supervision,
+            ),
+            selected,
+        )
+
+    if selected == "simple_concat_fusion":
+        return (
+            SimpleConcatFusion(
+                n_channels=n_channels,
+                n_classes=n_classes,
+                height_specialist_depth=height_specialist_depth,
+                height_gate_source=height_gate_source,
+                height_hidden_ch=height_hidden_ch,
+                height_trunk_depth=height_trunk_depth,
+                height_independent_branches=height_independent_branches,
+                height_head_kind=height_head_kind,
+                height_n_bins=height_n_bins,
+                height_bin_max_m=height_bin_max_m,
+                presence_head_kind=presence_head_kind,
+                presence_head_depth=presence_head_depth,
+                presence_branch_ch=presence_branch_ch,
+                bidirectional_ctask=bidirectional_ctask,
+                height_blend_mode=height_blend_mode,
+                dual_presence=dual_presence,
+            ),
+            selected,
+        )
+
+    if selected == "simple_gated_fusion":
+        return (
+            SimpleGatedFusion(
+                n_channels=n_channels,
+                n_classes=n_classes,
+                gate_init_bias=gate_init_bias,
+                height_specialist_depth=height_specialist_depth,
+                height_gate_source=height_gate_source,
+                height_hidden_ch=height_hidden_ch,
+                height_trunk_depth=height_trunk_depth,
+                height_independent_branches=height_independent_branches,
+                height_head_kind=height_head_kind,
+                height_n_bins=height_n_bins,
+                height_bin_max_m=height_bin_max_m,
+                presence_head_kind=presence_head_kind,
+                presence_head_depth=presence_head_depth,
+                presence_branch_ch=presence_branch_ch,
+                bidirectional_ctask=bidirectional_ctask,
+                height_blend_mode=height_blend_mode,
+                dual_presence=dual_presence,
             ),
             selected,
         )
