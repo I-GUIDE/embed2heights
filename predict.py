@@ -137,6 +137,10 @@ def model_kwargs_from_run_config(cfg):
         "presence_head_kind": cfg.get("presence_head_kind", TRAIN_DEFAULTS["presence_head_kind"]),
         "presence_head_depth": cfg.get("presence_head_depth", TRAIN_DEFAULTS["presence_head_depth"]),
         "presence_branch_ch": cfg.get("presence_branch_ch", TRAIN_DEFAULTS["presence_branch_ch"]),
+        "bidirectional_ctask": cfg.get("bidirectional_ctask", False),
+        "height_blend_mode": cfg.get("height_blend_mode", "presence_gated"),
+        "dual_presence": cfg.get("dual_presence", False),
+        "ae_only_supervision": (cfg.get("ae_only_deep_sup_weight", 0.0) or 0.0) > 0.0,
     }
 
 
@@ -247,6 +251,9 @@ def main():
     )
     model = model.to(device)
     raw_sd = torch.load(model_path, map_location=device)
+    # Strip torch.compile prefix (_orig_mod.*) if present
+    if any(k.startswith("_orig_mod.") for k in raw_sd):
+        raw_sd = {k[len("_orig_mod."):]: v for k, v in raw_sd.items()}
     # Remap legacy key names: UpsampleBlock renamed self.norm → self.bn
     sd = {k.replace(".norm.", ".bn."): v for k, v in raw_sd.items()}
     missing, unexpected = model.load_state_dict(sd, strict=False)
