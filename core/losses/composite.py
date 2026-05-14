@@ -26,7 +26,15 @@ class ImprovedCompositeLoss(nn.Module):
                  aux_veg_weight=1.0, height_bin_aux_weight=0.0,
                  height_bin_sigma_bins=1.5,
                  dual_presence_consistency_weight=0.0,
-                 ae_only_deep_sup_weight=0.0):
+                 ae_only_deep_sup_weight=0.0,
+                 building_smooth_weight=0.0,
+                 building_smooth_erode_px=1,
+                 building_smooth_thr=0.0,
+                 vegetation_smooth_weight=0.0,
+                 vegetation_smooth_erode_px=1,
+                 vegetation_smooth_thr=0.0,
+                 building_presence_tversky_weight=1.0,
+                 building_presence_bce_weight=1.0):
         super().__init__()
         if loss_preset != "presence_centered":
             raise ValueError("loss_preset must be presence_centered")
@@ -56,6 +64,14 @@ class ImprovedCompositeLoss(nn.Module):
         self.height_bin_sigma_bins = float(height_bin_sigma_bins)
         self.dual_presence_consistency_weight = float(dual_presence_consistency_weight)
         self.ae_only_deep_sup_weight = float(ae_only_deep_sup_weight)
+        self.building_smooth_weight = float(building_smooth_weight)
+        self.building_smooth_erode_px = int(building_smooth_erode_px)
+        self.building_smooth_thr = float(building_smooth_thr)
+        self.vegetation_smooth_weight = float(vegetation_smooth_weight)
+        self.vegetation_smooth_erode_px = int(vegetation_smooth_erode_px)
+        self.vegetation_smooth_thr = float(vegetation_smooth_thr)
+        self.building_presence_tversky_weight = float(building_presence_tversky_weight)
+        self.building_presence_bce_weight = float(building_presence_bce_weight)
 
         self.task = "both"
         self.train_presence = True
@@ -81,6 +97,32 @@ class ImprovedCompositeLoss(nn.Module):
             log_centers,
             sigma_bins=self.height_bin_sigma_bins,
         )
+
+    @staticmethod
+    def _eroded_interior(class_target_2d, thr, erode_px, validity_2d):
+        # class_target_2d: (B, H, W) ground-truth fraction for a single class.
+        # validity_2d: (B, H, W) where height supervision is valid.
+        raw = (class_target_2d > thr).float()
+        if erode_px > 0:
+            k = 2 * erode_px + 1
+            inv = (1.0 - raw).unsqueeze(1)
+            dilated_inv = F.max_pool2d(inv, kernel_size=k, stride=1, padding=erode_px)
+            eroded = (1.0 - dilated_inv).squeeze(1)
+        else:
+            eroded = raw
+        return eroded * validity_2d
+
+    @staticmethod
+    def _interior_height_tv(height_pred_2d, mask_2d):
+        # height_pred_2d, mask_2d: (B, H, W). TV computed on neighbor-pairs where
+        # both endpoints are inside the interior mask, then mean-normalized.
+        dh = torch.abs(height_pred_2d[:, :, 1:] - height_pred_2d[:, :, :-1])
+        dv = torch.abs(height_pred_2d[:, 1:, :] - height_pred_2d[:, :-1, :])
+        mh = torch.minimum(mask_2d[:, :, 1:], mask_2d[:, :, :-1])
+        mv = torch.minimum(mask_2d[:, 1:, :], mask_2d[:, :-1, :])
+        num = (dh * mh).sum() + (dv * mv).sum()
+        den = mh.sum() + mv.sum() + 1e-6
+        return num / den
 
     def forward(self, preds, targets, valid_mask=None):
         """
@@ -208,7 +250,16 @@ class ImprovedCompositeLoss(nn.Module):
                 loss = F.binary_cross_entropy_with_logits(
                     safe_logits, safe_target, reduction="none"
                 )
-                return torch.sum(loss * lc_mask) / (torch.sum(lc_mask) + 1e-6)
+                # Per-channel weighting: emphasize building if requested.
+                ch_weights = torch.tensor(
+                    [self.building_presence_bce_weight, 1.0, 1.0],
+                    device=loss.device,
+                    dtype=loss.dtype,
+                ).view(1, 3, 1, 1)
+                weighted_loss = loss * lc_mask * ch_weights
+                # Normalize by the unweighted valid count so the per-class
+                # building emphasis raises the overall loss magnitude.
+                return torch.sum(weighted_loss) / (torch.sum(lc_mask) + 1e-6)
 
             presence_loss = masked_presence_bce(aux_outputs["presence_logits"])
             if self.loss_preset == "presence_centered":
@@ -228,7 +279,10 @@ class ImprovedCompositeLoss(nn.Module):
                     presence_target[:, 2, :, :],
                     valid_mask=gm_bool,
                 )
-                presence_tversky_loss = (p_build + p_veg + p_water) / 3.0
+                # Asymmetric per-class weighting: scale building contribution
+                # to push building recall when iou_bld is the bottleneck.
+                b_w = self.building_presence_tversky_weight
+                presence_tversky_loss = (b_w * p_build + p_veg + p_water) / 3.0
 
             target_height = targets[:, 3:4, :, :]
             bld_height_mask = (targets[:, 0:1, :, :] > 0).float() * height_mask
@@ -364,6 +418,38 @@ class ImprovedCompositeLoss(nn.Module):
         w_axh = self.aux_weight if self.train_height else 0.0
         w_bince = self.height_bin_aux_weight if self.train_height else 0.0
 
+        # ── Interior height-TV regularization (building + vegetation) ──────
+        # Penalizes predicted height gradients inside eroded GT class footprints.
+        # Buildings: encourages within-structure flatness. Vegetation: encourages
+        # local smoothness across the canopy (lighter weight recommended since
+        # vegetation height is not truly uniform within a tree-class patch).
+        building_smooth_loss = zero
+        vegetation_smooth_loss = zero
+        if self.train_height and (preds.shape[1] >= 4):
+            height_pred_2d = preds[:, 3, :, :]
+            if self.building_smooth_weight > 0:
+                interior_bld = self._eroded_interior(
+                    targets[:, 0, :, :],
+                    self.building_smooth_thr,
+                    self.building_smooth_erode_px,
+                    height_1ch,
+                )
+                building_smooth_loss = self._interior_height_tv(
+                    height_pred_2d, interior_bld
+                )
+                total_loss = total_loss + self.building_smooth_weight * building_smooth_loss
+            if self.vegetation_smooth_weight > 0:
+                interior_veg = self._eroded_interior(
+                    targets[:, 1, :, :],
+                    self.vegetation_smooth_thr,
+                    self.vegetation_smooth_erode_px,
+                    height_1ch,
+                )
+                vegetation_smooth_loss = self._interior_height_tv(
+                    height_pred_2d, interior_veg
+                )
+                total_loss = total_loss + self.vegetation_smooth_weight * vegetation_smooth_loss
+
         components = {
             "mae": loss_mae,
             "fraction_mae": loss_fraction_mae,
@@ -389,5 +475,9 @@ class ImprovedCompositeLoss(nn.Module):
             "dual_aux_bce": dual_aux_bce_loss,
             "dual_aux_tversky": dual_aux_tversky_loss,
             "dual_consistency": dual_consistency_loss,
+            "building_smooth": building_smooth_loss,
+            "vegetation_smooth": vegetation_smooth_loss,
+            "weighted_building_smooth": self.building_smooth_weight * building_smooth_loss,
+            "weighted_vegetation_smooth": self.vegetation_smooth_weight * vegetation_smooth_loss,
         }
         return total_loss, components
