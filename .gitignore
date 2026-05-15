@@ -53,6 +53,9 @@ configs/
 !configs/legacy/*.md
 *.sbatch
 !sample.sbatch
+
+# Experiment / launcher scripts (not part of the core library).
+scripts/
 *.out
 run_uw_gated_F_submit.bash
 run_uw_gated_F_seeds.bash
