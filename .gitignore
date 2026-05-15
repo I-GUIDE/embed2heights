@@ -54,8 +54,10 @@ configs/
 *.sbatch
 !sample.sbatch
 
-# Experiment / launcher scripts (not part of the core library).
-scripts/
+# Experiment / launcher scripts (not part of the core library), except the
+# canonical example launcher.
+scripts/*
+!scripts/example_run_fold0.bash
 *.out
 run_uw_gated_F_submit.bash
 run_uw_gated_F_seeds.bash

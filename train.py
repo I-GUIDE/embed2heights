@@ -75,6 +75,10 @@ MODEL_CHOICES = [
     # Active strategy aliases (registry.py)
     "ae_only", "ae_tessera", "ae_tessera_gated", "ae_tessera_crossattn",
     "xfusion_crosslevel",
+    "ae_tessera_simple", "ae_tessera_simple_gated",
+    "ae_tessera_simple_convnext", "ae_tessera_simple_aspp",
+    "simple_concat_fusion", "simple_gated_fusion",
+    "simple_concat_convnext", "simple_concat_aspp",
 ]
 LOSS_PRESET_CHOICES = ["auto", "current", "no_ssim_grad", "presence_centered"]
 
@@ -117,6 +121,7 @@ RAW_COMPONENTS = (
     "aux_height_vegetation",
     "height_bin_ce",
     "building_smooth",
+    "vegetation_smooth",
 )
 
 WEIGHTED_COMPONENTS = (
@@ -130,6 +135,7 @@ WEIGHTED_COMPONENTS = (
     "weighted_aux_height",
     "weighted_height_bin_ce",
     "weighted_building_smooth",
+    "weighted_vegetation_smooth",
 )
 
 
@@ -350,6 +356,26 @@ def parse_args():
     p.add_argument("--building-smooth-thr", type=float, default=0.0,
                    help="GT building fraction threshold used to define building "
                         "pixels for interior smoothness.")
+    p.add_argument("--vegetation-smooth-weight", type=float, default=0.0,
+                   help="Weight for height total-variation loss inside eroded GT "
+                        "vegetation interiors. 0.0 disables it. Lighter than "
+                        "building smooth is usually appropriate because canopy "
+                        "height varies smoothly rather than being uniform.")
+    p.add_argument("--vegetation-smooth-erode-px", type=int, default=1,
+                   help="Binary erosion radius in pixels before applying "
+                        "vegetation interior smoothness.")
+    p.add_argument("--vegetation-smooth-thr", type=float, default=0.0,
+                   help="GT vegetation fraction threshold used to define "
+                        "vegetation pixels for interior smoothness.")
+    p.add_argument("--building-presence-tversky-weight", type=float, default=1.0,
+                   help="Per-channel weight multiplier applied to the building "
+                        "class in the presence Tversky loss. 1.0 = symmetric "
+                        "(default); >1 emphasizes building recall — target "
+                        "iou_bld when buildings are the LB bottleneck.")
+    p.add_argument("--building-presence-bce-weight", type=float, default=1.0,
+                   help="Per-channel weight multiplier applied to the building "
+                        "class in the presence BCE loss. 1.0 = symmetric; "
+                        ">1 emphasizes building presence prediction.")
     p.add_argument("--lds-sampler", action="store_true",
                    help="Replace shuffle=True on the train DataLoader with a "
                         "WeightedRandomSampler whose per-patch weights are 1/n_b on "
@@ -832,6 +858,11 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "building_smooth_weight": args.building_smooth_weight,
         "building_smooth_erode_px": args.building_smooth_erode_px,
         "building_smooth_thr": args.building_smooth_thr,
+        "vegetation_smooth_weight": args.vegetation_smooth_weight,
+        "vegetation_smooth_erode_px": args.vegetation_smooth_erode_px,
+        "vegetation_smooth_thr": args.vegetation_smooth_thr,
+        "building_presence_tversky_weight": args.building_presence_tversky_weight,
+        "building_presence_bce_weight": args.building_presence_bce_weight,
         "task": args.task,
         "lds_sampler": args.lds_sampler,
         "lds_bins":    args.lds_bins,
@@ -1054,6 +1085,14 @@ def main():
         height_bin_sigma_bins=args.height_bin_sigma_bins,
         dual_presence_consistency_weight=args.dual_presence_consistency_weight,
         ae_only_deep_sup_weight=args.ae_only_deep_sup_weight,
+        building_smooth_weight=args.building_smooth_weight,
+        building_smooth_erode_px=args.building_smooth_erode_px,
+        building_smooth_thr=args.building_smooth_thr,
+        vegetation_smooth_weight=args.vegetation_smooth_weight,
+        vegetation_smooth_erode_px=args.vegetation_smooth_erode_px,
+        vegetation_smooth_thr=args.vegetation_smooth_thr,
+        building_presence_tversky_weight=args.building_presence_tversky_weight,
+        building_presence_bce_weight=args.building_presence_bce_weight,
     ).to(device)
     print(
         "Using loss: "
@@ -1078,6 +1117,9 @@ def main():
         f"building_smooth_weight={args.building_smooth_weight}, "
         f"building_smooth_erode_px={args.building_smooth_erode_px}, "
         f"building_smooth_thr={args.building_smooth_thr}, "
+        f"vegetation_smooth_weight={args.vegetation_smooth_weight}, "
+        f"vegetation_smooth_erode_px={args.vegetation_smooth_erode_px}, "
+        f"vegetation_smooth_thr={args.vegetation_smooth_thr}, "
         f"task={args.task}"
     )
 

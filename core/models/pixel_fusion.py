@@ -3,7 +3,7 @@ import torch.nn as nn
 
 import torch.nn.functional as F
 
-from .blocks import ChannelCalibration, ConvGNAct, _group_count
+from .blocks import ASPP, ChannelCalibration, ConvGNAct, ConvNeXtBlock, _group_count
 from .backbones import DoubleConv, LightUNet
 from .heads import MultiTaskPredictionHead
 
@@ -665,4 +665,159 @@ class SimpleGatedFusion(nn.Module):
         fused = g * ae_feat + (1.0 - g) * tessera_feat
 
         features = self.trunk(fused)
+        return self.head(features, return_aux=return_aux)
+
+
+class SimpleConcatConvNeXt(nn.Module):
+    """Lightweight per-pixel fusion with ConvNeXt trunk for larger receptive
+    field. Targets building IoU specifically: 7x7 depthwise conv per block
+    gives more spatial context than 3x3 ConvGNAct.
+
+    AE → GroupNorm + 1x1 → 48ch
+    Tessera → ChannelCalibration + 1x1 → 80ch
+    concat → 128ch → 1x1 reduce → 64ch → ConvNeXtBlock(64) × n_blocks → head
+    """
+
+    def __init__(self, n_channels, n_classes=4, alpha_channels=64,
+                 ae_proj_ch=48, tessera_proj_ch=80,
+                 trunk_ch=64, n_blocks=3,
+                 height_specialist_depth=0,
+                 height_gate_source="alpha", height_hidden_ch=None,
+                 height_trunk_depth=2, height_independent_branches=False,
+                 height_head_kind="linear", height_n_bins=64,
+                 height_bin_max_m=80.0,
+                 presence_head_kind="shared", presence_head_depth=1,
+                 presence_branch_ch=None, bidirectional_ctask=False,
+                 height_blend_mode="presence_gated",
+                 dual_presence=False):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("SimpleConcatConvNeXt assumes 4 output channels")
+        if n_channels <= alpha_channels:
+            raise ValueError(
+                "SimpleConcatConvNeXt expects AlphaEarth+Tessera concat input "
+                f">{alpha_channels} channels, got {n_channels}"
+            )
+        self.supports_aux_outputs = True
+        self.alpha_channels = alpha_channels
+        tessera_channels = n_channels - alpha_channels
+
+        self.ae_norm = nn.GroupNorm(1, alpha_channels)
+        self.ae_proj = nn.Conv2d(alpha_channels, ae_proj_ch, kernel_size=1)
+        self.tessera_calib = ChannelCalibration(tessera_channels)
+        self.tessera_proj = nn.Conv2d(tessera_channels, tessera_proj_ch, kernel_size=1)
+
+        fused_ch = ae_proj_ch + tessera_proj_ch
+        self.reduce = nn.Sequential(
+            nn.Conv2d(fused_ch, trunk_ch, kernel_size=1),
+            nn.GroupNorm(_group_count(trunk_ch), trunk_ch),
+            nn.GELU(),
+        )
+        self.blocks = nn.Sequential(*[
+            ConvNeXtBlock(trunk_ch) for _ in range(n_blocks)
+        ])
+
+        self.head = MultiTaskPredictionHead(
+            in_ch=trunk_ch,
+            out_channels=n_classes,
+            height_specialist_depth=height_specialist_depth,
+            height_gate_source=height_gate_source,
+            height_hidden_ch=height_hidden_ch,
+            height_trunk_depth=height_trunk_depth,
+            height_independent_branches=height_independent_branches,
+            height_head_kind=height_head_kind,
+            height_n_bins=height_n_bins,
+            height_bin_max_m=height_bin_max_m,
+            presence_head_kind=presence_head_kind,
+            presence_head_depth=presence_head_depth,
+            presence_branch_ch=presence_branch_ch,
+            bidirectional_ctask=bidirectional_ctask,
+            height_blend_mode=height_blend_mode,
+            dual_presence=dual_presence,
+        )
+
+    def forward(self, x, return_aux=False):
+        ae = x[:, :self.alpha_channels, :, :]
+        tessera = x[:, self.alpha_channels:, :, :]
+
+        ae_feat = self.ae_proj(self.ae_norm(ae))
+        tessera_feat = self.tessera_proj(self.tessera_calib(tessera))
+
+        fused = torch.cat([ae_feat, tessera_feat], dim=1)
+        features = self.blocks(self.reduce(fused))
+        return self.head(features, return_aux=return_aux)
+
+
+class SimpleConcatASPP(nn.Module):
+    """Lightweight per-pixel fusion with ASPP for multi-scale context.
+
+    AE → GroupNorm + 1x1 → 48ch
+    Tessera → ChannelCalibration + 1x1 → 80ch
+    concat → 128ch → ASPP(128 → 96, rates=(1,3,6,12)) → ConvGNAct(64) → head
+    Smaller dilation rates than the default since building variations are
+    bounded; rates=(1,3,6,12) captures up to ~25px context at 256x256.
+    """
+
+    def __init__(self, n_channels, n_classes=4, alpha_channels=64,
+                 ae_proj_ch=48, tessera_proj_ch=80,
+                 aspp_ch=96, trunk_out=64,
+                 aspp_rates=(1, 3, 6, 12),
+                 height_specialist_depth=0,
+                 height_gate_source="alpha", height_hidden_ch=None,
+                 height_trunk_depth=2, height_independent_branches=False,
+                 height_head_kind="linear", height_n_bins=64,
+                 height_bin_max_m=80.0,
+                 presence_head_kind="shared", presence_head_depth=1,
+                 presence_branch_ch=None, bidirectional_ctask=False,
+                 height_blend_mode="presence_gated",
+                 dual_presence=False):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("SimpleConcatASPP assumes 4 output channels")
+        if n_channels <= alpha_channels:
+            raise ValueError(
+                "SimpleConcatASPP expects AlphaEarth+Tessera concat input "
+                f">{alpha_channels} channels, got {n_channels}"
+            )
+        self.supports_aux_outputs = True
+        self.alpha_channels = alpha_channels
+        tessera_channels = n_channels - alpha_channels
+
+        self.ae_norm = nn.GroupNorm(1, alpha_channels)
+        self.ae_proj = nn.Conv2d(alpha_channels, ae_proj_ch, kernel_size=1)
+        self.tessera_calib = ChannelCalibration(tessera_channels)
+        self.tessera_proj = nn.Conv2d(tessera_channels, tessera_proj_ch, kernel_size=1)
+
+        fused_ch = ae_proj_ch + tessera_proj_ch
+        self.aspp = ASPP(fused_ch, aspp_ch, rates=aspp_rates)
+        self.reduce = ConvGNAct(aspp_ch, trunk_out, kernel_size=3)
+
+        self.head = MultiTaskPredictionHead(
+            in_ch=trunk_out,
+            out_channels=n_classes,
+            height_specialist_depth=height_specialist_depth,
+            height_gate_source=height_gate_source,
+            height_hidden_ch=height_hidden_ch,
+            height_trunk_depth=height_trunk_depth,
+            height_independent_branches=height_independent_branches,
+            height_head_kind=height_head_kind,
+            height_n_bins=height_n_bins,
+            height_bin_max_m=height_bin_max_m,
+            presence_head_kind=presence_head_kind,
+            presence_head_depth=presence_head_depth,
+            presence_branch_ch=presence_branch_ch,
+            bidirectional_ctask=bidirectional_ctask,
+            height_blend_mode=height_blend_mode,
+            dual_presence=dual_presence,
+        )
+
+    def forward(self, x, return_aux=False):
+        ae = x[:, :self.alpha_channels, :, :]
+        tessera = x[:, self.alpha_channels:, :, :]
+
+        ae_feat = self.ae_proj(self.ae_norm(ae))
+        tessera_feat = self.tessera_proj(self.tessera_calib(tessera))
+
+        fused = torch.cat([ae_feat, tessera_feat], dim=1)
+        features = self.reduce(self.aspp(fused))
         return self.head(features, return_aux=return_aux)
