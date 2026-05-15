@@ -10,7 +10,6 @@
 # validation prediction/evaluation. Test prediction and submission creation are
 # included as an optional final stage.
 
-#SBATCH --account=bcrm-tgirails
 #SBATCH --job-name=ae_tessera_gated
 #SBATCH --output=slurm-%j-ae_tessera_gated.out
 #SBATCH --nodes=1
@@ -20,6 +19,8 @@
 #SBATCH --mem=40G
 #SBATCH --time=48:00:00
 #SBATCH --partition=gpu_a100
+# NOTE: Add #SBATCH --account=<your-slurm-account> here for clusters that
+# require an account, or set SBATCH_ACCOUNT in your environment.
 
 set -euo pipefail
 
@@ -29,9 +30,11 @@ echo "SLURM job ID: ${SLURM_JOB_ID:-local}"
 
 # ---- User settings ---------------------------------------------------------
 
-PROJECT_DIR=/u/dingqi2/workspace/esa/emb2heights-backbone
-DATA_DIR=/projects/bcrm/emb2height/data
-CONDA_ENV=emb2heights
+# PROJECT_DIR defaults to where this script lives. Override via env var when
+# submitting from elsewhere, e.g.  PROJECT_DIR=/path/to/clone sbatch sample.sbatch
+PROJECT_DIR="${PROJECT_DIR:-$(cd "$(dirname "$0")" && pwd)}"
+DATA_DIR="${DATA_DIR:-${PROJECT_DIR}/data}"
+CONDA_ENV="${CONDA_ENV:-emb2heights}"
 
 EXP_NAME=ae_tessera_gated_v001
 CONFIG=${PROJECT_DIR}/configs/active/ae_tessera_gated.yml
