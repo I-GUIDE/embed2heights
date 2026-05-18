@@ -141,6 +141,7 @@ def model_kwargs_from_run_config(cfg):
         "height_blend_mode": cfg.get("height_blend_mode", "presence_gated"),
         "dual_presence": cfg.get("dual_presence", False),
         "ae_only_supervision": (cfg.get("ae_only_deep_sup_weight", 0.0) or 0.0) > 0.0,
+        "use_se": cfg.get("use_se", False),
     }
 
 

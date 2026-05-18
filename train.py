@@ -74,7 +74,7 @@ MODEL_CHOICES = [
     "tessera_token_crosslevel_xattn_bottleneck_decoder64",
     # Active strategy aliases (registry.py)
     "ae_only", "ae_tessera", "ae_tessera_gated", "ae_tessera_crossattn",
-    "xfusion_crosslevel",
+    "xfusion_crosslevel", "xfusion_pp", "tessera_token_crosslevel_s2_decoder64_perpixel",
     "ae_tessera_simple", "ae_tessera_simple_gated",
     "ae_tessera_simple_convnext", "ae_tessera_simple_aspp",
     "simple_concat_fusion", "simple_gated_fusion",
@@ -200,6 +200,44 @@ def parse_args():
                    help="Apply random D4 (h-flip/v-flip/transpose) augmentation to "
                         "training patches. Only wired into PixelEmbeddingDataset and "
                         "MultiPixelEmbeddingDataset (AE-only / AE+Tessera pixel paths).")
+    p.add_argument("--cutmix-prob", type=float, default=0.0,
+                   help="Probability of CutMix per training sample. Pastes a random box "
+                        "from another training tile into the current one (both image and "
+                        "label). Targets KE-density distribution shift by creating "
+                        "synthetic high-density composites.")
+    p.add_argument("--cutmix-min-frac", type=float, default=0.15)
+    p.add_argument("--cutmix-max-frac", type=float, default=0.50)
+    p.add_argument("--cutmix-density-aware", action="store_true",
+                   help="When pasting via CutMix, prefer source tiles with higher "
+                        "building density (creates KE-like dense composites).")
+    p.add_argument("--mixup-prob", type=float, default=0.0,
+                   help="Mixup probability per training sample. Linear blend of two "
+                        "tiles (both embedding and label) with lam ~ Beta(alpha,alpha). "
+                        "No discontinuities, unlike CutMix.")
+    p.add_argument("--mixup-alpha", type=float, default=0.2,
+                   help="Beta distribution alpha for mixup. 0.2 = strong mixing, 1.0 = mild.")
+    p.add_argument("--bld-copypaste-prob", type=float, default=0.0,
+                   help="Building copy-paste augmentation. Picks a donor tile with "
+                        "buildings, finds the BBox of building pixels, pastes that "
+                        "region (with corresponding embedding features) into the "
+                        "current tile at a random position. Targets iou_bld.")
+    p.add_argument("--bld-copypaste-max-size-frac", type=float, default=0.25,
+                   help="Maximum size of the pasted building region as a fraction of "
+                        "patch dimension. 0.25 = up to 25%% of patch h/w.")
+    p.add_argument("--use-se", action="store_true",
+                   help="Enable Squeeze-Excitation channel attention in LightUNet "
+                        "DoubleConv blocks. Lightweight, well-proven on segmentation.")
+    p.add_argument("--boundary-weight", type=float, default=0.0,
+                   help="Enable boundary-aware loss. Upweights BCE on the building "
+                        "channel near GT boundaries. >0 enables, e.g. 1.0 to turn on.")
+    p.add_argument("--boundary-sigma-px", type=float, default=2.0,
+                   help="Width of the boundary band in pixels (dilation iters).")
+    p.add_argument("--boundary-amp", type=float, default=4.0,
+                   help="Boundary upweight multiplier: weight = 1 + amp * boundary_band.")
+    p.add_argument("--lovasz-weight", type=float, default=0.0,
+                   help="Mix Lovász-Hinge loss on building logits with weight "
+                        "lovasz_weight (added to total loss). Directly optimizes "
+                        "building IoU. Recommended 0.3-0.7. 0 disables.")
     p.add_argument("--bidirectional-ctask", action="store_true",
                    help="Enable bidirectional cross-task attention in ae_tessera_gated: "
                         "height trunk features gate the presence head input via a "
@@ -704,12 +742,24 @@ def make_dataloaders(args, device):
         train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, scale_factor=16, is_train=True)
         val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, scale_factor=16, is_train=False)
     else:
-        train_ds = DatasetCls(
-            train_pairs,
+        ds_kwargs = dict(
             patch_size=args.patch_size,
             is_train=True,
             geom_aug=getattr(args, "geom_aug", False),
         )
+        # Only the multi-pixel dataset supports CutMix
+        if DatasetCls.__name__ == "MultiPixelEmbeddingDataset":
+            ds_kwargs.update(
+                cutmix_prob=getattr(args, "cutmix_prob", 0.0),
+                cutmix_min_frac=getattr(args, "cutmix_min_frac", 0.15),
+                cutmix_max_frac=getattr(args, "cutmix_max_frac", 0.50),
+                cutmix_density_aware=getattr(args, "cutmix_density_aware", False),
+                mixup_prob=getattr(args, "mixup_prob", 0.0),
+                mixup_alpha=getattr(args, "mixup_alpha", 0.2),
+                bld_copypaste_prob=getattr(args, "bld_copypaste_prob", 0.0),
+                bld_copypaste_max_size_frac=getattr(args, "bld_copypaste_max_size_frac", 0.25),
+            )
+        train_ds = DatasetCls(train_pairs, **ds_kwargs)
         val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, is_train=False)
 
     loader_kwargs = {
@@ -773,10 +823,14 @@ def load_pretrain_weights(model, checkpoint_path, *, strict=False):
     """Load compatible self-supervised weights without touching unmatched heads."""
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state = checkpoint.get("model_state", checkpoint.get("state_dict", checkpoint))
-    state = {
-        (key[7:] if key.startswith("module.") else key): value
-        for key, value in state.items()
-    }
+
+    def _strip(k):
+        for prefix in ("module.", "_orig_mod."):
+            while k.startswith(prefix):
+                k = k[len(prefix):]
+        return k
+
+    state = {_strip(k): v for k, v in state.items()}
 
     if strict:
         result = model.load_state_dict(state, strict=True)
@@ -891,6 +945,11 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "iou_loss_kind":       args.iou_loss_kind,
         "focal_gamma":         args.focal_gamma,
         "focal_alpha":         args.focal_alpha,
+        "use_se":              getattr(args, "use_se", False),
+        "lovasz_weight":       getattr(args, "lovasz_weight", 0.0),
+        "boundary_weight":     getattr(args, "boundary_weight", 0.0),
+        "boundary_sigma_px":   getattr(args, "boundary_sigma_px", 2.0),
+        "boundary_amp":        getattr(args, "boundary_amp", 4.0),
         "train_targets_dir":    args.train_targets_dir,
         "val_split":       DEFAULTS["val_split"],
         "device":          str(device),
@@ -1040,6 +1099,7 @@ def main():
         height_blend_mode=args.height_blend_mode,
         dual_presence=args.dual_presence,
         ae_only_supervision=(args.ae_only_deep_sup_weight > 0.0),
+        use_se=getattr(args, "use_se", False),
     )
     if args.init_from_pretrain:
         load_pretrain_weights(
@@ -1093,6 +1153,10 @@ def main():
         vegetation_smooth_thr=args.vegetation_smooth_thr,
         building_presence_tversky_weight=args.building_presence_tversky_weight,
         building_presence_bce_weight=args.building_presence_bce_weight,
+        boundary_weight=getattr(args, "boundary_weight", 0.0),
+        boundary_sigma_px=getattr(args, "boundary_sigma_px", 2.0),
+        boundary_amp=getattr(args, "boundary_amp", 4.0),
+        lovasz_weight=getattr(args, "lovasz_weight", 0.0),
     ).to(device)
     print(
         "Using loss: "
