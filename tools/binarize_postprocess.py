@@ -27,6 +27,16 @@ def remove_small_components(mask, min_size):
     return keep[labels].astype(mask.dtype)
 
 
+def morphological_closing(mask, kernel_size):
+    """Binary closing: dilate then erode. Fills small gaps inside positive
+    regions, increasing recall on under-segmented classes."""
+    if kernel_size <= 0:
+        return mask
+    from scipy.ndimage import binary_closing
+    struct = np.ones((kernel_size, kernel_size), dtype=bool)
+    return binary_closing(mask.astype(bool), structure=struct).astype(mask.dtype)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--input-dir", required=True)
