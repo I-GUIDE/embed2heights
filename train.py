@@ -75,6 +75,7 @@ MODEL_CHOICES = [
     # Active strategy aliases (registry.py)
     "ae_only", "ae_tessera", "ae_tessera_gated", "ae_tessera_crossattn",
     "xfusion_crosslevel", "xfusion_pp", "tessera_token_crosslevel_s2_decoder64_perpixel",
+    "hier_gated", "hierarchical_gated_token_fusion",
     "ae_tessera_simple", "ae_tessera_simple_gated",
     "ae_tessera_simple_convnext", "ae_tessera_simple_aspp",
     "simple_concat_fusion", "simple_gated_fusion",
