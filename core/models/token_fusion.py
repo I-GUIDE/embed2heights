@@ -5,7 +5,7 @@ import torch.nn.functional as F
 from .blocks import ConvGNAct
 from .backbones import LightUNet
 from .heads import MultiTaskPredictionHead
-from .pixel_fusion import TesseraCompressionStem
+from .pixel_fusion import TesseraCompressionStem, TesseraIoUFusionGatedLightUNet
 
 
 class TokenPyramidNeck(nn.Module):
@@ -235,3 +235,68 @@ class TesseraTokenCrossLevelFusionLightUNet(nn.Module):
         )
         return self.head(feat, return_aux=return_aux,
                          presence_extra=presence_extra)
+
+
+class HierarchicalGatedFusion(nn.Module):
+    """User's hierarchical gated fusion idea.
+
+    Stage 1: AE + Tessera via existing TesseraIoUFusionGatedLightUNet
+      → produces (B, 4, H, W) main output (and aux dict if requested).
+    Stage 2: token features (16x16, e.g. TerraMind-S2 768ch) → 1x1 channel reduce →
+      ConvGNAct → bilinear upsample to (H, W) → conv → (B, 4, H, W) Stage 2 output.
+    Final gate: per-pixel sigmoid gate over [stage1_out, stage2_out],
+      INITIALIZED so the gate ~= 1 (Stage 1 dominant) at init. This guarantees
+      we never DESTROY our known-good Stage 1; tokens can only add small corrections
+      where useful.
+
+    Aux outputs are passed through from Stage 1 (since Stage 2 is just a logit
+    correction, not a deep-supervised branch).
+    """
+
+    def __init__(self, pixel_channels, token_channels, n_classes=4,
+                 token_hidden_ch=64, **stage1_kwargs):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("HierarchicalGatedFusion assumes 4 output channels")
+        self.supports_aux_outputs = True
+        # Stage 1: the proven gated AE+Tessera arch
+        self.stage1 = TesseraIoUFusionGatedLightUNet(
+            n_channels=pixel_channels, n_classes=n_classes, **stage1_kwargs
+        )
+        # Stage 2: light token branch
+        # Channel reduce 768 → 64, then upsample, then 4-channel logits
+        self.token_proj = ConvGNAct(token_channels, token_hidden_ch, kernel_size=1)
+        self.token_conv = ConvGNAct(token_hidden_ch, token_hidden_ch, kernel_size=3)
+        self.token_head = nn.Conv2d(token_hidden_ch, n_classes, kernel_size=1)
+        # Final gate: 2*n_classes inputs → n_classes gate values; bias=4.0 means
+        # sigmoid(4)≈0.98 at init, so Stage1 dominates initially.
+        self.final_gate = nn.Conv2d(2 * n_classes, n_classes, kernel_size=1)
+        nn.init.zeros_(self.final_gate.weight)
+        nn.init.constant_(self.final_gate.bias, 4.0)
+
+    def forward(self, x, return_aux=False):
+        if not isinstance(x, (tuple, list)) or len(x) != 2:
+            raise ValueError("HierarchicalGatedFusion expects (pixel, token) input")
+        pixel, token = x
+        # Stage 1: AE+Tessera through gated UNet
+        if return_aux:
+            stage1_out, aux = self.stage1(pixel, return_aux=True)
+        else:
+            stage1_out = self.stage1(pixel, return_aux=False)
+            aux = None
+
+        # Stage 2: token branch (16x16 → up to pixel HxW)
+        t = self.token_proj(token)
+        t = self.token_conv(t)
+        t = F.interpolate(t, size=(pixel.shape[2], pixel.shape[3]),
+                          mode="bilinear", align_corners=False)
+        stage2_out = self.token_head(t)
+
+        # Per-pixel sigmoid gate: g≈1 at init → stage1 dominant.
+        gate_in = torch.cat([stage1_out, stage2_out], dim=1)
+        gate = torch.sigmoid(self.final_gate(gate_in))
+        fused = gate * stage1_out + (1.0 - gate) * stage2_out
+
+        if return_aux:
+            return fused, aux
+        return fused

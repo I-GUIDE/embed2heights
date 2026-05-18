@@ -14,7 +14,7 @@ from .pixel_fusion import (
     TesseraIoUFusionGatedLightUNet,
     TesseraIoUFusionLightUNet,
 )
-from .token_fusion import TesseraTokenCrossLevelFusionLightUNet
+from .token_fusion import TesseraTokenCrossLevelFusionLightUNet, HierarchicalGatedFusion
 
 
 ACTIVE_MODEL_ALIASES = {
@@ -26,6 +26,10 @@ ACTIVE_MODEL_ALIASES = {
     "xfusion_crosslevel": "tessera_token_crosslevel_s2_decoder64_presence_3way_deep",
     # Per-pixel sigmoid-gated token fusion: model learns WHERE to borrow tokens
     "xfusion_pp": "tessera_token_crosslevel_s2_decoder64_perpixel",
+    # Hierarchical output-level gated fusion: Stage 1 (AE+Tessera gated UNet)
+    # → 4-channel logits. Stage 2 (token branch) → 4-channel logits. Per-pixel
+    # sigmoid gate between them, initialized so Stage 1 dominates at start.
+    "hier_gated": "hierarchical_gated_token_fusion",
     # Lightweight per-pixel fusion: no UNet, ~16% params of gated.
     "ae_tessera_simple": "simple_concat_fusion",
     # Hybrid: lightweight trunk + our gated mixing.
@@ -338,6 +342,46 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 presence_head_depth=2,
                 presence_branch_ch=48,
                 per_pixel_gate=True,
+            ),
+            selected,
+        )
+
+    if selected == "hierarchical_gated_token_fusion":
+        if not isinstance(n_channels, (tuple, list)) or len(n_channels) != 2:
+            raise ValueError(
+                "hier_gated expects n_channels=(pixel_channels, token_channels)"
+            )
+        pixel_channels, token_channels = n_channels
+        return (
+            HierarchicalGatedFusion(
+                pixel_channels=pixel_channels,
+                token_channels=token_channels,
+                n_classes=n_classes,
+                # Stage1 kwargs (forwarded to TesseraIoUFusionGatedLightUNet)
+                tessera_presence_ch=tessera_presence_ch,
+                tessera_hidden_ch=tessera_hidden_ch,
+                tessera_hidden_depth=tessera_hidden_depth,
+                height_specialist_depth=height_specialist_depth,
+                base_ch=lightunet_base_ch,
+                height_gate_source=height_gate_source,
+                height_hidden_ch=height_hidden_ch,
+                height_trunk_depth=height_trunk_depth,
+                height_independent_branches=height_independent_branches,
+                height_head_kind=height_head_kind,
+                height_n_bins=height_n_bins,
+                height_bin_max_m=height_bin_max_m,
+                norm_kind=lightunet_norm_kind,
+                gate_mode=gate_mode,
+                gate_untied=gate_untied,
+                gate_init_bias=gate_init_bias,
+                modality_dropout=modality_dropout,
+                presence_head_kind=presence_head_kind,
+                presence_head_depth=presence_head_depth,
+                presence_branch_ch=presence_branch_ch,
+                bidirectional_ctask=bidirectional_ctask,
+                height_blend_mode=height_blend_mode,
+                dual_presence=dual_presence,
+                use_se=use_se,
             ),
             selected,
         )
