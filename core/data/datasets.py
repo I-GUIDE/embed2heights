@@ -189,16 +189,30 @@ class MultiPixelEmbeddingDataset(Dataset):
       - (primary_emb_path, secondary_emb_path, label_path)
       - (primary_emb_path, secondary_emb_path) for label-free inference
     """
-    def __init__(self, file_pairs, patch_size=128, is_train=True, geom_aug=False):
+    def __init__(self, file_pairs, patch_size=128, is_train=True, geom_aug=False,
+                 cutmix_prob=0.0, cutmix_min_frac=0.15, cutmix_max_frac=0.5,
+                 cutmix_density_aware=False, mixup_prob=0.0, mixup_alpha=0.2,
+                 bld_copypaste_prob=0.0, bld_copypaste_max_size_frac=0.25):
         self.patch_size = patch_size
         self.is_train = is_train
         self.geom_aug = bool(geom_aug)
         self.file_pairs = file_pairs
+        self.cutmix_prob = float(cutmix_prob)
+        self.cutmix_min_frac = float(cutmix_min_frac)
+        self.cutmix_max_frac = float(cutmix_max_frac)
+        self.cutmix_density_aware = bool(cutmix_density_aware)
+        self.mixup_prob = float(mixup_prob)
+        self.mixup_alpha = float(mixup_alpha)
+        # Building copy-paste: locate a building region in a donor tile and
+        # paste it (with corresponding embedding features) into the current tile.
+        # Increases building diversity in low-density tiles. Targets iou_bld.
+        self.bld_copypaste_prob = float(bld_copypaste_prob)
+        self.bld_copypaste_max_size_frac = float(bld_copypaste_max_size_frac)
 
     def __len__(self):
         return len(self.file_pairs)
 
-    def __getitem__(self, idx):
+    def _load_tile(self, idx):
         pair = self.file_pairs[idx]
         if len(pair) == 3:
             primary_path, secondary_path, tar_path = pair
@@ -207,26 +221,118 @@ class MultiPixelEmbeddingDataset(Dataset):
             tar_path = None
         else:
             raise ValueError("MultiPixelEmbeddingDataset expects 2- or 3-item tuples")
-
         primary = _read_raster(primary_path)
         secondary = _read_raster(secondary_path)
-
         _assert_same_spatial(primary, secondary, primary_path, secondary_path, "Embedding")
         image = np.concatenate([primary, secondary], axis=0)
         target, valid_mask = _prepare_target(tar_path, image.shape[1:])
-
         image, target, valid_mask = _pad_pixel_training_tensors(
-            image,
-            target,
-            valid_mask,
-            self.patch_size,
+            image, target, valid_mask, self.patch_size,
         )
         _, h, w = image.shape
         top, left = _sample_or_center_origin(h, w, self.patch_size, self.is_train)
-
         image = _crop_chw(image, top, left, self.patch_size)
         target = _crop_chw(target, top, left, self.patch_size)
         valid_mask = _crop_chw(valid_mask, top, left, self.patch_size)
+        return image, target, valid_mask
+
+    def __getitem__(self, idx):
+        image, target, valid_mask = self._load_tile(idx)
+
+        # CutMix: with probability cutmix_prob, paste a random box from another
+        # tile into this one. Useful for KE-density augmentation since pasting
+        # high-density patches creates synthetic urban-dense composites.
+        if self.is_train and self.cutmix_prob > 0 and np.random.rand() < self.cutmix_prob:
+            # Pick source tile. If density_aware, sample from indices with above-average building label.
+            if self.cutmix_density_aware:
+                # Try a few candidates and pick the one with highest bld density
+                best_idx = None; best_density = -1.0
+                for _ in range(3):
+                    cand = np.random.randint(len(self.file_pairs))
+                    if cand == idx: continue
+                    _, t_cand, _ = self._load_tile(cand)
+                    d = float((t_cand[0] > 0.5).mean())
+                    if d > best_density: best_density = d; best_idx = cand
+                src_idx = best_idx if best_idx is not None else np.random.randint(len(self.file_pairs))
+            else:
+                src_idx = np.random.randint(len(self.file_pairs))
+                while src_idx == idx:
+                    src_idx = np.random.randint(len(self.file_pairs))
+            src_image, src_target, src_valid_mask = self._load_tile(src_idx)
+            # Random cut box
+            ph = image.shape[1]; pw = image.shape[2]
+            frac = np.random.uniform(self.cutmix_min_frac, self.cutmix_max_frac)
+            bh = max(1, int(round(np.sqrt(frac) * ph)))
+            bw = max(1, int(round(np.sqrt(frac) * pw)))
+            y0 = np.random.randint(0, max(1, ph - bh + 1))
+            x0 = np.random.randint(0, max(1, pw - bw + 1))
+            image[:, y0:y0+bh, x0:x0+bw] = src_image[:, y0:y0+bh, x0:x0+bw]
+            target[:, y0:y0+bh, x0:x0+bw] = src_target[:, y0:y0+bh, x0:x0+bw]
+            valid_mask[:, y0:y0+bh, x0:x0+bw] = src_valid_mask[:, y0:y0+bh, x0:x0+bw]
+
+        # Building Copy-Paste: find a building region in a donor tile, crop a
+        # bounding box around real building pixels, paste it (with corresponding
+        # embedding features) into the current tile at a random position. This
+        # targets iou_bld by giving the model real buildings in diverse
+        # geographic contexts.
+        if self.is_train and self.bld_copypaste_prob > 0 and np.random.rand() < self.bld_copypaste_prob:
+            # Try up to 5 donor candidates; accept the first with enough building pixels.
+            donor_image = None
+            donor_target = None
+            donor_valid = None
+            donor_bbox = None
+            for _ in range(5):
+                cand = np.random.randint(len(self.file_pairs))
+                if cand == idx:
+                    continue
+                d_image, d_target, d_valid = self._load_tile(cand)
+                bld_pix = (d_target[0] > 0.1)  # channel 0 = building presence
+                if bld_pix.sum() < 32:  # too few buildings, skip
+                    continue
+                # Find bounding box of building pixels
+                ys, xs = np.where(bld_pix)
+                y0, y1 = int(ys.min()), int(ys.max()) + 1
+                x0, x1 = int(xs.min()), int(xs.max()) + 1
+                # Limit box size to <= max_size_frac of patch
+                ph_p, pw_p = d_image.shape[1], d_image.shape[2]
+                max_h = int(ph_p * self.bld_copypaste_max_size_frac)
+                max_w = int(pw_p * self.bld_copypaste_max_size_frac)
+                bh = min(y1 - y0, max_h)
+                bw = min(x1 - x0, max_w)
+                # Random crop within the bounding box if larger than max
+                if (y1 - y0) > bh:
+                    y0 = y0 + np.random.randint(0, (y1 - y0) - bh + 1)
+                if (x1 - x0) > bw:
+                    x0 = x0 + np.random.randint(0, (x1 - x0) - bw + 1)
+                donor_image = d_image
+                donor_target = d_target
+                donor_valid = d_valid
+                donor_bbox = (y0, y0 + bh, x0, x0 + bw)
+                break
+            if donor_bbox is not None:
+                dy0, dy1, dx0, dx1 = donor_bbox
+                bh = dy1 - dy0
+                bw = dx1 - dx0
+                ph_c, pw_c = image.shape[1], image.shape[2]
+                # Random paste location in current tile
+                py = np.random.randint(0, max(1, ph_c - bh + 1))
+                px = np.random.randint(0, max(1, pw_c - bw + 1))
+                # Paste both inputs and targets so input-output consistency holds
+                image[:, py:py+bh, px:px+bw] = donor_image[:, dy0:dy1, dx0:dx1]
+                target[:, py:py+bh, px:px+bw] = donor_target[:, dy0:dy1, dx0:dx1]
+                valid_mask[:, py:py+bh, px:px+bw] = donor_valid[:, dy0:dy1, dx0:dx1]
+
+        # Mixup: linear blend with another tile. No discontinuities (unlike CutMix).
+        if self.is_train and self.mixup_prob > 0 and np.random.rand() < self.mixup_prob:
+            src_idx = np.random.randint(len(self.file_pairs))
+            while src_idx == idx:
+                src_idx = np.random.randint(len(self.file_pairs))
+            src_image, src_target, src_valid_mask = self._load_tile(src_idx)
+            lam = float(np.random.beta(self.mixup_alpha, self.mixup_alpha))
+            lam = max(lam, 1.0 - lam)  # ensure lam >= 0.5 so the primary tile dominates
+            image = (lam * image + (1.0 - lam) * src_image).astype(np.float32)
+            target = (lam * target + (1.0 - lam) * src_target).astype(np.float32)
+            valid_mask = np.minimum(valid_mask, src_valid_mask)
 
         if self.is_train and self.geom_aug:
             image, target, valid_mask = _apply_d4_aug(image, target, valid_mask)
