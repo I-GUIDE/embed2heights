@@ -24,6 +24,8 @@ ACTIVE_MODEL_ALIASES = {
     "ae_tessera_gated": "tessera_iou_fusion_gated",
     "ae_tessera_crossattn": "tessera_crossattn_bottleneck",
     "xfusion_crosslevel": "tessera_token_crosslevel_s2_decoder64_presence_3way_deep",
+    # Per-pixel sigmoid-gated token fusion: model learns WHERE to borrow tokens
+    "xfusion_pp": "tessera_token_crosslevel_s2_decoder64_perpixel",
     # Lightweight per-pixel fusion: no UNet, ~16% params of gated.
     "ae_tessera_simple": "simple_concat_fusion",
     # Hybrid: lightweight trunk + our gated mixing.
@@ -67,7 +69,8 @@ def build_active_model(model_type, n_channels, n_classes, *,
                        crossattn_n_heads=4,
                        height_blend_mode="presence_gated",
                        dual_presence=False,
-                       ae_only_supervision=False):
+                       ae_only_supervision=False,
+                       use_se=False):
     selected = canonical_model_type(model_type)
     if selected not in ACTIVE_MODEL_TYPES:
         return None
@@ -147,6 +150,7 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 height_blend_mode=height_blend_mode,
                 dual_presence=dual_presence,
                 ae_only_supervision=ae_only_supervision,
+                use_se=use_se,
             ),
             selected,
         )
@@ -298,6 +302,42 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 presence_head_kind="split_all",
                 presence_head_depth=2,
                 presence_branch_ch=48,
+            ),
+            selected,
+        )
+
+    if selected == "tessera_token_crosslevel_s2_decoder64_perpixel":
+        # Same as xfusion_crosslevel but with per-pixel gate: model learns
+        # WHERE to borrow tokens. Safe init (gate≈0) so it starts as the
+        # AE+Tessera baseline and only borrows when helpful.
+        if not isinstance(n_channels, (tuple, list)) or len(n_channels) != 2:
+            raise ValueError(
+                "xfusion_pp expects n_channels=(pixel_channels, token_channels)"
+            )
+        pixel_channels, token_channels = n_channels
+        return (
+            TesseraTokenCrossLevelFusionLightUNet(
+                pixel_channels=pixel_channels,
+                token_channels=token_channels,
+                n_classes=n_classes,
+                tessera_presence_ch=tessera_presence_ch,
+                tessera_hidden_ch=tessera_hidden_ch,
+                tessera_hidden_depth=tessera_hidden_depth,
+                height_specialist_depth=height_specialist_depth,
+                base_ch=lightunet_base_ch,
+                height_gate_source=height_gate_source,
+                height_hidden_ch=height_hidden_ch,
+                height_trunk_depth=height_trunk_depth,
+                height_independent_branches=height_independent_branches,
+                height_head_kind=height_head_kind,
+                height_n_bins=height_n_bins,
+                height_bin_max_m=height_bin_max_m,
+                token_fusion_kind="single",
+                fusion_points=("decoder64",),
+                presence_head_kind="split_all",
+                presence_head_depth=2,
+                presence_branch_ch=48,
+                per_pixel_gate=True,
             ),
             selected,
         )

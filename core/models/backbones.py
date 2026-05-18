@@ -16,17 +16,40 @@ def _light_norm(num_channels, kind="bn"):
     raise ValueError(f"Unknown norm_kind={kind!r}; expected 'bn' or 'gn'.")
 
 
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels, norm_kind="bn"):
+class SEBlock(nn.Module):
+    """Squeeze-Excitation channel attention. Lightweight, well-proven on segmentation."""
+    def __init__(self, channels, reduction=8):
         super().__init__()
-        self.double_conv = nn.Sequential(
+        hidden = max(channels // reduction, 4)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, hidden, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, channels, bias=False),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.shape
+        y = self.pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_channels, out_channels, norm_kind="bn", use_se=False):
+        super().__init__()
+        layers = [
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
             _light_norm(out_channels, norm_kind),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
             _light_norm(out_channels, norm_kind),
             nn.ReLU(inplace=True),
-        )
+        ]
+        if use_se:
+            layers.append(SEBlock(out_channels))
+        self.double_conv = nn.Sequential(*layers)
 
     def forward(self, x):
         return self.double_conv(x)
@@ -50,28 +73,29 @@ class UpsampleBlock(nn.Module):
 class LightUNet(nn.Module):
     def __init__(self, n_channels, n_classes, base_ch=32, norm_kind="bn",
                  presence_head_kind="shared", presence_head_depth=1,
-                 presence_branch_ch=None):
+                 presence_branch_ch=None, use_se=False):
         super().__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.base_ch = base_ch
         self.norm_kind = norm_kind
+        self.use_se = bool(use_se)
         self.supports_aux_outputs = True
 
         c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
-        self.inc = DoubleConv(n_channels, c1, norm_kind=norm_kind)
-        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c1, c2, norm_kind=norm_kind))
-        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c2, c3, norm_kind=norm_kind))
-        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c3, c4, norm_kind=norm_kind))
+        self.inc = DoubleConv(n_channels, c1, norm_kind=norm_kind, use_se=self.use_se)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c1, c2, norm_kind=norm_kind, use_se=self.use_se))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c2, c3, norm_kind=norm_kind, use_se=self.use_se))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c3, c4, norm_kind=norm_kind, use_se=self.use_se))
 
         self.up1 = UpsampleBlock(c4, c3, norm_kind=norm_kind)
-        self.conv1 = DoubleConv(c4, c3, norm_kind=norm_kind)
+        self.conv1 = DoubleConv(c4, c3, norm_kind=norm_kind, use_se=self.use_se)
 
         self.up2 = UpsampleBlock(c3, c2, norm_kind=norm_kind)
-        self.conv2 = DoubleConv(c3, c2, norm_kind=norm_kind)
+        self.conv2 = DoubleConv(c3, c2, norm_kind=norm_kind, use_se=self.use_se)
 
         self.up3 = UpsampleBlock(c2, c1, norm_kind=norm_kind)
-        self.conv3 = DoubleConv(c2, c1, norm_kind=norm_kind)
+        self.conv3 = DoubleConv(c2, c1, norm_kind=norm_kind, use_se=self.use_se)
 
         self.head = MultiTaskPredictionHead(
             in_ch=c1,

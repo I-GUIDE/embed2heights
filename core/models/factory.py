@@ -23,7 +23,8 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 bidirectional_ctask=False, crossattn_n_heads=4,
                 height_blend_mode="presence_gated",
                 dual_presence=False,
-                ae_only_supervision=False):
+                ae_only_supervision=False,
+                use_se=False):
     selected = model_type.lower()
     if selected == "auto":
         selected = infer_model_type(n_channels)
@@ -57,6 +58,7 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
         height_blend_mode=height_blend_mode,
         dual_presence=dual_presence,
         ae_only_supervision=ae_only_supervision,
+        use_se=use_se,
     )
     if active is not None:
         return active

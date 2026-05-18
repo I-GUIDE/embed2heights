@@ -84,6 +84,37 @@ class GatedTokenScaleResidual(nn.Module):
         return target + self.gate * self.net(token_feat)
 
 
+class PerPixelGatedTokenScaleResidual(nn.Module):
+    """Per-pixel sigmoid-gated token residual. Model learns WHERE to borrow
+    from the token modality based on the AE+Tessera target features.
+
+    Init: gate ~ sigmoid(-4) ~ 0.018 so output starts ~= target (safe baseline).
+    The gate is a 1x1 conv on the target features, output 1 channel (broadcast)."""
+
+    def __init__(self, token_ch, target_ch, hidden_ch=None, init_bias=-4.0):
+        super().__init__()
+        hidden_ch = hidden_ch or min(max(target_ch, 64), 256)
+        self.net = nn.Sequential(
+            ConvGNAct(token_ch, hidden_ch, kernel_size=1, padding=0),
+            ConvGNAct(hidden_ch, target_ch, kernel_size=3),
+        )
+        self.gate_conv = nn.Conv2d(target_ch, 1, kernel_size=1)
+        nn.init.zeros_(self.gate_conv.weight)
+        nn.init.constant_(self.gate_conv.bias, init_bias)
+
+    def forward(self, target, token_feat):
+        if token_feat.shape[-2:] != target.shape[-2:]:
+            token_feat = F.interpolate(
+                token_feat,
+                size=target.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        token_proj = self.net(token_feat)
+        gate = torch.sigmoid(self.gate_conv(target))
+        return target + gate * token_proj
+
+
 class TesseraTokenCrossLevelFusionLightUNet(nn.Module):
     """Active three-modal model: AE+Tessera pixels plus TerraMind-S2 tokens."""
 
@@ -99,7 +130,7 @@ class TesseraTokenCrossLevelFusionLightUNet(nn.Module):
                  height_bin_max_m=80.0, token_fusion_kind="single",
                  fusion_points=("decoder64",), normalize_tokens=False,
                  presence_head_kind="split_all", presence_head_depth=2,
-                 presence_branch_ch=48, **unused):
+                 presence_branch_ch=48, per_pixel_gate=False, **unused):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TesseraTokenCrossLevelFusionLightUNet assumes 4 output channels")
@@ -138,16 +169,17 @@ class TesseraTokenCrossLevelFusionLightUNet(nn.Module):
         self.token_pyramid = TokenPyramidProvider(token_channels)
         self._token_input_channels = dict(self._TOKEN_LEVEL_CHANNELS)
 
+        gate_cls = PerPixelGatedTokenScaleResidual if per_pixel_gate else GatedTokenScaleResidual
         self.bottleneck_adapter = (
-            GatedTokenScaleResidual(self._token_input_channels[32], c4)
+            gate_cls(self._token_input_channels[32], c4)
             if "bottleneck" in self.fusion_points else None
         )
         self.decoder64_adapter = (
-            GatedTokenScaleResidual(self._token_input_channels[64], c3)
+            gate_cls(self._token_input_channels[64], c3)
             if "decoder64" in self.fusion_points else None
         )
         self.decoder128_adapter = (
-            GatedTokenScaleResidual(self._token_input_channels[128], c2)
+            gate_cls(self._token_input_channels[128], c2)
             if "decoder128" in self.fusion_points else None
         )
         self.head = MultiTaskPredictionHead(
