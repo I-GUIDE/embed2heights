@@ -239,6 +239,11 @@ def parse_args():
                    help="Mix Lovász-Hinge loss on building logits with weight "
                         "lovasz_weight (added to total loss). Directly optimizes "
                         "building IoU. Recommended 0.3-0.7. 0 disables.")
+    p.add_argument("--disable-head-film", action="store_true",
+                   help="Disable FiLM-on-fractions inside the head. Labmate "
+                        "found removing this improves height regression by "
+                        "reducing gradient interference. Worth testing alongside "
+                        "any new arch.")
     p.add_argument("--bidirectional-ctask", action="store_true",
                    help="Enable bidirectional cross-task attention in ae_tessera_gated: "
                         "height trunk features gate the presence head input via a "
@@ -947,6 +952,7 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "focal_gamma":         args.focal_gamma,
         "focal_alpha":         args.focal_alpha,
         "use_se":              getattr(args, "use_se", False),
+        "disable_head_film":   getattr(args, "disable_head_film", False),
         "lovasz_weight":       getattr(args, "lovasz_weight", 0.0),
         "boundary_weight":     getattr(args, "boundary_weight", 0.0),
         "boundary_sigma_px":   getattr(args, "boundary_sigma_px", 2.0),
@@ -1101,6 +1107,7 @@ def main():
         dual_presence=args.dual_presence,
         ae_only_supervision=(args.ae_only_deep_sup_weight > 0.0),
         use_se=getattr(args, "use_se", False),
+        disable_head_film=getattr(args, "disable_head_film", False),
     )
     if args.init_from_pretrain:
         load_pretrain_weights(

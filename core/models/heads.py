@@ -47,8 +47,13 @@ class MultiTaskPredictionHead(nn.Module):
                  height_bin_max_m=80.0, presence_head_kind="shared",
                  presence_head_depth=1, presence_branch_ch=None,
                  bidirectional_ctask=False, height_blend_mode="presence_gated",
-                 dual_presence=False):
+                 dual_presence=False, disable_head_film=False):
         super().__init__()
+        # When True: skip the FiLM modulation on intermediate height features.
+        # Labmate's finding (and our own pattern of veg-height regression when
+        # the loss/arch get more complex) suggests FiLM-on-fractions can
+        # destabilize height training. Try disabling to see if heights improve.
+        self.disable_head_film = bool(disable_head_film)
         if out_channels != 4:
             raise ValueError("MultiTaskPredictionHead assumes 4 output channels")
         if height_gate_source not in {"alpha", "fused"}:
@@ -302,10 +307,14 @@ class MultiTaskPredictionHead(nn.Module):
         fraction_logits = self.fraction_head(x)
         fractions = torch.sigmoid(fraction_logits)
 
-        # FiLM conditioning uses soft fractions (fine-grained coverage signal)
-        scale = self.film_scale(fractions)
-        shift = self.film_shift(fractions)
-        h = x * (1.0 + scale) + shift
+        # FiLM conditioning uses soft fractions (fine-grained coverage signal).
+        # Optionally bypass to test if heights improve without modulation.
+        if self.disable_head_film:
+            h = x
+        else:
+            scale = self.film_scale(fractions)
+            shift = self.film_shift(fractions)
+            h = x * (1.0 + scale) + shift
 
         if self.height_independent_branches:
             h_base = self.height_base_trunk(h)

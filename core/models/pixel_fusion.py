@@ -259,7 +259,7 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
                  height_blend_mode="presence_gated",
                  dual_presence=False,
                  ae_only_supervision=False,
-                 token_channels=0, use_se=False):
+                 token_channels=0, use_se=False, disable_head_film=False):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TesseraIoUFusionGatedLightUNet assumes 4 output channels")
@@ -317,6 +317,7 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
             bidirectional_ctask=bidirectional_ctask,
             height_blend_mode=height_blend_mode,
             dual_presence=dual_presence,
+            disable_head_film=disable_head_film,
         )
 
         # CMGFNet-style deep supervision: parallel light prediction head from

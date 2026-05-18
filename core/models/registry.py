@@ -74,7 +74,8 @@ def build_active_model(model_type, n_channels, n_classes, *,
                        height_blend_mode="presence_gated",
                        dual_presence=False,
                        ae_only_supervision=False,
-                       use_se=False):
+                       use_se=False,
+                       disable_head_film=False):
     selected = canonical_model_type(model_type)
     if selected not in ACTIVE_MODEL_TYPES:
         return None
@@ -382,6 +383,7 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 height_blend_mode=height_blend_mode,
                 dual_presence=dual_presence,
                 use_se=use_se,
+                disable_head_film=disable_head_film,
             ),
             selected,
         )
