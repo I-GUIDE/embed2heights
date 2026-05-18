@@ -278,19 +278,29 @@ class HierarchicalGatedFusion(nn.Module):
         if not isinstance(x, (tuple, list)) or len(x) != 2:
             raise ValueError("HierarchicalGatedFusion expects (pixel, token) input")
         pixel, token = x
-        # Stage 1: AE+Tessera through gated UNet
+
+        # Stage 1: AE+Tessera through gated UNet. With return_aux=True it
+        # returns a dict containing "out" (4-channel: [presence_prob×3, height]).
+        # With return_aux=False it returns the 4-channel tensor directly.
+        stage1_result = self.stage1(pixel, return_aux=return_aux)
         if return_aux:
-            stage1_out, aux = self.stage1(pixel, return_aux=True)
+            stage1_out = stage1_result["out"]  # (B, 4, H, W), post-sigmoid + height
+            aux = stage1_result
         else:
-            stage1_out = self.stage1(pixel, return_aux=False)
+            stage1_out = stage1_result
             aux = None
 
-        # Stage 2: token branch (16x16 → up to pixel HxW)
+        # Stage 2: token branch (16x16 → up to pixel HxW).
+        # Project channels, conv, upsample, then 4-channel head.
+        # Apply sigmoid/softplus so Stage 2 output is in the same space as Stage 1.
         t = self.token_proj(token)
         t = self.token_conv(t)
         t = F.interpolate(t, size=(pixel.shape[2], pixel.shape[3]),
                           mode="bilinear", align_corners=False)
-        stage2_out = self.token_head(t)
+        stage2_raw = self.token_head(t)
+        stage2_pres = torch.sigmoid(stage2_raw[:, :3, :, :])
+        stage2_height = F.softplus(stage2_raw[:, 3:4, :, :], threshold=20.0)
+        stage2_out = torch.cat([stage2_pres, stage2_height], dim=1)
 
         # Per-pixel sigmoid gate: g≈1 at init → stage1 dominant.
         gate_in = torch.cat([stage1_out, stage2_out], dim=1)
@@ -298,5 +308,6 @@ class HierarchicalGatedFusion(nn.Module):
         fused = gate * stage1_out + (1.0 - gate) * stage2_out
 
         if return_aux:
-            return fused, aux
+            aux["out"] = fused
+            return aux
         return fused
