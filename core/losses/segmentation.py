@@ -4,6 +4,40 @@ import torch
 import torch.nn as nn
 
 
+def _lovasz_grad(gt_sorted):
+    p = gt_sorted.numel()
+    gts = gt_sorted.sum()
+    intersection = gts - gt_sorted.float().cumsum(0)
+    union = gts + (1 - gt_sorted).float().cumsum(0)
+    jaccard = 1.0 - intersection / union.clamp(min=1e-8)
+    if p > 1:
+        jaccard[1:p] = jaccard[1:p] - jaccard[0:-1]
+    return jaccard
+
+
+def lovasz_hinge_flat(logits, labels, valid_mask=None):
+    """Lovász hinge for binary segmentation (Berman, Triki, Blaschko CVPR 2018).
+    logits: arbitrary-shape float tensor (raw, pre-sigmoid).
+    labels: same shape, in {0,1} (will be converted to {-1,+1}).
+    valid_mask: optional bool/float mask same shape as logits; False/0 pixels are skipped.
+    Run in float32 for stability under AMP (caller's responsibility — typically wrap in autocast(enabled=False)).
+    """
+    logits = logits.reshape(-1)
+    labels = labels.reshape(-1)
+    if valid_mask is not None:
+        m = valid_mask.reshape(-1).bool()
+        logits = logits[m]
+        labels = labels[m]
+    if logits.numel() == 0:
+        return logits.sum() * 0.0
+    signs = 2.0 * labels.float() - 1.0
+    errors = (1.0 - logits * signs)
+    errors_sorted, perm = torch.sort(errors, dim=0, descending=True)
+    gt_sorted = labels[perm]
+    grad = _lovasz_grad(gt_sorted)
+    return torch.dot(torch.relu(errors_sorted), grad)
+
+
 class TverskyLoss(nn.Module):
     """
     Tversky Loss for imbalanced segmentation.

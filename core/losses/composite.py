@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .height import height_bin_ce, height_error
-from .segmentation import TverskyLoss
+from .segmentation import TverskyLoss, lovasz_hinge_flat
 from .structure import GradientDifferenceLoss, SSIMLoss
 
 
@@ -34,7 +34,11 @@ class ImprovedCompositeLoss(nn.Module):
                  vegetation_smooth_erode_px=1,
                  vegetation_smooth_thr=0.0,
                  building_presence_tversky_weight=1.0,
-                 building_presence_bce_weight=1.0):
+                 building_presence_bce_weight=1.0,
+                 boundary_weight=0.0,
+                 boundary_sigma_px=2.0,
+                 boundary_amp=4.0,
+                 lovasz_weight=0.0):
         super().__init__()
         if loss_preset != "presence_centered":
             raise ValueError("loss_preset must be presence_centered")
@@ -72,6 +76,14 @@ class ImprovedCompositeLoss(nn.Module):
         self.vegetation_smooth_thr = float(vegetation_smooth_thr)
         self.building_presence_tversky_weight = float(building_presence_tversky_weight)
         self.building_presence_bce_weight = float(building_presence_bce_weight)
+        # Boundary-aware presence loss: upweights BCE near building boundaries.
+        # weight_map = 1 + amp * exp(-distance_to_boundary / sigma) within image,
+        # so pixels at boundary get ~(1+amp), pixels far away ~1.
+        self.boundary_weight = float(boundary_weight)
+        self.boundary_sigma_px = float(boundary_sigma_px)
+        self.boundary_amp = float(boundary_amp)
+        # Lovász-hinge for binary building: mix BCE + lovasz_weight * Lovász.
+        self.lovasz_weight = float(lovasz_weight)
 
         self.task = "both"
         self.train_presence = True
@@ -236,6 +248,27 @@ class ImprovedCompositeLoss(nn.Module):
         if aux_outputs is not None and "presence_logits" in aux_outputs:
             presence_target = (targets[:, :3, :, :] > 0).float()
 
+            # Boundary weight map for building (channel 0): higher weight near
+            # ground-truth building boundary, computed on-the-fly via a Sobel-style
+            # 3x3 maxpool difference (cheap, no scipy distance transform on GPU).
+            boundary_weight_map = None
+            if self.boundary_weight > 0:
+                with torch.no_grad():
+                    bld_gt = presence_target[:, 0:1, :, :]  # [B, 1, H, W]
+                    # Boundary pixels = those where 3x3 dilation differs from erosion
+                    # Approximate distance-to-boundary via repeated maxpool diffs
+                    dilated = F.max_pool2d(bld_gt, 3, stride=1, padding=1)
+                    eroded = -F.max_pool2d(-bld_gt, 3, stride=1, padding=1)
+                    boundary_mask = (dilated - eroded).clamp(0, 1)
+                    # Multi-ring soft: dilate boundary_mask itself once or twice
+                    # to capture a 1-2 pixel halo
+                    sigma = max(1.0, self.boundary_sigma_px)
+                    soft_band = boundary_mask
+                    for _ in range(max(1, int(round(sigma)))):
+                        soft_band = F.max_pool2d(soft_band, 3, stride=1, padding=1)
+                    # weight = 1 + amp * soft_band  (soft_band in {0,1})
+                    boundary_weight_map = 1.0 + self.boundary_amp * soft_band
+
             def masked_presence_bce(logits):
                 safe_logits = torch.where(
                     lc_mask.bool(),
@@ -257,6 +290,11 @@ class ImprovedCompositeLoss(nn.Module):
                     dtype=loss.dtype,
                 ).view(1, 3, 1, 1)
                 weighted_loss = loss * lc_mask * ch_weights
+                # Apply boundary-aware weighting on the building channel only
+                if self.boundary_weight > 0 and boundary_weight_map is not None:
+                    # Boost only the building channel near boundaries
+                    bld_boost = boundary_weight_map  # [B, 1, H, W]
+                    weighted_loss[:, 0:1] = weighted_loss[:, 0:1] * bld_boost
                 # Normalize by the unweighted valid count so the per-class
                 # building emphasis raises the overall loss magnitude.
                 return torch.sum(weighted_loss) / (torch.sum(lc_mask) + 1e-6)
@@ -283,6 +321,16 @@ class ImprovedCompositeLoss(nn.Module):
                 # to push building recall when iou_bld is the bottleneck.
                 b_w = self.building_presence_tversky_weight
                 presence_tversky_loss = (b_w * p_build + p_veg + p_water) / 3.0
+
+            lovasz_building_loss = zero
+            if self.lovasz_weight > 0:
+                with torch.cuda.amp.autocast(enabled=False):
+                    bld_logits = aux_outputs["presence_logits"][:, 0, :, :].float()
+                    bld_target = presence_target[:, 0, :, :].float()
+                    lc_bool = lc_mask[:, 0, :, :].bool()
+                    lovasz_building_loss = lovasz_hinge_flat(
+                        bld_logits, bld_target, valid_mask=lc_bool
+                    )
 
             target_height = targets[:, 3:4, :, :]
             bld_height_mask = (targets[:, 0:1, :, :] > 0).float() * height_mask
@@ -316,6 +364,9 @@ class ImprovedCompositeLoss(nn.Module):
                 presence_loss_active + aux_height_building_active
                 + self.aux_veg_weight * aux_height_vegetation_active
             ) + self.presence_tversky_weight * presence_tversky_active
+
+            if self.lovasz_weight > 0 and self.train_presence:
+                total_loss = total_loss + self.lovasz_weight * lovasz_building_loss
 
         # ── Dual-presence consistency (T-SwinUNet style) ─────────────────
         # When the head exposes a parallel auxiliary presence branch, supervise
@@ -479,5 +530,7 @@ class ImprovedCompositeLoss(nn.Module):
             "vegetation_smooth": vegetation_smooth_loss,
             "weighted_building_smooth": self.building_smooth_weight * building_smooth_loss,
             "weighted_vegetation_smooth": self.vegetation_smooth_weight * vegetation_smooth_loss,
+            "lovasz_building": lovasz_building_loss,
+            "weighted_lovasz_building": self.lovasz_weight * lovasz_building_loss,
         }
         return total_loss, components
