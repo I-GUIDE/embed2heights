@@ -38,7 +38,8 @@ class ImprovedCompositeLoss(nn.Module):
                  boundary_weight=0.0,
                  boundary_sigma_px=2.0,
                  boundary_amp=4.0,
-                 lovasz_weight=0.0):
+                 lovasz_weight=0.0,
+                 argmax_presence_target=False):
         super().__init__()
         if loss_preset != "presence_centered":
             raise ValueError("loss_preset must be presence_centered")
@@ -84,6 +85,11 @@ class ImprovedCompositeLoss(nn.Module):
         self.boundary_amp = float(boundary_amp)
         # Lovász-hinge for binary building: mix BCE + lovasz_weight * Lovász.
         self.lovasz_weight = float(lovasz_weight)
+        # If True, presence target uses argmax across class channels (only
+        # the dominant class is positive per pixel). Fixes the labeling bug
+        # where overlap-trained models predict all classes at multi-class
+        # pixels — train/eval mismatch with LB scoring.
+        self.argmax_presence_target = bool(argmax_presence_target)
 
         self.task = "both"
         self.train_presence = True
@@ -163,6 +169,20 @@ class ImprovedCompositeLoss(nn.Module):
         global_1ch = global_mask.squeeze(1)
         height_1ch = height_mask.squeeze(1)
 
+        # Argmax presence target: each multi-class pixel is positive ONLY for
+        # its dominant class. Used in place of (fraction > 0) when
+        # self.argmax_presence_target=True. Aligns supervision with LB scoring
+        # which (per external tip) credits the dominant class per pixel.
+        if self.argmax_presence_target:
+            _cls_frac = targets[:, :3, :, :]
+            _any_present = (_cls_frac > 0).any(dim=1, keepdim=True)
+            _argmax_idx = _cls_frac.argmax(dim=1, keepdim=True)
+            _argmax_presence = torch.zeros_like(_cls_frac)
+            _argmax_presence.scatter_(1, _argmax_idx, 1.0)
+            _argmax_presence = _argmax_presence * _any_present.float()
+        else:
+            _argmax_presence = None
+
         if aux_outputs is not None and "fractions" in aux_outputs:
             class_pred = aux_outputs["fractions"]
         else:
@@ -210,8 +230,12 @@ class ImprovedCompositeLoss(nn.Module):
                                    targets[:, 2, :, :], valid_mask=gm_bool)
             loss_tversky = (t_build + t_veg + t_water) / 3.0
 
-        build_presence_mask = (targets[:, 0, :, :] > 0.1).float() * height_1ch
-        veg_presence_mask = (targets[:, 1, :, :] > 0.1).float() * height_1ch
+        if self.argmax_presence_target:
+            build_presence_mask = _argmax_presence[:, 0, :, :] * height_1ch
+            veg_presence_mask = _argmax_presence[:, 1, :, :] * height_1ch
+        else:
+            build_presence_mask = (targets[:, 0, :, :] > 0.1).float() * height_1ch
+            veg_presence_mask = (targets[:, 1, :, :] > 0.1).float() * height_1ch
         height_err = self._height_err(
             preds[:, 3, :, :], targets[:, 3, :, :], valid_mask=height_1ch
         ) * height_1ch
@@ -246,7 +270,10 @@ class ImprovedCompositeLoss(nn.Module):
         aux_height_building_loss = zero
         aux_height_vegetation_loss = zero
         if aux_outputs is not None and "presence_logits" in aux_outputs:
-            presence_target = (targets[:, :3, :, :] > 0).float()
+            if self.argmax_presence_target:
+                presence_target = _argmax_presence
+            else:
+                presence_target = (targets[:, :3, :, :] > 0).float()
 
             # Boundary weight map for building (channel 0): higher weight near
             # ground-truth building boundary, computed on-the-fly via a Sobel-style
@@ -333,8 +360,12 @@ class ImprovedCompositeLoss(nn.Module):
                     )
 
             target_height = targets[:, 3:4, :, :]
-            bld_height_mask = (targets[:, 0:1, :, :] > 0).float() * height_mask
-            veg_height_mask = (targets[:, 1:2, :, :] > 0).float() * height_mask
+            if self.argmax_presence_target:
+                bld_height_mask = _argmax_presence[:, 0:1, :, :] * height_mask
+                veg_height_mask = _argmax_presence[:, 1:2, :, :] * height_mask
+            else:
+                bld_height_mask = (targets[:, 0:1, :, :] > 0).float() * height_mask
+                veg_height_mask = (targets[:, 1:2, :, :] > 0).float() * height_mask
 
             def masked_height(pred, target, mask):
                 err = self._height_err(pred, target, valid_mask=mask)
@@ -444,8 +475,12 @@ class ImprovedCompositeLoss(nn.Module):
                 and "height_log_bin_centers" in aux_outputs):
             log_centers = aux_outputs["height_log_bin_centers"]
             target_height = targets[:, 3:4, :, :]
-            bld_height_mask = (targets[:, 0:1, :, :] > 0).float() * height_mask
-            veg_height_mask = (targets[:, 1:2, :, :] > 0).float() * height_mask
+            if self.argmax_presence_target:
+                bld_height_mask = _argmax_presence[:, 0:1, :, :] * height_mask
+                veg_height_mask = _argmax_presence[:, 1:2, :, :] * height_mask
+            else:
+                bld_height_mask = (targets[:, 0:1, :, :] > 0).float() * height_mask
+                veg_height_mask = (targets[:, 1:2, :, :] > 0).float() * height_mask
             ce_base = self._height_bin_ce(
                 aux_outputs.get("height_base_logits"),
                 target_height, height_mask, log_centers,

@@ -232,6 +232,11 @@ def parse_args():
                    help="Enable Coordinate Attention (Hou 2021) in LightUNet DoubleConv "
                         "blocks. Decomposes 2D pool into H+W pools so channel attention "
                         "carries positional info — relevant when regions matter (e.g. KE).")
+    p.add_argument("--argmax-presence-target", action="store_true",
+                   help="Use argmax across class fractions for the presence supervision "
+                        "target (each multi-class pixel is positive ONLY for its dominant "
+                        "class). Fixes the train/eval mismatch where fraction>0 trains the "
+                        "model to predict every class at multi-class pixels.")
     p.add_argument("--boundary-weight", type=float, default=0.0,
                    help="Enable boundary-aware loss. Upweights BCE on the building "
                         "channel near GT boundaries. >0 enables, e.g. 1.0 to turn on.")
@@ -957,6 +962,7 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "focal_alpha":         args.focal_alpha,
         "use_se":              getattr(args, "use_se", False),
         "use_coord_attn":      getattr(args, "use_coord_attn", False),
+        "argmax_presence_target": getattr(args, "argmax_presence_target", False),
         "disable_head_film":   getattr(args, "disable_head_film", False),
         "lovasz_weight":       getattr(args, "lovasz_weight", 0.0),
         "boundary_weight":     getattr(args, "boundary_weight", 0.0),
@@ -1171,6 +1177,7 @@ def main():
         boundary_sigma_px=getattr(args, "boundary_sigma_px", 2.0),
         boundary_amp=getattr(args, "boundary_amp", 4.0),
         lovasz_weight=getattr(args, "lovasz_weight", 0.0),
+        argmax_presence_target=getattr(args, "argmax_presence_target", False),
     ).to(device)
     print(
         "Using loss: "
