@@ -13,7 +13,6 @@ import torch.optim as optim
 from core.losses import ImprovedCompositeLoss
 from core.engine import (
     format_components,
-    load_pretrain_weights,
     plot_loss_curve,
     run_epoch,
     save_experiment_config,
@@ -135,12 +134,6 @@ def main():
 
     print("--- 2. Model Init ---")
     model, selected_model = build_active_model(args, n_channels)
-    if args.init_from_pretrain:
-        load_pretrain_weights(
-            model,
-            args.init_from_pretrain,
-            strict=args.init_pretrain_strict,
-        )
     model = model.to(device)
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)

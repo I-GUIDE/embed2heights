@@ -15,9 +15,7 @@ DEFAULT_CONFIG_PATH = os.path.join(REPO_DIR, "configs", "defaults.yml")
 MODEL_CHOICES = [
     "ae_only",
     "ae_tessera_gated",
-    "xfusion_crosslevel",
     "xfusion_twogate_bn_attention",
-    "xfusion_film_fusion",
     "xfusion_unet_film_per_modality",
     "auto",
 ]
@@ -170,8 +168,6 @@ def parse_args():
     p.add_argument("--seed", type=int)
     p.add_argument("--amp", action=argparse.BooleanOptionalAction)
     p.add_argument("--data-parallel", action=argparse.BooleanOptionalAction)
-    p.add_argument("--init-from-pretrain",
-                   help="Optional self-supervised pretrain checkpoint.")
     p.add_argument("--freeze-except",
                    help="Freeze all params whose name does NOT contain this substring. "
                         "Used for two-stage training: freeze pixel path, train token path only.")
@@ -217,8 +213,6 @@ def build_resolved_config(args, *, device=None, use_amp=None):
         "data_parallel": args.data_parallel,
         "num_workers": args.num_workers,
         "prefetch_factor": args.prefetch_factor,
-        "init_from_pretrain": args.init_from_pretrain,
-        "init_pretrain_strict": args.init_pretrain_strict,
     }
     if device is not None:
         runtime["device"] = str(device)

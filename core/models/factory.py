@@ -4,7 +4,7 @@ from .registry import ACTIVE_MODEL_ALIASES, ACTIVE_MODEL_TYPES, build_active_mod
 def infer_model_type(n_channels):
     """Best-effort default for active experiments."""
     if isinstance(n_channels, (tuple, list)):
-        return "xfusion_crosslevel"
+        return "xfusion_unet_film_per_modality"
     if n_channels > 64:
         return "ae_tessera_gated"
     return "ae_only"

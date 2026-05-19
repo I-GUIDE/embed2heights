@@ -62,5 +62,3 @@ runtime:
   data_parallel: false
   num_workers: 4
   prefetch_factor: 1
-  init_from_pretrain:
-  init_pretrain_strict: false
