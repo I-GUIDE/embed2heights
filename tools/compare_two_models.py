@@ -115,7 +115,7 @@ def main():
     per_loc = defaultdict(list)
     for r in rows: per_loc[r["loc"]].append(r)
     print(f"\n=== Per-location delta (sorted by delta) ===")
-    print(f"{'loc':<5} {'n':<4} {'sA':>7} {'sB':>7} {'delta':>+7} {'d_iou_b':>9}")
+    print(f"{'loc':<5} {'n':<4} {'sA':>7} {'sB':>7} {'delta':>7} {'d_iou_b':>9}")
     locs = sorted(per_loc.items(), key=lambda x: np.mean([r["delta"] for r in x[1]]))
     for loc, rs in locs:
         sA_l = np.mean([r["sA"] for r in rs]); sB_l = np.mean([r["sB"] for r in rs])
