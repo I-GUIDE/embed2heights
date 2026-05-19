@@ -29,6 +29,8 @@ model:
   presence_head_kind: shared
   presence_head_depth: 1
   presence_branch_ch:
+  use_fraction_film: true
+  use_fraction_aux: true
 
 training:
   batch_size: 32
@@ -49,6 +51,9 @@ training:
   aux_veg_weight: 1.0
   height_bin_aux_weight: 0.0
   height_bin_sigma_bins: 1.5
+  tversky_water_alpha: 0.3
+  water_empty_topk: 0
+  weight_water_empty_topk: 0.0
 
 runtime:
   experiment_name: run01

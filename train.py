@@ -58,6 +58,8 @@ def build_active_model(args, n_channels):
         presence_head_kind=args.presence_head_kind,
         presence_head_depth=args.presence_head_depth,
         presence_branch_ch=args.presence_branch_ch,
+        use_fraction_film=args.use_fraction_film,
+        use_fraction_aux=args.use_fraction_aux,
     )
 
 
@@ -76,6 +78,9 @@ def build_loss(args, device):
         aux_veg_weight=args.aux_veg_weight,
         height_bin_aux_weight=args.height_bin_aux_weight,
         height_bin_sigma_bins=args.height_bin_sigma_bins,
+        tversky_water_alpha=args.tversky_water_alpha,
+        water_empty_topk=args.water_empty_topk,
+        weight_water_empty_topk=args.weight_water_empty_topk,
     ).to(device)
     print(
         "Using loss: "
@@ -92,7 +97,10 @@ def build_loss(args, device):
         f"aux_veg_weight={args.aux_veg_weight}, "
         f"height_head_kind={args.height_head_kind}, "
         f"height_n_bins={args.height_n_bins}, "
-        f"height_bin_max_m={args.height_bin_max_m}"
+        f"height_bin_max_m={args.height_bin_max_m}, "
+        f"tversky_water_alpha={args.tversky_water_alpha}, "
+        f"water_empty_topk={args.water_empty_topk}, "
+        f"weight_water_empty_topk={args.weight_water_empty_topk}"
     )
     return criterion
 

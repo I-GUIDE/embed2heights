@@ -15,32 +15,10 @@ DEFAULT_CONFIG_PATH = os.path.join(REPO_DIR, "configs", "defaults.yml")
 MODEL_CHOICES = [
     "ae_only",
     "ae_tessera_gated",
-    "ae_tessera_unet_gated",
-    "ae_tessera_unet_hierarchical",
     "xfusion_crosslevel",
-    "xfusion_gated_nonwater",
-    "xfusion_bottleneck_adaptive",
-    "xfusion_twogate_attention",
-    "xfusion_cqa_twogate_attention",
-    "xfusion_twogate_aligned_attention",
-    "xfusion_aligned_concat_attention",
-    "xfusion_aligned_grouped_concat_attention",
-    "xfusion_aligned_concat_aux",
-    "xfusion_twogate_grouped",
     "xfusion_twogate_bn_attention",
-    "xfusion_per_modality",
-    "xfusion_task_router",
-    "xfusion_twogate_unet_attention",
-    "xfusion_per_modality_unet",
-    "xfusion_bn_attention_unet",
-    "xfusion_concat_attention",
-    "xfusion_concat_unet_attention",
-    "xfusion_residual_concat_attention",
-    "xfusion_residual_concat_unet_attention",
-    "xfusion_sixmodal_bottleneck",
-    "xfusion_error_router_height_only",
-    "xfusion_error_router_height_aux",
     "xfusion_film_fusion",
+    "xfusion_unet_film_per_modality",
     "auto",
 ]
 CONFIG_SECTIONS = ("data", "model", "training", "runtime")
@@ -55,6 +33,7 @@ RAW_COMPONENTS = (
     "height_boost",
     "presence_bce",
     "presence_tversky",
+    "water_empty_topk",
     "aux_height_building",
     "aux_height_vegetation",
     "height_bin_ce",
@@ -78,6 +57,7 @@ WEIGHTED_COMPONENTS = (
     "weighted_height_boost",
     "weighted_presence_bce",
     "weighted_presence_tversky",
+    "weighted_water_empty_topk",
     "weighted_aux_height",
     "weighted_height_bin_ce",
     "weighted_building_smooth",
@@ -209,6 +189,16 @@ def parse_args():
     p.add_argument("--tversky-building-alpha", type=float,
                    help="Tversky alpha (FP penalty) for building class only. "
                         "Lower = more recall-focused. Default 0.3.")
+    p.add_argument("--tversky-water-alpha", type=float,
+                   help="Tversky alpha (FP penalty) for water class only.")
+    p.add_argument("--water-empty-topk", type=int,
+                   help="Top-k water probabilities to penalize on patches with no water.")
+    p.add_argument("--weight-water-empty-topk", type=float,
+                   help="Weight for the empty-water top-k penalty.")
+    p.add_argument("--use-fraction-film", action=argparse.BooleanOptionalAction,
+                   help="Use predicted fractions as FiLM conditioning for height.")
+    p.add_argument("--use-fraction-aux", action=argparse.BooleanOptionalAction,
+                   help="Keep the fraction auxiliary head/loss even when height FiLM is disabled.")
 
     p.set_defaults(**DEFAULTS)
     p.set_defaults(**config_defaults)
@@ -281,6 +271,8 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "presence_head_kind": args.presence_head_kind,
             "presence_head_depth": args.presence_head_depth,
             "presence_branch_ch": args.presence_branch_ch,
+            "use_fraction_film": args.use_fraction_film,
+            "use_fraction_aux": args.use_fraction_aux,
         },
         "training": {
             "batch_size": args.batch_size,
@@ -309,6 +301,9 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "boundary_building_weight": args.boundary_building_weight,
             "boundary_kernel_size": args.boundary_kernel_size,
             "tversky_building_alpha": args.tversky_building_alpha,
+            "tversky_water_alpha": args.tversky_water_alpha,
+            "water_empty_topk": args.water_empty_topk,
+            "weight_water_empty_topk": args.weight_water_empty_topk,
         },
         "runtime": runtime,
     }

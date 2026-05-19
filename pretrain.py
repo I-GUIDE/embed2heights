@@ -9,10 +9,8 @@ weights can be loaded by supervised ``tessera_iou_fusion`` runs with
 import argparse
 import json
 import os
-import random
 import sys
 
-import numpy as np
 import torch
 import torch.optim as optim
 from sklearn.model_selection import train_test_split
@@ -34,6 +32,7 @@ from core.pretrain import (
     save_pretrain_config,
 )
 from core.data.training import build_data_loader
+from core.engine import move_to_device, select_device, seed_everything
 
 
 DEFAULT_DATA = os.path.abspath(os.path.join(REPO_DIR, "..", "data"))
@@ -87,29 +86,6 @@ def parse_args():
                         "in a complementary batch. Forces robustness to a "
                         "missing modality at finetune time. 0.0 disables.")
     return p.parse_args()
-
-
-def select_device():
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-
-def seed_everything(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-
-
-def move_pair(batch, device):
-    alpha, tessera = batch
-    non_blocking = device.type == "cuda"
-    return (
-        alpha.to(device, non_blocking=non_blocking),
-        tessera.to(device, non_blocking=non_blocking),
-    )
 
 
 def make_loaders(args, device):
@@ -168,7 +144,7 @@ def run_epoch(model, loader, masker, optimizer, scaler, device, args, *, train):
     with context:
         pbar = tqdm(loader, desc=desc, leave=False)
         for step, batch in enumerate(pbar, start=1):
-            alpha, tessera = move_pair(batch, device)
+            alpha, tessera = move_to_device(batch, device, non_blocking=device.type == "cuda")
             (
                 alpha_in, alpha_mask,
                 tessera_in, tessera_mask,

@@ -2,8 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-HEIGHT_NORM_CONSTANT = 30.0  # mirrors core.data.datasets; meters / NORM = normalized height.
+from core.data.datasets import HEIGHT_NORM_CONSTANT
 
 
 class ChannelCalibration(nn.Module):

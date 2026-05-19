@@ -16,8 +16,8 @@ except ImportError:
 
 from core.data.datasets import (
     MultiPixelEmbeddingDataset,
+    PixelEmbeddingDataset,
     PixelTokenEmbeddingDataset,
-    pick_dataset_class,
 )
 from core.data.discovery import (
     find_embedding_files,
@@ -137,6 +137,8 @@ def model_kwargs_from_run_config(cfg):
         "presence_head_kind": cfg.get("presence_head_kind", TRAIN_DEFAULTS["presence_head_kind"]),
         "presence_head_depth": cfg.get("presence_head_depth", TRAIN_DEFAULTS["presence_head_depth"]),
         "presence_branch_ch": cfg.get("presence_branch_ch", TRAIN_DEFAULTS["presence_branch_ch"]),
+        "use_fraction_film": cfg.get("use_fraction_film", TRAIN_DEFAULTS["use_fraction_film"]),
+        "use_fraction_aux": cfg.get("use_fraction_aux", TRAIN_DEFAULTS["use_fraction_aux"]),
     }
 
 
@@ -210,7 +212,7 @@ def infer_channels_and_dataset(args, inputs):
             n_channels += src.count
         return n_channels, MultiPixelEmbeddingDataset
 
-    return n_channels, pick_dataset_class(args.model_type or "auto", n_channels)
+    return n_channels, PixelEmbeddingDataset
 
 
 def build_dataset(dataset_cls, inputs, patch_size):

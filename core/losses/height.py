@@ -3,6 +3,8 @@
 import torch
 import torch.nn.functional as F
 
+from core.data.datasets import HEIGHT_NORM_CONSTANT
+
 
 def height_error(pred, target, *, kind, huber_delta):
     """Elementwise height error under the configured regression loss."""
@@ -28,7 +30,7 @@ def height_bin_ce(logits, target_norm, mask, log_centers, sigma_bins):
             dtype=logits.dtype if logits is not None else target_norm.dtype,
         )
 
-    log_target = torch.log1p(target_norm * 30.0)
+    log_target = torch.log1p(target_norm * HEIGHT_NORM_CONSTANT)
     centers = log_centers.to(logits.device, logits.dtype).view(1, -1, 1, 1)
     if log_centers.numel() >= 2:
         bin_width = float((log_centers[1] - log_centers[0]).item())

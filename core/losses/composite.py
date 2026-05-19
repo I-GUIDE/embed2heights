@@ -24,7 +24,8 @@ class ImprovedCompositeLoss(nn.Module):
                  height_loss_kind="l1", huber_delta=1.0,
                  build_height_boost=5.0, veg_height_boost=0.0,
                  aux_veg_weight=1.0, height_bin_aux_weight=0.0,
-                 height_bin_sigma_bins=1.5):
+                 height_bin_sigma_bins=1.5, tversky_water_alpha=0.3,
+                 water_empty_topk=0, weight_water_empty_topk=0.0):
         super().__init__()
         if loss_preset != "presence_centered":
             raise ValueError("loss_preset must be presence_centered")
@@ -34,6 +35,8 @@ class ImprovedCompositeLoss(nn.Module):
         self.ssim = SSIMLoss(window_size=11)
         self.gdl = GradientDifferenceLoss()
         self.tversky = TverskyLoss(alpha=0.3, beta=0.7)
+        water_alpha = float(tversky_water_alpha)
+        self.tversky_water = TverskyLoss(alpha=water_alpha, beta=1.0 - water_alpha)
 
         self.w_mae = weight_mae
         self.w_ssim = 0.0
@@ -52,10 +55,8 @@ class ImprovedCompositeLoss(nn.Module):
         self.aux_veg_weight = float(aux_veg_weight)
         self.height_bin_aux_weight = float(height_bin_aux_weight)
         self.height_bin_sigma_bins = float(height_bin_sigma_bins)
-
-        self.task = "both"
-        self.train_presence = True
-        self.train_height = True
+        self.water_empty_topk = max(0, int(water_empty_topk))
+        self.weight_water_empty_topk = float(weight_water_empty_topk)
 
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
         self.fraction_mae_weights = torch.tensor([1.0, 1.0, 1.0]).float()
@@ -147,8 +148,8 @@ class ImprovedCompositeLoss(nn.Module):
                                    targets[:, 0, :, :], valid_mask=gm_bool)
             t_veg = self.tversky(torch.relu(class_pred[:, 1, :, :]),
                                  targets[:, 1, :, :], valid_mask=gm_bool)
-            t_water = self.tversky(torch.relu(class_pred[:, 2, :, :]),
-                                   targets[:, 2, :, :], valid_mask=gm_bool)
+            t_water = self.tversky_water(torch.relu(class_pred[:, 2, :, :]),
+                                         targets[:, 2, :, :], valid_mask=gm_bool)
             loss_tversky = (t_build + t_veg + t_water) / 3.0
 
         build_presence_mask = (targets[:, 0, :, :] > 0.1).float() * height_1ch
@@ -169,23 +170,19 @@ class ImprovedCompositeLoss(nn.Module):
         weighted_tversky = self.w_structure * loss_tversky
         weighted_height_boost = self.w_structure * loss_height_boost
 
-        if not self.train_presence:
-            weighted_mae = zero
-            weighted_ssim = zero
-            weighted_grad = zero
-            weighted_tversky = zero
-        if not self.train_height:
-            weighted_height_boost = zero
-
         total_loss = weighted_mae + weighted_ssim + weighted_grad + \
             weighted_tversky + weighted_height_boost
 
         presence_loss = zero
         presence_tversky_loss = zero
+        water_empty_topk_loss = zero
         aux_height_building_loss = zero
         aux_height_vegetation_loss = zero
         if aux_outputs is not None and "presence_logits" in aux_outputs:
-            presence_target = (targets[:, :3, :, :] > 0).float()
+            fractions = targets[:, :3, :, :]
+            any_present = (fractions > 0).any(dim=1, keepdim=True).float()
+            argmax_idx = fractions.argmax(dim=1, keepdim=True)
+            presence_target = torch.zeros_like(fractions).scatter_(1, argmax_idx, 1.0) * any_present
 
             def masked_presence_bce(logits):
                 safe_logits = torch.where(
@@ -216,12 +213,24 @@ class ImprovedCompositeLoss(nn.Module):
                     presence_target[:, 1, :, :],
                     valid_mask=gm_bool,
                 )
-                p_water = self.tversky(
+                p_water = self.tversky_water(
                     presence_prob[:, 2, :, :],
                     presence_target[:, 2, :, :],
                     valid_mask=gm_bool,
                 )
                 presence_tversky_loss = (p_build + p_veg + p_water) / 3.0
+
+            if self.water_empty_topk > 0 and self.weight_water_empty_topk > 0:
+                water_target = presence_target[:, 2:3, :, :] * global_mask
+                empty_water = torch.sum(water_target, dim=(1, 2, 3)) <= 0
+                if torch.any(empty_water):
+                    water_prob = torch.sigmoid(
+                        aux_outputs["presence_logits"][:, 2:3, :, :]
+                    ) * global_mask
+                    flat = water_prob[empty_water].flatten(1)
+                    if flat.numel() > 0:
+                        k = min(self.water_empty_topk, flat.shape[1])
+                        water_empty_topk_loss = torch.topk(flat, k, dim=1).values.mean()
 
             target_height = targets[:, 3:4, :, :]
             bld_height_mask = (targets[:, 0:1, :, :] > 0).float() * height_mask
@@ -240,21 +249,11 @@ class ImprovedCompositeLoss(nn.Module):
                     aux_outputs["height_vegetation"], target_height, veg_height_mask
                 )
 
-            presence_loss_active = presence_loss if self.train_presence else zero
-            presence_tversky_active = (
-                presence_tversky_loss if self.train_presence else zero
-            )
-            aux_height_building_active = (
-                aux_height_building_loss if self.train_height else zero
-            )
-            aux_height_vegetation_active = (
-                aux_height_vegetation_loss if self.train_height else zero
-            )
-
             total_loss = total_loss + self.aux_weight * (
-                presence_loss_active + aux_height_building_active
-                + self.aux_veg_weight * aux_height_vegetation_active
-            ) + self.presence_tversky_weight * presence_tversky_active
+                presence_loss + aux_height_building_loss
+                + self.aux_veg_weight * aux_height_vegetation_loss
+            ) + self.presence_tversky_weight * presence_tversky_loss
+            total_loss = total_loss + self.weight_water_empty_topk * water_empty_topk_loss
 
         height_bin_ce_loss = zero
         if (aux_outputs is not None
@@ -277,15 +276,15 @@ class ImprovedCompositeLoss(nn.Module):
                 target_height, veg_height_mask, log_centers,
             )
             height_bin_ce_loss = ce_base + ce_bld + self.aux_veg_weight * ce_veg
-            if self.train_height:
-                total_loss = total_loss + self.height_bin_aux_weight * height_bin_ce_loss
+            total_loss = total_loss + self.height_bin_aux_weight * height_bin_ce_loss
 
         aux_height_loss = (aux_height_building_loss
                            + self.aux_veg_weight * aux_height_vegetation_loss)
-        w_pres = self.aux_weight if self.train_presence else 0.0
-        w_ptv = self.presence_tversky_weight if self.train_presence else 0.0
-        w_axh = self.aux_weight if self.train_height else 0.0
-        w_bince = self.height_bin_aux_weight if self.train_height else 0.0
+        w_pres = self.aux_weight
+        w_ptv = self.presence_tversky_weight
+        w_axh = self.aux_weight
+        w_bince = self.height_bin_aux_weight
+        w_wetopk = self.weight_water_empty_topk
 
         components = {
             "mae": loss_mae,
@@ -296,6 +295,7 @@ class ImprovedCompositeLoss(nn.Module):
             "height_boost": loss_height_boost,
             "presence_bce": presence_loss,
             "presence_tversky": presence_tversky_loss,
+            "water_empty_topk": water_empty_topk_loss,
             "aux_height_building": aux_height_building_loss,
             "aux_height_vegetation": aux_height_vegetation_loss,
             "aux_height": aux_height_loss,
@@ -307,6 +307,7 @@ class ImprovedCompositeLoss(nn.Module):
             "weighted_height_boost": weighted_height_boost,
             "weighted_presence_bce": w_pres * presence_loss,
             "weighted_presence_tversky": w_ptv * presence_tversky_loss,
+            "weighted_water_empty_topk": w_wetopk * water_empty_topk_loss,
             "weighted_aux_height": w_axh * aux_height_loss,
             "weighted_height_bin_ce": w_bince * height_bin_ce_loss,
         }

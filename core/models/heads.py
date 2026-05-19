@@ -44,7 +44,8 @@ class MultiTaskPredictionHead(nn.Module):
                  height_gate_source="alpha", height_hidden_ch=None,
                  height_trunk_depth=2, height_independent_branches=False,
                  height_head_kind="linear", height_n_bins=64,
-                 height_bin_max_m=80.0, presence_head_kind="shared",
+                 height_bin_max_m=80.0, use_fraction_film=True,
+                 use_fraction_aux=None, presence_head_kind="shared",
                  presence_head_depth=1, presence_branch_ch=None):
         super().__init__()
         if out_channels != 4:
@@ -75,6 +76,10 @@ class MultiTaskPredictionHead(nn.Module):
         self.height_head_kind = height_head_kind
         self.height_n_bins = int(height_n_bins) if height_head_kind == "softbin" else 0
         self.height_bin_max_m = float(height_bin_max_m)
+        self.use_fraction_film = bool(use_fraction_film)
+        self.use_fraction_aux = (
+            self.use_fraction_film if use_fraction_aux is None else bool(use_fraction_aux)
+        )
 
         # --- Deeper shared trunk: 2 layers + residual ---
         self.shared = nn.Sequential(
@@ -89,9 +94,12 @@ class MultiTaskPredictionHead(nn.Module):
         self.shared_act = nn.GELU()
 
         # --- Fraction head (auxiliary: soft coverage regression) ---
-        self.fraction_head = nn.Sequential(
-            ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
-            nn.Conv2d(hidden_ch, 3, 1),
+        self.fraction_head = (
+            nn.Sequential(
+                ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
+                nn.Conv2d(hidden_ch, 3, 1),
+            )
+            if (self.use_fraction_aux or self.use_fraction_film) else None
         )
 
         # --- Presence head (main: binary classifier for submission channels 0-2) ---
@@ -158,8 +166,8 @@ class MultiTaskPredictionHead(nn.Module):
             self.presence_delta_head = None
 
         # --- FiLM conditioning: soft fractions modulate height features ---
-        self.film_scale = nn.Conv2d(3, hidden_ch, 1)
-        self.film_shift = nn.Conv2d(3, hidden_ch, 1)
+        self.film_scale = nn.Conv2d(3, hidden_ch, 1) if self.use_fraction_film else None
+        self.film_shift = nn.Conv2d(3, hidden_ch, 1) if self.use_fraction_film else None
 
         # --- Height trunk + 3 lightweight output projections ---
         def _height_trunk():
@@ -271,9 +279,14 @@ class MultiTaskPredictionHead(nn.Module):
             bypass_h = self.shared(water_bypass_x)
             bypass_h = self.shared_act(bypass_h + self.shared_res(bypass_h))
 
-        # Auxiliary soft fraction (for height gating + regression losses)
-        fraction_logits = self.fraction_head(x)
-        fractions = torch.sigmoid(fraction_logits)
+        # Optional soft fraction head. In 081 it remains an auxiliary target
+        # but is no longer injected into the height branch.
+        if self.fraction_head is not None:
+            fraction_logits = self.fraction_head(x)
+            fractions = torch.sigmoid(fraction_logits)
+        else:
+            fraction_logits = None
+            fractions = None
 
         # Main presence classifier (submission channels 0-2). When an external
         # edge feature is provided, it learns only a zero-initialized residual
@@ -296,10 +309,12 @@ class MultiTaskPredictionHead(nn.Module):
             presence_logits = alpha_presence_logits
         presence_prob = torch.sigmoid(presence_logits)
 
-        # FiLM conditioning uses soft fractions (fine-grained coverage signal)
-        scale = self.film_scale(fractions)
-        shift = self.film_shift(fractions)
-        h = x * (1.0 + scale) + shift
+        if self.use_fraction_film and fractions is not None:
+            scale = self.film_scale(fractions)
+            shift = self.film_shift(fractions)
+            h = x * (1.0 + scale) + shift
+        else:
+            h = x
 
         if self.height_independent_branches:
             h_base = self.height_base_trunk(h)
@@ -363,8 +378,6 @@ class MultiTaskPredictionHead(nn.Module):
             return out
         aux = {
             "out": out,
-            "fraction_logits": fraction_logits,
-            "fractions": fractions,
             "presence_logits": presence_logits,
             "presence_prob": presence_prob,
             "alpha_presence_logits": alpha_presence_logits,
@@ -374,6 +387,9 @@ class MultiTaskPredictionHead(nn.Module):
             "height_building": building_height,
             "height_vegetation": vegetation_height,
         }
+        if fractions is not None:
+            aux["fraction_logits"] = fraction_logits
+            aux["fractions"] = fractions
         if self.height_head_kind == "softbin":
             aux["height_base_logits"] = base_logits
             aux["height_building_logits"] = building_logits

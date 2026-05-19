@@ -72,4 +72,6 @@ configs/*
 slurm-*.out
 logs/*.pdf
 
+logs/
+
 tools/*.ipynb

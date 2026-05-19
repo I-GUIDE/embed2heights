@@ -8,18 +8,6 @@ from torch.utils.data import Dataset
 
 HEIGHT_NORM_CONSTANT = 30.0
 
-# Active model types all consume pixel-aligned embeddings; xfusion additionally
-# receives a token tensor through PixelTokenEmbeddingDataset.
-PIXEL_MODEL_TYPES = (
-    "ae_only",
-    "ae_tessera_gated",
-    "xfusion_crosslevel",
-    "lightunet",
-    "tessera_iou_fusion_gated",
-    "tessera_token_crosslevel_s2_decoder64_presence_3way_deep",
-)
-TOKEN_MODEL_TYPES = ()
-
 
 def clean_raster_array(array):
     """Convert raster data to finite float32 values."""
@@ -79,20 +67,6 @@ def _sample_or_center_origin(height, width, crop_size, is_train):
             np.random.randint(0, width - crop_size + 1),
         )
     return (height - crop_size) // 2, (width - crop_size) // 2
-
-
-def pick_dataset_class(model_type, n_channels):
-    """Resolve (model_type, n_channels) to the right Dataset subclass.
-
-    `model_type == 'auto'` routes by channel count (the rough pixel vs ViT-token
-    discriminator); an explicit model type routes by the PIXEL_MODEL_TYPES list.
-    """
-    mt = model_type.lower()
-    if mt == "auto":
-        is_pixel = n_channels < 512
-    else:
-        is_pixel = mt in PIXEL_MODEL_TYPES
-    return PixelEmbeddingDataset if is_pixel else LatentTokenDataset
 
 
 def _prepare_target(tar_path, image_shape, patch_size=None):
@@ -199,70 +173,6 @@ class MultiPixelEmbeddingDataset(Dataset):
         image = _crop_chw(image, top, left, self.patch_size)
         target = _crop_chw(target, top, left, self.patch_size)
         valid_mask = _crop_chw(valid_mask, top, left, self.patch_size)
-
-        return torch.from_numpy(image), torch.from_numpy(target), torch.from_numpy(valid_mask)
-
-
-class MultiLatentTokenDataset(Dataset):
-    """
-    For same-grid token fusion, e.g. TerraMind/THOR S1 768ch@16x16 +
-    S2 768ch@16x16 -> 1536ch@16x16.
-
-    file_pairs may contain:
-      - (primary_token_path, secondary_token_path, label_path)
-      - (primary_token_path, secondary_token_path) for label-free inference
-    """
-    def __init__(self, file_pairs, patch_size=256, scale_factor=16, is_train=True):
-        self.patch_size = patch_size
-        self.scale_factor = scale_factor
-        self.is_train = is_train
-        self.file_pairs = file_pairs
-
-    def __len__(self):
-        return len(self.file_pairs)
-
-    def __getitem__(self, idx):
-        pair = self.file_pairs[idx]
-        if len(pair) == 3:
-            primary_path, secondary_path, tar_path = pair
-        elif len(pair) == 2:
-            primary_path, secondary_path = pair
-            tar_path = None
-        else:
-            raise ValueError("MultiLatentTokenDataset expects 2- or 3-item tuples")
-
-        primary = _read_raster(primary_path)
-        secondary = _read_raster(secondary_path)
-
-        _assert_same_spatial(primary, secondary, primary_path, secondary_path, "Token")
-        image = np.concatenate([primary, secondary], axis=0)
-        emb_patch_size = self.patch_size // self.scale_factor
-
-        target, valid_mask = _prepare_target(tar_path, image.shape[1:], patch_size=self.patch_size)
-
-        image = _pad_to_min_shape(image, (emb_patch_size, emb_patch_size), mode="reflect")
-        target = _pad_to_min_shape(target, (self.patch_size, self.patch_size), mode="reflect")
-        valid_mask = _pad_to_min_shape(
-            valid_mask,
-            (self.patch_size, self.patch_size),
-            mode="constant",
-            constant_values=0,
-        )
-
-        _, h_emb, w_emb = image.shape
-        top_emb, left_emb = _sample_or_center_origin(
-            h_emb,
-            w_emb,
-            emb_patch_size,
-            self.is_train,
-        )
-
-        top_tar = top_emb * self.scale_factor
-        left_tar = left_emb * self.scale_factor
-
-        image = _crop_chw(image, top_emb, left_emb, emb_patch_size)
-        target = _crop_chw(target, top_tar, left_tar, self.patch_size)
-        valid_mask = _crop_chw(valid_mask, top_tar, left_tar, self.patch_size)
 
         return torch.from_numpy(image), torch.from_numpy(target), torch.from_numpy(valid_mask)
 
@@ -439,53 +349,3 @@ class PixelMultiTokenEmbeddingDataset(Dataset):
         ), torch.from_numpy(target), torch.from_numpy(valid_mask)
 
 
-class LatentTokenDataset(Dataset):
-    """
-    For patch-level embeddings (TerraMind 768ch@16x16, THOR 768ch@16x16).
-    file_pairs: list of (emb_path, label_path) tuples, OR list of emb_path strings (label-free mode).
-    """
-    def __init__(self, file_pairs, patch_size=256, scale_factor=16, is_train=True):
-        self.patch_size = patch_size
-        self.scale_factor = scale_factor
-        self.is_train = is_train
-        if file_pairs and isinstance(file_pairs[0], str):
-            self.file_pairs = [(p, None) for p in file_pairs]
-        else:
-            self.file_pairs = file_pairs
-
-    def __len__(self):
-        return len(self.file_pairs)
-
-    def __getitem__(self, idx):
-        emb_path, tar_path = self.file_pairs[idx]
-
-        image = _read_raster(emb_path)
-
-        emb_patch_size = self.patch_size // self.scale_factor
-        target, valid_mask = _prepare_target(tar_path, image.shape[1:], patch_size=self.patch_size)
-
-        image = _pad_to_min_shape(image, (emb_patch_size, emb_patch_size), mode="reflect")
-        target = _pad_to_min_shape(target, (self.patch_size, self.patch_size), mode="reflect")
-        valid_mask = _pad_to_min_shape(
-            valid_mask,
-            (self.patch_size, self.patch_size),
-            mode="constant",
-            constant_values=0,
-        )
-
-        _, h_emb, w_emb = image.shape
-        top_emb, left_emb = _sample_or_center_origin(
-            h_emb,
-            w_emb,
-            emb_patch_size,
-            self.is_train,
-        )
-
-        top_tar = top_emb * self.scale_factor
-        left_tar = left_emb * self.scale_factor
-
-        image = _crop_chw(image, top_emb, left_emb, emb_patch_size)
-        target = _crop_chw(target, top_tar, left_tar, self.patch_size)
-        valid_mask = _crop_chw(valid_mask, top_tar, left_tar, self.patch_size)
-
-        return torch.from_numpy(image), torch.from_numpy(target), torch.from_numpy(valid_mask)

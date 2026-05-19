@@ -132,24 +132,6 @@ def find_trisource_file_pairs(primary_emb_dir, secondary_emb_dir, token_emb_dir,
     )
 
 
-def find_quadsource_file_pairs(primary_emb_dir, secondary_emb_dir, token_primary_dir,
-                               token_secondary_dir, tar_dir):
-    """
-    Match two pixel-aligned sources, two token sources, and labels by normalized core id.
-
-    Returns tuples of (primary_embedding, secondary_embedding, token_primary,
-    token_secondary, label). The token order is preserved for same-model S1/S2
-    fusion, so pass S1 as token_primary and S2 as token_secondary.
-    """
-    return _match_labeled_embedding_dirs(
-        primary_emb_dir,
-        secondary_emb_dir,
-        token_primary_dir,
-        token_secondary_dir,
-        tar_dir=tar_dir,
-    )
-
-
 def find_multisource_embedding_files(primary_emb_dir, secondary_emb_dir):
     """
     Match two label-free embedding dirs by normalized core id.
@@ -167,22 +149,6 @@ def find_trisource_embedding_files(primary_emb_dir, secondary_emb_dir, token_emb
     Returns tuples of (primary_embedding, secondary_embedding, token_embedding).
     """
     return _match_embedding_dirs(primary_emb_dir, secondary_emb_dir, token_emb_dir)
-
-
-def find_quadsource_embedding_files(primary_emb_dir, secondary_emb_dir, token_primary_dir,
-                                    token_secondary_dir):
-    """
-    Match two pixel-aligned embedding dirs and two token embedding dirs for inference.
-
-    Returns tuples of (primary_embedding, secondary_embedding, token_primary,
-    token_secondary). The primary path is used for leaderboard submission ids.
-    """
-    return _match_embedding_dirs(
-        primary_emb_dir,
-        secondary_emb_dir,
-        token_primary_dir,
-        token_secondary_dir,
-    )
 
 
 def save_split(split_path, train_pairs, val_pairs):
