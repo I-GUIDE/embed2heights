@@ -36,8 +36,40 @@ class SEBlock(nn.Module):
         return x * y
 
 
+class CoordAttention(nn.Module):
+    """Coordinate Attention (Hou et al. 2021, CVPR).
+
+    Decomposes the 2D pool into separate H and W pools, then mixes them through
+    a shared 1x1 conv before splitting back into per-axis attention maps. Unlike
+    SE, this encodes positional information into channel attention — relevant
+    here because regions (KE etc.) are spatially correlated within tiles.
+    """
+    def __init__(self, channels, reduction=32, min_hidden=8):
+        super().__init__()
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        mip = max(min_hidden, channels // reduction)
+        self.conv1 = nn.Conv2d(channels, mip, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.Hardswish(inplace=True)
+        self.conv_h = nn.Conv2d(mip, channels, kernel_size=1, bias=False)
+        self.conv_w = nn.Conv2d(mip, channels, kernel_size=1, bias=False)
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        x_h = self.pool_h(x)
+        x_w = self.pool_w(x).permute(0, 1, 3, 2).contiguous()
+        y = torch.cat([x_h, x_w], dim=2)
+        y = self.act(self.bn1(self.conv1(y)))
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        x_w = x_w.permute(0, 1, 3, 2).contiguous()
+        a_h = torch.sigmoid(self.conv_h(x_h))
+        a_w = torch.sigmoid(self.conv_w(x_w))
+        return x * a_h * a_w
+
+
 class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels, norm_kind="bn", use_se=False):
+    def __init__(self, in_channels, out_channels, norm_kind="bn", use_se=False, use_coord_attn=False):
         super().__init__()
         layers = [
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
@@ -49,6 +81,8 @@ class DoubleConv(nn.Module):
         ]
         if use_se:
             layers.append(SEBlock(out_channels))
+        if use_coord_attn:
+            layers.append(CoordAttention(out_channels))
         self.double_conv = nn.Sequential(*layers)
 
     def forward(self, x):
@@ -73,29 +107,31 @@ class UpsampleBlock(nn.Module):
 class LightUNet(nn.Module):
     def __init__(self, n_channels, n_classes, base_ch=32, norm_kind="bn",
                  presence_head_kind="shared", presence_head_depth=1,
-                 presence_branch_ch=None, use_se=False):
+                 presence_branch_ch=None, use_se=False, use_coord_attn=False):
         super().__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.base_ch = base_ch
         self.norm_kind = norm_kind
         self.use_se = bool(use_se)
+        self.use_coord_attn = bool(use_coord_attn)
         self.supports_aux_outputs = True
 
         c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
-        self.inc = DoubleConv(n_channels, c1, norm_kind=norm_kind, use_se=self.use_se)
-        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c1, c2, norm_kind=norm_kind, use_se=self.use_se))
-        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c2, c3, norm_kind=norm_kind, use_se=self.use_se))
-        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c3, c4, norm_kind=norm_kind, use_se=self.use_se))
+        dc_kw = dict(norm_kind=norm_kind, use_se=self.use_se, use_coord_attn=self.use_coord_attn)
+        self.inc = DoubleConv(n_channels, c1, **dc_kw)
+        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c1, c2, **dc_kw))
+        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c2, c3, **dc_kw))
+        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c3, c4, **dc_kw))
 
         self.up1 = UpsampleBlock(c4, c3, norm_kind=norm_kind)
-        self.conv1 = DoubleConv(c4, c3, norm_kind=norm_kind, use_se=self.use_se)
+        self.conv1 = DoubleConv(c4, c3, **dc_kw)
 
         self.up2 = UpsampleBlock(c3, c2, norm_kind=norm_kind)
-        self.conv2 = DoubleConv(c3, c2, norm_kind=norm_kind, use_se=self.use_se)
+        self.conv2 = DoubleConv(c3, c2, **dc_kw)
 
         self.up3 = UpsampleBlock(c2, c1, norm_kind=norm_kind)
-        self.conv3 = DoubleConv(c2, c1, norm_kind=norm_kind, use_se=self.use_se)
+        self.conv3 = DoubleConv(c2, c1, **dc_kw)
 
         self.head = MultiTaskPredictionHead(
             in_ch=c1,
