@@ -825,3 +825,104 @@ class SimpleConcatASPP(nn.Module):
         fused = torch.cat([ae_feat, tessera_feat], dim=1)
         features = self.reduce(self.aspp(fused))
         return self.head(features, return_aux=return_aux)
+
+
+class AeTesseraMlpFusion(nn.Module):
+    """Lightweight MLP-only decoder over AE+Tessera embeddings.
+
+    Tests the hypothesis (THOR 2026, TESSERA 2026) that strong foundation-
+    model embeddings (AE 64-D ViT, Tessera 128-D Transformer+GRU) already
+    encode all the spatial+temporal context required for dense prediction,
+    and a heavy UNet decoder is just a 2.5M-param invitation to overfit in
+    our 2024-tile, leave-region-out CV regime.
+
+    Architecture:
+      1. Per-modality InstanceNorm to neutralize the magnitude mismatch
+         (AE range [-90, 80] vs Tessera [-13, 16]) — addresses regional
+         style/scale shifts before feature mixing.
+      2. Concat → single 1x1 conv into shared hidden width (default 256)
+         with BN + GELU. Zero spatial receptive-field expansion in the
+         decoder; all spatial context comes from the encoders.
+      3. Pass through MultiTaskPredictionHead (FiLM/softbin/multi-task
+         outputs) for loss compatibility with the canon recipe.
+
+    Total: ~250-400k params depending on head config — ~5-10% of the
+    canonical 5.2M model. The structural bottleneck forces the network
+    to rely on the pre-trained embeddings rather than memorizing training-
+    tile spatial idiosyncrasies.
+    """
+    def __init__(self, n_channels, n_classes=4, alpha_channels=64,
+                 hidden_ch=256, height_specialist_depth=0,
+                 height_gate_source="alpha", height_hidden_ch=None,
+                 height_trunk_depth=2, height_independent_branches=False,
+                 height_head_kind="linear", height_n_bins=64,
+                 height_bin_max_m=80.0, norm_kind="bn",
+                 presence_head_kind="shared", presence_head_depth=1,
+                 presence_branch_ch=None, bidirectional_ctask=False,
+                 height_blend_mode="presence_gated",
+                 dual_presence=False, disable_head_film=False,
+                 use_bottleneck_attn=False, **_ignored):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("AeTesseraMlpFusion assumes 4 output channels")
+        self.supports_aux_outputs = True
+        self.alpha_channels = alpha_channels
+        tessera_channels = n_channels - alpha_channels
+        if tessera_channels <= 0:
+            raise ValueError(
+                f"Expected n_channels > alpha_channels ({alpha_channels}); got {n_channels}"
+            )
+
+        # Per-modality InstanceNorm: strip regional style/illumination/scale.
+        # Operates on each (B, C, H, W) independently per sample, per channel.
+        self.ae_norm = nn.InstanceNorm2d(alpha_channels, affine=True)
+        self.tessera_norm = nn.InstanceNorm2d(tessera_channels, affine=True)
+
+        # Single 1x1 mixing layer — no spatial conv, no receptive field growth.
+        self.mix = nn.Sequential(
+            nn.Conv2d(n_channels, hidden_ch, kernel_size=1, bias=False),
+            nn.BatchNorm2d(hidden_ch) if norm_kind == "bn" else nn.GroupNorm(
+                _group_count(hidden_ch), hidden_ch),
+            nn.GELU(),
+        )
+
+        # Optional bottleneck self-attention block (treats the entire feature
+        # map as tokens; here, no downsampling so it acts at full 256x256).
+        # Use sparingly — quadratic memory.
+        from .backbones import BottleneckSelfAttention
+        self.bottleneck_attn = (
+            BottleneckSelfAttention(hidden_ch) if use_bottleneck_attn else None
+        )
+
+        # Existing multi-task head provides FiLM, softbin, aux heights, etc.
+        self.head = MultiTaskPredictionHead(
+            in_ch=hidden_ch,
+            out_channels=n_classes,
+            hidden_ch=hidden_ch,
+            height_specialist_depth=height_specialist_depth,
+            height_gate_source=height_gate_source,
+            height_hidden_ch=height_hidden_ch,
+            height_trunk_depth=height_trunk_depth,
+            height_independent_branches=height_independent_branches,
+            height_head_kind=height_head_kind,
+            height_n_bins=height_n_bins,
+            height_bin_max_m=height_bin_max_m,
+            presence_head_kind=presence_head_kind,
+            presence_head_depth=presence_head_depth,
+            presence_branch_ch=presence_branch_ch,
+            bidirectional_ctask=bidirectional_ctask,
+            height_blend_mode=height_blend_mode,
+            dual_presence=dual_presence,
+            disable_head_film=disable_head_film,
+        )
+
+    def forward(self, x, return_aux=False):
+        ae = x[:, :self.alpha_channels, :, :]
+        tessera = x[:, self.alpha_channels:, :, :]
+        ae = self.ae_norm(ae)
+        tessera = self.tessera_norm(tessera)
+        x = torch.cat([ae, tessera], dim=1)
+        x = self.mix(x)
+        if self.bottleneck_attn is not None:
+            x = self.bottleneck_attn(x)
+        return self.head(x, return_aux=return_aux)

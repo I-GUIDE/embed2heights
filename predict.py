@@ -73,6 +73,13 @@ def parse_args():
     parser.add_argument("--tta", default="none", choices=TTA_CHOICES,
                         help="Test-time augmentation mode. 'flip' uses identity + h/v flips; "
                              "'d4' uses rotations plus mirrored rotations.")
+    parser.add_argument("--adabn", action="store_true",
+                        help="Adaptive Batch Normalization: do a no-grad forward pass over the "
+                             "test/inference inputs with BN layers in training mode (updates "
+                             "running stats to match the inference distribution) before the "
+                             "final eval-mode pass. Parameter-free domain adaptation that "
+                             "neutralizes regional style shifts (per-region illumination, "
+                             "sensor noise, etc.) without risking catastrophic divergence.")
     return parser.parse_args()
 
 
@@ -270,6 +277,21 @@ def main():
             print(f"  INFO: {len(bn_missing)} BN running-stat keys not in checkpoint (legacy GroupNorm ckpt) — using defaults")
         if other_missing:
             print(f"  WARN: {len(other_missing)} non-stat keys missing: {other_missing[:3]}...")
+    if args.adabn:
+        print(f"AdaBN: running no-grad forward pass over {len(test_ds)} samples to update BN stats...")
+        # Reset all BN running statistics so they accumulate purely from
+        # inference distribution. Then run forward in train() mode under
+        # no_grad to update running_mean / running_var per batch without
+        # touching the learned affine parameters or any other weight.
+        for m in model.modules():
+            if isinstance(m, (torch.nn.BatchNorm1d, torch.nn.BatchNorm2d, torch.nn.BatchNorm3d)):
+                m.reset_running_stats()
+        model.train()
+        with torch.no_grad():
+            for i in tqdm(range(len(test_ds)), desc="AdaBN BN-update"):
+                img_tensor, _, _ = test_ds[i]
+                img_batch = move_to_device(batched(img_tensor), device)
+                model(img_batch)
     model.eval()
 
     print(f"Loaded model: {selected_model} from {model_path} (input channels={input_channels(sample_img)})")
