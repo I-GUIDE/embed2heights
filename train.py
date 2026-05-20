@@ -237,6 +237,11 @@ def parse_args():
                         "target (each multi-class pixel is positive ONLY for its dominant "
                         "class). Fixes the train/eval mismatch where fraction>0 trains the "
                         "model to predict every class at multi-class pixels.")
+    p.add_argument("--argmax-bce-only", action="store_true",
+                   help="When set with --argmax-presence-target, applies the argmax label "
+                        "ONLY to the BCE presence loss; Tversky + height masks keep the "
+                        "fraction>0 convention. Matches the narrower description of Ye "
+                        "Dingqi's fix and avoids over-restricting height supervision.")
     p.add_argument("--boundary-weight", type=float, default=0.0,
                    help="Enable boundary-aware loss. Upweights BCE on the building "
                         "channel near GT boundaries. >0 enables, e.g. 1.0 to turn on.")
@@ -963,6 +968,7 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "use_se":              getattr(args, "use_se", False),
         "use_coord_attn":      getattr(args, "use_coord_attn", False),
         "argmax_presence_target": getattr(args, "argmax_presence_target", False),
+        "argmax_bce_only":     getattr(args, "argmax_bce_only", False),
         "disable_head_film":   getattr(args, "disable_head_film", False),
         "lovasz_weight":       getattr(args, "lovasz_weight", 0.0),
         "boundary_weight":     getattr(args, "boundary_weight", 0.0),
@@ -1178,6 +1184,7 @@ def main():
         boundary_amp=getattr(args, "boundary_amp", 4.0),
         lovasz_weight=getattr(args, "lovasz_weight", 0.0),
         argmax_presence_target=getattr(args, "argmax_presence_target", False),
+        argmax_bce_only=getattr(args, "argmax_bce_only", False),
     ).to(device)
     print(
         "Using loss: "

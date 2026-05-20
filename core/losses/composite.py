@@ -39,7 +39,8 @@ class ImprovedCompositeLoss(nn.Module):
                  boundary_sigma_px=2.0,
                  boundary_amp=4.0,
                  lovasz_weight=0.0,
-                 argmax_presence_target=False):
+                 argmax_presence_target=False,
+                 argmax_bce_only=False):
         super().__init__()
         if loss_preset != "presence_centered":
             raise ValueError("loss_preset must be presence_centered")
@@ -90,6 +91,10 @@ class ImprovedCompositeLoss(nn.Module):
         # where overlap-trained models predict all classes at multi-class
         # pixels — train/eval mismatch with LB scoring.
         self.argmax_presence_target = bool(argmax_presence_target)
+        # If True (and argmax_presence_target=True), argmax label is used
+        # ONLY for the BCE component; Tversky + height masks keep the
+        # fraction>0 convention. Narrower fix matching the original tip.
+        self.argmax_bce_only = bool(argmax_bce_only)
 
         self.task = "both"
         self.train_presence = True
@@ -230,7 +235,7 @@ class ImprovedCompositeLoss(nn.Module):
                                    targets[:, 2, :, :], valid_mask=gm_bool)
             loss_tversky = (t_build + t_veg + t_water) / 3.0
 
-        if self.argmax_presence_target:
+        if self.argmax_presence_target and not self.argmax_bce_only:
             build_presence_mask = _argmax_presence[:, 0, :, :] * height_1ch
             veg_presence_mask = _argmax_presence[:, 1, :, :] * height_1ch
         else:
@@ -270,10 +275,21 @@ class ImprovedCompositeLoss(nn.Module):
         aux_height_building_loss = zero
         aux_height_vegetation_loss = zero
         if aux_outputs is not None and "presence_logits" in aux_outputs:
-            if self.argmax_presence_target:
+            # Default presence_target is fraction>0; only switch to argmax
+            # for BOTH BCE and Tversky if --argmax-presence-target is on and
+            # --argmax-bce-only is off. In bce-only mode, presence_target
+            # (used by Tversky and dual-aux) stays fraction>0, while a separate
+            # bce_target uses argmax labels.
+            fraction_presence = (targets[:, :3, :, :] > 0).float()
+            if self.argmax_presence_target and not self.argmax_bce_only:
                 presence_target = _argmax_presence
             else:
-                presence_target = (targets[:, :3, :, :] > 0).float()
+                presence_target = fraction_presence
+            # The actual BCE target — argmax if either flag enables it
+            if self.argmax_presence_target:
+                bce_target = _argmax_presence
+            else:
+                bce_target = fraction_presence
 
             # Boundary weight map for building (channel 0): higher weight near
             # ground-truth building boundary, computed on-the-fly via a Sobel-style
@@ -304,8 +320,8 @@ class ImprovedCompositeLoss(nn.Module):
                 )
                 safe_target = torch.where(
                     lc_mask.bool(),
-                    presence_target,
-                    torch.zeros_like(presence_target),
+                    bce_target,
+                    torch.zeros_like(bce_target),
                 )
                 loss = F.binary_cross_entropy_with_logits(
                     safe_logits, safe_target, reduction="none"
@@ -360,7 +376,7 @@ class ImprovedCompositeLoss(nn.Module):
                     )
 
             target_height = targets[:, 3:4, :, :]
-            if self.argmax_presence_target:
+            if self.argmax_presence_target and not self.argmax_bce_only:
                 bld_height_mask = _argmax_presence[:, 0:1, :, :] * height_mask
                 veg_height_mask = _argmax_presence[:, 1:2, :, :] * height_mask
             else:
@@ -475,7 +491,7 @@ class ImprovedCompositeLoss(nn.Module):
                 and "height_log_bin_centers" in aux_outputs):
             log_centers = aux_outputs["height_log_bin_centers"]
             target_height = targets[:, 3:4, :, :]
-            if self.argmax_presence_target:
+            if self.argmax_presence_target and not self.argmax_bce_only:
                 bld_height_mask = _argmax_presence[:, 0:1, :, :] * height_mask
                 veg_height_mask = _argmax_presence[:, 1:2, :, :] * height_mask
             else:
