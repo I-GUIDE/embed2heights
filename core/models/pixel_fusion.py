@@ -827,6 +827,132 @@ class SimpleConcatASPP(nn.Module):
         return self.head(features, return_aux=return_aux)
 
 
+class PixelMoEFusion(nn.Module):
+    """Pixel-level Top-K=2 Mixture-of-Experts fusion of AE + Tessera.
+
+    Per deep research recommendation #1 — dynamic routing replaces static
+    gating. Router projects concat(AE, Tessera) → expert logits per pixel,
+    Top-K=2 experts process the concat features in parallel, outputs are
+    weighted-summed by the (renormalized) top-K softmax probs. Each pixel
+    routes to a different expert combination based on its content.
+
+    Strong fit for small-data regimes (research): sparse activation acts
+    as structural regularization — only K/N of the model's capacity is
+    active per pixel per forward pass, so the effective parameter budget
+    seen by any single training sample stays modest.
+
+    Wired upstream of the alpha_unet branch in TesseraIoUFusionGatedLightUNet,
+    so the LightUNet trunk and multi-task head are unchanged. Only the
+    fusion layer differs.
+    """
+    def __init__(self, in_channels=192, out_channels=64, num_experts=4, k=2,
+                 expert_hidden=128):
+        super().__init__()
+        self.k = int(k)
+        self.num_experts = int(num_experts)
+        # Router
+        self.router = nn.Conv2d(in_channels, num_experts, kernel_size=1)
+        # Lightweight experts (1x1 → hidden → 1x1 with GELU)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Conv2d(in_channels, expert_hidden, kernel_size=1, bias=False),
+                nn.GELU(),
+                nn.Conv2d(expert_hidden, out_channels, kernel_size=1),
+            )
+            for _ in range(num_experts)
+        ])
+
+    def forward(self, x):
+        # x: (B, in_channels, H, W); both AE and Tessera concatenated
+        b, c, h, w = x.shape
+        logits = self.router(x)                          # (B, E, H, W)
+        probs = F.softmax(logits, dim=1)
+        topk_probs, topk_idx = torch.topk(probs, self.k, dim=1)  # (B, k, H, W)
+        topk_probs = topk_probs / (topk_probs.sum(dim=1, keepdim=True) + 1e-8)
+
+        # Forward through ALL experts then gather (simple but not most efficient;
+        # acceptable for E=4, k=2 at our scale)
+        expert_outs = torch.stack([expert(x) for expert in self.experts], dim=1)
+        # expert_outs: (B, E, out_channels, H, W)
+        out = torch.zeros(b, expert_outs.shape[2], h, w, device=x.device, dtype=x.dtype)
+        for i in range(self.k):
+            idx_i = topk_idx[:, i:i+1, :, :]              # (B, 1, H, W) values in [0, E)
+            prob_i = topk_probs[:, i:i+1, :, :]
+            # Gather selected expert output: index along E-dim with idx_i
+            expanded_idx = idx_i.unsqueeze(2).expand(-1, -1, expert_outs.shape[2], -1, -1)
+            selected = torch.gather(expert_outs, 1, expanded_idx).squeeze(1)  # (B, out, H, W)
+            out = out + prob_i * selected
+        return out
+
+
+class AeTesseraMoeFusion(nn.Module):
+    """AE+Tessera with per-pixel MoE fusion → LightUNet → MultiTaskHead.
+
+    Mirrors TesseraIoUFusionGatedLightUNet's structure but the gated fusion
+    layer is replaced by a PixelMoEFusion module. Everything downstream
+    (UNet trunk, multi-task head, bidirectional cross-task, softbin height)
+    is identical to the canon recipe — so any score delta is directly
+    attributable to the fusion mechanism.
+    """
+    def __init__(self, n_channels, n_classes=4, alpha_channels=64,
+                 num_experts=4, k=2, expert_hidden=128, base_ch=48,
+                 norm_kind="bn", height_specialist_depth=0,
+                 height_gate_source="alpha", height_hidden_ch=None,
+                 height_trunk_depth=2, height_independent_branches=False,
+                 height_head_kind="linear", height_n_bins=64,
+                 height_bin_max_m=80.0,
+                 presence_head_kind="shared", presence_head_depth=1,
+                 presence_branch_ch=None, bidirectional_ctask=False,
+                 height_blend_mode="presence_gated",
+                 dual_presence=False, disable_head_film=False,
+                 use_bottleneck_attn=False, **_ignored):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("AeTesseraMoeFusion assumes 4 output channels")
+        self.supports_aux_outputs = True
+        self.alpha_channels = alpha_channels
+        # MoE fusion outputs base_ch (matches LightUNet first-layer width)
+        self.moe = PixelMoEFusion(
+            in_channels=n_channels, out_channels=base_ch,
+            num_experts=num_experts, k=k, expert_hidden=expert_hidden,
+        )
+        # Then a LightUNet trunk + multi-task head, but starting from base_ch
+        # input rather than full concat. Mirrors the canon recipe with the
+        # fusion stage replaced.
+        self.unet = LightUNet(
+            base_ch, n_classes, base_ch=base_ch, norm_kind=norm_kind,
+            use_bottleneck_attn=bool(use_bottleneck_attn),
+        )
+        # Replace UNet's default head with our richer multi-task head
+        self.unet.head = MultiTaskPredictionHead(
+            in_ch=base_ch,
+            out_channels=n_classes,
+            height_specialist_depth=height_specialist_depth,
+            height_gate_source=height_gate_source,
+            height_hidden_ch=height_hidden_ch,
+            height_trunk_depth=height_trunk_depth,
+            height_independent_branches=height_independent_branches,
+            height_head_kind=height_head_kind,
+            height_n_bins=height_n_bins,
+            height_bin_max_m=height_bin_max_m,
+            presence_head_kind=presence_head_kind,
+            presence_head_depth=presence_head_depth,
+            presence_branch_ch=presence_branch_ch,
+            bidirectional_ctask=bidirectional_ctask,
+            height_blend_mode=height_blend_mode,
+            dual_presence=dual_presence,
+            disable_head_film=disable_head_film,
+        )
+
+    def forward(self, x, return_aux=False):
+        # x: (B, n_channels, H, W) — full concat of AE + Tessera
+        fused = self.moe(x)
+        # Use UNet's forward via direct call
+        x4, skips = self.unet.forward_encoder(fused)
+        feat = self.unet.forward_decoder(x4, skips)
+        return self.unet.head(feat, return_aux=return_aux)
+
+
 class AeTesseraMlpFusion(nn.Module):
     """Lightweight MLP-only decoder over AE+Tessera embeddings.
 

@@ -80,6 +80,8 @@ MODEL_CHOICES = [
     "ae_tessera_simple_convnext", "ae_tessera_simple_aspp",
     "simple_concat_fusion", "simple_gated_fusion",
     "simple_concat_convnext", "simple_concat_aspp",
+    "ae_tessera_mlp", "ae_tessera_mlp_fusion",
+    "ae_tessera_moe", "ae_tessera_moe_fusion",
 ]
 LOSS_PRESET_CHOICES = ["auto", "current", "no_ssim_grad", "presence_centered"]
 

@@ -12,7 +12,7 @@ except ImportError:
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CONFIG_PATH = os.path.join(REPO_DIR, "configs", "defaults.yml")
 
-MODEL_CHOICES = ["ae_only", "ae_tessera", "ae_tessera_gated", "xfusion_crosslevel", "xfusion_pp", "hier_gated", "auto"]
+MODEL_CHOICES = ["ae_only", "ae_tessera", "ae_tessera_gated", "ae_tessera_mlp", "ae_tessera_moe", "xfusion_crosslevel", "xfusion_pp", "hier_gated", "auto"]
 CONFIG_SECTIONS = ("data", "model", "training", "runtime")
 RECIPE_METADATA_KEYS = ("name", "description", "reference")
 

@@ -7,6 +7,7 @@ variants are recorded in logs rather than kept as live code.
 from .backbones import LightUNet
 from .pixel_fusion import (
     AeTesseraMlpFusion,
+    AeTesseraMoeFusion,
     SimpleConcatASPP,
     SimpleConcatConvNeXt,
     SimpleConcatFusion,
@@ -43,6 +44,10 @@ ACTIVE_MODEL_ALIASES = {
     # THOR/TESSERA-paper hypothesis: heavy decoders overfit when embeddings
     # are strong. Targets the OOF→LB generalization gap.
     "ae_tessera_mlp": "ae_tessera_mlp_fusion",
+    # Per-pixel Mixture-of-Experts fusion (deep research #1). Top-K=2 routing
+    # over 4 lightweight experts; sparse activation regularizes small-data
+    # training while expanding effective parameter capacity.
+    "ae_tessera_moe": "ae_tessera_moe_fusion",
 }
 
 ACTIVE_MODEL_TYPES = set(ACTIVE_MODEL_ALIASES) | set(ACTIVE_MODEL_ALIASES.values())
@@ -164,6 +169,34 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 ae_only_supervision=ae_only_supervision,
                 use_se=use_se,
                 use_coord_attn=use_coord_attn,
+                use_bottleneck_attn=use_bottleneck_attn,
+            ),
+            selected,
+        )
+
+    if selected == "ae_tessera_moe_fusion":
+        return (
+            AeTesseraMoeFusion(
+                n_channels=n_channels,
+                n_classes=n_classes,
+                num_experts=4, k=2, expert_hidden=128,
+                base_ch=lightunet_base_ch,
+                norm_kind=lightunet_norm_kind,
+                height_specialist_depth=height_specialist_depth,
+                height_gate_source=height_gate_source,
+                height_hidden_ch=height_hidden_ch,
+                height_trunk_depth=height_trunk_depth,
+                height_independent_branches=height_independent_branches,
+                height_head_kind=height_head_kind,
+                height_n_bins=height_n_bins,
+                height_bin_max_m=height_bin_max_m,
+                presence_head_kind=presence_head_kind,
+                presence_head_depth=presence_head_depth,
+                presence_branch_ch=presence_branch_ch,
+                bidirectional_ctask=bidirectional_ctask,
+                height_blend_mode=height_blend_mode,
+                dual_presence=dual_presence,
+                disable_head_film=disable_head_film,
                 use_bottleneck_attn=use_bottleneck_attn,
             ),
             selected,
