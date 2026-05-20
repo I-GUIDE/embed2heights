@@ -143,6 +143,7 @@ def model_kwargs_from_run_config(cfg):
         "ae_only_supervision": (cfg.get("ae_only_deep_sup_weight", 0.0) or 0.0) > 0.0,
         "use_se": cfg.get("use_se", False),
         "use_coord_attn": cfg.get("use_coord_attn", False),
+        "use_bottleneck_attn": cfg.get("use_bottleneck_attn", False),
         "disable_head_film": cfg.get("disable_head_film", False),
     }
 

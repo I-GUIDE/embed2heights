@@ -26,6 +26,7 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 ae_only_supervision=False,
                 use_se=False,
                 use_coord_attn=False,
+                use_bottleneck_attn=False,
                 disable_head_film=False):
     selected = model_type.lower()
     if selected == "auto":
@@ -62,6 +63,7 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
         ae_only_supervision=ae_only_supervision,
         use_se=use_se,
         use_coord_attn=use_coord_attn,
+        use_bottleneck_attn=use_bottleneck_attn,
         disable_head_film=disable_head_film,
     )
     if active is not None:

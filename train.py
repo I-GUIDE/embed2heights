@@ -232,6 +232,10 @@ def parse_args():
                    help="Enable Coordinate Attention (Hou 2021) in LightUNet DoubleConv "
                         "blocks. Decomposes 2D pool into H+W pools so channel attention "
                         "carries positional info — relevant when regions matter (e.g. KE).")
+    p.add_argument("--use-bottleneck-attn", action="store_true",
+                   help="Insert a Transformer-style self-attention block at the UNet "
+                        "bottleneck (32x32 at 256 input). Adds global context the conv "
+                        "receptive field can't reach in 3 downsamples.")
     p.add_argument("--argmax-presence-target", action="store_true",
                    help="Use argmax across class fractions for the presence supervision "
                         "target (each multi-class pixel is positive ONLY for its dominant "
@@ -967,6 +971,7 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "focal_alpha":         args.focal_alpha,
         "use_se":              getattr(args, "use_se", False),
         "use_coord_attn":      getattr(args, "use_coord_attn", False),
+        "use_bottleneck_attn": getattr(args, "use_bottleneck_attn", False),
         "argmax_presence_target": getattr(args, "argmax_presence_target", False),
         "argmax_bce_only":     getattr(args, "argmax_bce_only", False),
         "disable_head_film":   getattr(args, "disable_head_film", False),
@@ -1125,6 +1130,7 @@ def main():
         ae_only_supervision=(args.ae_only_deep_sup_weight > 0.0),
         use_se=getattr(args, "use_se", False),
         use_coord_attn=getattr(args, "use_coord_attn", False),
+        use_bottleneck_attn=getattr(args, "use_bottleneck_attn", False),
         disable_head_film=getattr(args, "disable_head_film", False),
     )
     if args.init_from_pretrain:

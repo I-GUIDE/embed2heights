@@ -68,6 +68,40 @@ class CoordAttention(nn.Module):
         return x * a_h * a_w
 
 
+class BottleneckSelfAttention(nn.Module):
+    """Single Transformer block on the UNet bottleneck features (32×32 at 256 input).
+
+    Provides global context that the convolutional receptive field cannot reach
+    in 3 downsamples. Lighter than a full ViT trunk: one MSA + MLP, ~0.9-1.5M
+    params at base_ch=48 (bottleneck dim 384). Skipped when input is below
+    a minimum spatial size to avoid using on tiny patches.
+    """
+    def __init__(self, channels, n_heads=4, mlp_ratio=1.0, min_size=4):
+        super().__init__()
+        self.channels = channels
+        self.min_size = int(min_size)
+        self.norm1 = nn.LayerNorm(channels)
+        self.attn = nn.MultiheadAttention(channels, n_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(channels)
+        hidden = int(channels * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, channels),
+        )
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        if h < self.min_size or w < self.min_size:
+            return x
+        x_seq = x.flatten(2).transpose(1, 2)  # [B, H*W, C]
+        n1 = self.norm1(x_seq)
+        attn_out, _ = self.attn(n1, n1, n1, need_weights=False)
+        x_seq = x_seq + attn_out
+        x_seq = x_seq + self.mlp(self.norm2(x_seq))
+        return x_seq.transpose(1, 2).reshape(b, c, h, w)
+
+
 class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels, norm_kind="bn", use_se=False, use_coord_attn=False):
         super().__init__()
@@ -107,7 +141,8 @@ class UpsampleBlock(nn.Module):
 class LightUNet(nn.Module):
     def __init__(self, n_channels, n_classes, base_ch=32, norm_kind="bn",
                  presence_head_kind="shared", presence_head_depth=1,
-                 presence_branch_ch=None, use_se=False, use_coord_attn=False):
+                 presence_branch_ch=None, use_se=False, use_coord_attn=False,
+                 use_bottleneck_attn=False):
         super().__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
@@ -115,6 +150,7 @@ class LightUNet(nn.Module):
         self.norm_kind = norm_kind
         self.use_se = bool(use_se)
         self.use_coord_attn = bool(use_coord_attn)
+        self.use_bottleneck_attn = bool(use_bottleneck_attn)
         self.supports_aux_outputs = True
 
         c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
@@ -123,6 +159,7 @@ class LightUNet(nn.Module):
         self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c1, c2, **dc_kw))
         self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c2, c3, **dc_kw))
         self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c3, c4, **dc_kw))
+        self.bottleneck_attn = BottleneckSelfAttention(c4) if self.use_bottleneck_attn else None
 
         self.up1 = UpsampleBlock(c4, c3, norm_kind=norm_kind)
         self.conv1 = DoubleConv(c4, c3, **dc_kw)
@@ -147,6 +184,8 @@ class LightUNet(nn.Module):
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)
+        if self.bottleneck_attn is not None:
+            x4 = self.bottleneck_attn(x4)
         return x4, (x1, x2, x3)
 
     def forward_decoder(self, x4, skips):
