@@ -68,6 +68,44 @@ class CoordAttention(nn.Module):
         return x * a_h * a_w
 
 
+class MixStyle(nn.Module):
+    """MixStyle: Zhou et al. 2021. Mix feature statistics across the batch.
+
+    During training, computes per-sample (mean, std) of features, then linearly
+    interpolates each sample's stats with another sample's stats (drawn from a
+    Beta distribution). This creates 'novel' feature distributions, training
+    the downstream layers to be robust to style/distribution shifts.
+
+    Inserted after the first DoubleConv. Disabled at eval. Direct attack on
+    the OOF→LB domain gap (test set has different per-region statistics).
+    """
+    def __init__(self, p=0.5, alpha=0.1, eps=1e-6):
+        super().__init__()
+        self.p = float(p)
+        self.alpha = float(alpha)
+        self.eps = float(eps)
+        self._beta = torch.distributions.Beta(self.alpha, self.alpha)
+
+    def forward(self, x):
+        if not self.training:
+            return x
+        if torch.rand(1).item() > self.p:
+            return x
+        b = x.shape[0]
+        # Per-sample feature statistics over spatial dims
+        mu = x.mean(dim=[2, 3], keepdim=True)
+        var = x.var(dim=[2, 3], keepdim=True, unbiased=False)
+        sig = (var + self.eps).sqrt()
+        # Normalize to instance-norm space
+        x_norm = (x - mu) / sig
+        # Mix stats with a permutation of the batch
+        perm = torch.randperm(b, device=x.device)
+        lam = self._beta.sample((b, 1, 1, 1)).to(x.device).to(x.dtype)
+        mu_mix = lam * mu + (1.0 - lam) * mu[perm]
+        sig_mix = lam * sig + (1.0 - lam) * sig[perm]
+        return x_norm * sig_mix + mu_mix
+
+
 class BottleneckSelfAttention(nn.Module):
     """Single Transformer block on the UNet bottleneck features (32×32 at 256 input).
 
@@ -142,7 +180,7 @@ class LightUNet(nn.Module):
     def __init__(self, n_channels, n_classes, base_ch=32, norm_kind="bn",
                  presence_head_kind="shared", presence_head_depth=1,
                  presence_branch_ch=None, use_se=False, use_coord_attn=False,
-                 use_bottleneck_attn=False):
+                 use_bottleneck_attn=False, use_mixstyle=False):
         super().__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
@@ -151,11 +189,13 @@ class LightUNet(nn.Module):
         self.use_se = bool(use_se)
         self.use_coord_attn = bool(use_coord_attn)
         self.use_bottleneck_attn = bool(use_bottleneck_attn)
+        self.use_mixstyle = bool(use_mixstyle)
         self.supports_aux_outputs = True
 
         c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
         dc_kw = dict(norm_kind=norm_kind, use_se=self.use_se, use_coord_attn=self.use_coord_attn)
         self.inc = DoubleConv(n_channels, c1, **dc_kw)
+        self.mixstyle = MixStyle() if self.use_mixstyle else None
         self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c1, c2, **dc_kw))
         self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c2, c3, **dc_kw))
         self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c3, c4, **dc_kw))
@@ -181,6 +221,8 @@ class LightUNet(nn.Module):
     def forward_encoder(self, x):
         """Returns (bottleneck, skip_connections) for external bottleneck fusion."""
         x1 = self.inc(x)
+        if self.mixstyle is not None:
+            x1 = self.mixstyle(x1)
         x2 = self.down1(x1)
         x3 = self.down2(x2)
         x4 = self.down3(x3)

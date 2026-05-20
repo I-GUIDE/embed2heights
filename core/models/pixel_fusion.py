@@ -260,7 +260,7 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
                  dual_presence=False,
                  ae_only_supervision=False,
                  token_channels=0, use_se=False, use_coord_attn=False,
-                 use_bottleneck_attn=False, disable_head_film=False):
+                 use_bottleneck_attn=False, use_mixstyle=False, disable_head_film=False):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TesseraIoUFusionGatedLightUNet assumes 4 output channels")
@@ -280,6 +280,7 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
             alpha_channels, n_classes, base_ch=base_ch, norm_kind=norm_kind,
             use_se=bool(use_se), use_coord_attn=bool(use_coord_attn),
             use_bottleneck_attn=bool(use_bottleneck_attn),
+            use_mixstyle=bool(use_mixstyle),
         )
         self.alpha_unet.head = nn.Identity()
         self.tessera_feature_stem = TesseraCompressionStem(

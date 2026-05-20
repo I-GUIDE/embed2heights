@@ -238,6 +238,10 @@ def parse_args():
                    help="Insert a Transformer-style self-attention block at the UNet "
                         "bottleneck (32x32 at 256 input). Adds global context the conv "
                         "receptive field can't reach in 3 downsamples.")
+    p.add_argument("--use-mixstyle", action="store_true",
+                   help="MixStyle (Zhou 2021): mix per-sample feature statistics across "
+                        "the batch during training to make the model robust to style/"
+                        "domain shifts. Direct attack on the OOF→LB style gap.")
     p.add_argument("--argmax-presence-target", action="store_true",
                    help="Use argmax across class fractions for the presence supervision "
                         "target (each multi-class pixel is positive ONLY for its dominant "
@@ -974,6 +978,7 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "use_se":              getattr(args, "use_se", False),
         "use_coord_attn":      getattr(args, "use_coord_attn", False),
         "use_bottleneck_attn": getattr(args, "use_bottleneck_attn", False),
+        "use_mixstyle":        getattr(args, "use_mixstyle", False),
         "argmax_presence_target": getattr(args, "argmax_presence_target", False),
         "argmax_bce_only":     getattr(args, "argmax_bce_only", False),
         "disable_head_film":   getattr(args, "disable_head_film", False),
@@ -1133,6 +1138,7 @@ def main():
         use_se=getattr(args, "use_se", False),
         use_coord_attn=getattr(args, "use_coord_attn", False),
         use_bottleneck_attn=getattr(args, "use_bottleneck_attn", False),
+        use_mixstyle=getattr(args, "use_mixstyle", False),
         disable_head_film=getattr(args, "disable_head_film", False),
     )
     if args.init_from_pretrain:
