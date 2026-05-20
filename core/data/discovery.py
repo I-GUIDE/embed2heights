@@ -132,6 +132,20 @@ def find_trisource_file_pairs(primary_emb_dir, secondary_emb_dir, token_emb_dir,
     )
 
 
+def find_multitoken_file_pairs(primary_emb_dir, secondary_emb_dir, token_dirs, tar_dir):
+    """
+    Match two pixel-aligned sources, one or more token sources, and labels.
+
+    Returns tuples of (primary_embedding, secondary_embedding, *token_embeddings, label).
+    """
+    return _match_labeled_embedding_dirs(
+        primary_emb_dir,
+        secondary_emb_dir,
+        *token_dirs,
+        tar_dir=tar_dir,
+    )
+
+
 def find_multisource_embedding_files(primary_emb_dir, secondary_emb_dir):
     """
     Match two label-free embedding dirs by normalized core id.
@@ -149,6 +163,15 @@ def find_trisource_embedding_files(primary_emb_dir, secondary_emb_dir, token_emb
     Returns tuples of (primary_embedding, secondary_embedding, token_embedding).
     """
     return _match_embedding_dirs(primary_emb_dir, secondary_emb_dir, token_emb_dir)
+
+
+def find_multitoken_embedding_files(primary_emb_dir, secondary_emb_dir, token_dirs):
+    """
+    Match two pixel-aligned embedding dirs and one or more token embedding dirs.
+
+    Returns tuples of (primary_embedding, secondary_embedding, *token_embeddings).
+    """
+    return _match_embedding_dirs(primary_emb_dir, secondary_emb_dir, *token_dirs)
 
 
 def save_split(split_path, train_pairs, val_pairs):

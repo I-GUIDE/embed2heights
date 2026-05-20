@@ -24,9 +24,9 @@ import numpy as np
 import rasterio
 
 from core.metrics import (
-    WEIGHTS, LABEL_THRESHOLD,
+    WEIGHTS,
     CH_BUILDING, CH_VEGETATION, CH_WATER, CH_HEIGHT,
-    binary_iou, compute_weighted_score,
+    binary_iou, compute_weighted_score, label_gt_mask,
     build_label_map, load_val_ids,
 )
 from core.data.discovery import normalize_core_id
@@ -40,14 +40,14 @@ DEFAULT_SPLIT_FILE = os.path.join(SCRIPT_DIR, "splits", "split.json")
 
 
 def evaluate_experiment(pred_dir, labels_dir, *, pred_threshold=0.5,
-                        label_threshold=LABEL_THRESHOLD, val_only_ids=None):
+                        val_only_ids=None):
     """
     Compute the 5 leaderboard metrics for one experiment.
 
     Aggregation:
       - IoU: per-image positive-only Jaccard (empty/empty -> 1), sample-averaged.
-      - RMSE: per-image RMSE on pixels where label_class > label_threshold,
-              sample-averaged (NOT pixel-accumulated).
+      - RMSE: per-image RMSE on dominant-class pixels, sample-averaged.
+      - GT binarization: argmax over channels 0-2 (mutually exclusive classes).
 
     `pred_threshold` may be a scalar or a 3-tuple (bld, veg, wat) for per-class.
     """
@@ -81,13 +81,13 @@ def evaluate_experiment(pred_dir, labels_dir, *, pred_threshold=0.5,
         w = min(pred.shape[2], label.shape[2])
         pred, label = pred[:, :h, :w], label[:, :h, :w]
 
-        iou_b.append(binary_iou(pred[CH_BUILDING]  > thr_b, label[CH_BUILDING]   > label_threshold))
-        iou_v.append(binary_iou(pred[CH_VEGETATION] > thr_v, label[CH_VEGETATION] > label_threshold))
-        iou_w.append(binary_iou(pred[CH_WATER]     > thr_w, label[CH_WATER]      > label_threshold))
+        iou_b.append(binary_iou(pred[CH_BUILDING]   > thr_b, label_gt_mask(label, CH_BUILDING)))
+        iou_v.append(binary_iou(pred[CH_VEGETATION] > thr_v, label_gt_mask(label, CH_VEGETATION)))
+        iou_w.append(binary_iou(pred[CH_WATER]      > thr_w, label_gt_mask(label, CH_WATER)))
 
-        # RMSE conditioned on GT class presence — per-image averaging.
-        bld_mask = label[CH_BUILDING]    > label_threshold
-        veg_mask = label[CH_VEGETATION]  > label_threshold
+        # RMSE on dominant-class pixels — per-image averaging.
+        bld_mask = label_gt_mask(label, CH_BUILDING)
+        veg_mask = label_gt_mask(label, CH_VEGETATION)
         if bld_mask.any():
             diff = pred[CH_HEIGHT][bld_mask] - label[CH_HEIGHT][bld_mask]
             rmse_b.append(float(np.sqrt(np.mean(diff.astype(np.float64) ** 2))))
@@ -123,8 +123,6 @@ def parse_args():
     p.add_argument("--thresholds", type=float, nargs=3, default=None,
                    metavar=("BLD", "VEG", "WAT"),
                    help="Per-class prediction thresholds. Overrides --pred-threshold when set.")
-    p.add_argument("--label-threshold", type=float, default=LABEL_THRESHOLD,
-                   help="Binarization threshold for LABEL channels (default 0, matches leaderboard).")
     p.add_argument("--val-only", action="store_true",
                    help="Evaluate only on the val split loaded from --split-file.")
     p.add_argument("--split-file", default=DEFAULT_SPLIT_FILE,
@@ -162,7 +160,6 @@ def main():
         metrics = evaluate_experiment(
             pred_dir, args.labels_dir,
             pred_threshold=effective_threshold,
-            label_threshold=args.label_threshold,
             val_only_ids=val_ids,
         )
         if metrics is None:
@@ -178,7 +175,7 @@ def main():
     thr_desc = (f"bld>{args.thresholds[0]}, veg>{args.thresholds[1]}, wat>{args.thresholds[2]}"
                 if args.thresholds is not None else f"pred>{args.pred_threshold}")
     print("\n" + "=" * 90)
-    print(f"  Evaluation Results  ({thr_desc}, label>{args.label_threshold}, split={split_mode})")
+    print(f"  Evaluation Results  ({thr_desc}, label=argmax, split={split_mode})")
     print("=" * 90)
     header = f"{'Experiment':<36} {'iou_bld':>9} {'iou_tree':>9} {'iou_wat':>9} {'RMSE_bH':>9} {'RMSE_vH':>9} {'Score':>8}"
     print(header)

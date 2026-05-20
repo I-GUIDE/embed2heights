@@ -10,18 +10,32 @@ from torch.utils.data import DataLoader
 
 from .datasets import (
     MultiPixelEmbeddingDataset,
+    PixelMultiTokenEmbeddingDataset,
     PixelTokenEmbeddingDataset,
     pick_dataset_class,
 )
 from .discovery import (
     find_file_pairs,
     find_multisource_file_pairs,
+    find_multitoken_file_pairs,
     find_trisource_file_pairs,
     load_split,
     save_split,
 )
 
 TOKEN_SCALE_FACTOR = 16
+
+
+def token_train_dirs(args):
+    return [
+        path for path in (
+            args.token_train_embeddings_dir,
+            getattr(args, "secondary_token_train_embeddings_dir", None),
+            getattr(args, "third_token_train_embeddings_dir", None),
+            getattr(args, "fourth_token_train_embeddings_dir", None),
+        )
+        if path
+    ]
 
 
 @dataclass(frozen=True)
@@ -33,17 +47,26 @@ class TrainingDatasetSpec:
 
 def discover_training_pairs(args):
     """Find all trainable embedding/label tuples for the configured sources."""
-    if args.token_train_embeddings_dir:
+    token_dirs = token_train_dirs(args)
+    if token_dirs:
         if not args.secondary_train_embeddings_dir:
             raise ValueError(
                 "--token-train-embeddings-dir requires --secondary-train-embeddings-dir"
             )
-        all_pairs = find_trisource_file_pairs(
-            args.train_embeddings_dir,
-            args.secondary_train_embeddings_dir,
-            args.token_train_embeddings_dir,
-            args.train_targets_dir,
-        )
+        if len(token_dirs) == 1:
+            all_pairs = find_trisource_file_pairs(
+                args.train_embeddings_dir,
+                args.secondary_train_embeddings_dir,
+                token_dirs[0],
+                args.train_targets_dir,
+            )
+        else:
+            all_pairs = find_multitoken_file_pairs(
+                args.train_embeddings_dir,
+                args.secondary_train_embeddings_dir,
+                token_dirs,
+                args.train_targets_dir,
+            )
     elif args.secondary_train_embeddings_dir:
         all_pairs = find_multisource_file_pairs(
             args.train_embeddings_dir,
@@ -94,11 +117,16 @@ def infer_training_dataset_spec(train_pairs, args):
     sample_pair = train_pairs[0]
     primary_channels = raster_channel_count(sample_pair[0])
 
-    if args.token_train_embeddings_dir:
+    token_dirs = token_train_dirs(args)
+    if token_dirs:
         secondary_channels = raster_channel_count(sample_pair[1])
-        token_channels = raster_channel_count(sample_pair[2])
+        token_channels = sum(raster_channel_count(path) for path in sample_pair[2:-1])
+        dataset_cls = (
+            PixelTokenEmbeddingDataset if len(token_dirs) == 1
+            else PixelMultiTokenEmbeddingDataset
+        )
         return TrainingDatasetSpec(
-            dataset_cls=PixelTokenEmbeddingDataset,
+            dataset_cls=dataset_cls,
             n_channels=(primary_channels + secondary_channels, token_channels),
             extra_kwargs={"scale_factor": TOKEN_SCALE_FACTOR},
         )

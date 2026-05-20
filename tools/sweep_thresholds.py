@@ -18,7 +18,7 @@ from core.inference.calibration import (  # noqa: E402
     sweep_thresholds,
     write_threshold_report,
 )
-from core.metrics import LABEL_THRESHOLD, WEIGHTS  # noqa: E402
+from core.metrics import WEIGHTS  # noqa: E402
 
 
 DEFAULT_LABELS_DIR = SCRIPT_DIR.parent / "data" / "train" / "labels"
@@ -63,7 +63,7 @@ def main():
 
     print("\n" + "=" * 95)
     print(f"  Threshold sweep for: {args.pred_dir}")
-    print(f"  Label threshold fixed at {LABEL_THRESHOLD}  (leaderboard convention)")
+    print("  Label binarization: argmax (mutually exclusive dominant class)")
     print("=" * 95)
     print(f"{'Row':<34} {'iou_bld':>8} {'iou_tree':>9} {'iou_wat':>8} {'RMSE_bH':>8} {'RMSE_vH':>8} {'Score':>8}")
     print("-" * 95)

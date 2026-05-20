@@ -17,6 +17,7 @@ except ImportError:
 from core.data.datasets import (
     MultiPixelEmbeddingDataset,
     PixelEmbeddingDataset,
+    PixelMultiTokenEmbeddingDataset,
     PixelTokenEmbeddingDataset,
 )
 from core.data.discovery import (
@@ -24,6 +25,8 @@ from core.data.discovery import (
     find_file_pairs,
     find_multisource_embedding_files,
     find_multisource_file_pairs,
+    find_multitoken_embedding_files,
+    find_multitoken_file_pairs,
     find_trisource_embedding_files,
     find_trisource_file_pairs,
 )
@@ -60,6 +63,12 @@ def parse_args():
                         help="Second pixel-aligned embedding dir, e.g. Tessera.")
     parser.add_argument("--token-test-embeddings-dir", default=None,
                         help="Optional 16x16 token embedding dir for xfusion.")
+    parser.add_argument("--secondary-token-test-embeddings-dir", default=None,
+                        help="Optional second 16x16 token embedding dir for xfusion.")
+    parser.add_argument("--third-token-test-embeddings-dir", default=None,
+                        help="Optional third 16x16 token embedding dir for xfusion.")
+    parser.add_argument("--fourth-token-test-embeddings-dir", default=None,
+                        help="Optional fourth 16x16 token embedding dir for xfusion.")
     parser.add_argument("--test-targets-dir", default=None,
                         help="When omitted, writes label-free submission ids with year suffix.")
     parser.add_argument("--predictions-dir", default=None,
@@ -139,31 +148,62 @@ def model_kwargs_from_run_config(cfg):
         "presence_branch_ch": cfg.get("presence_branch_ch", TRAIN_DEFAULTS["presence_branch_ch"]),
         "use_fraction_film": cfg.get("use_fraction_film", TRAIN_DEFAULTS["use_fraction_film"]),
         "use_fraction_aux": cfg.get("use_fraction_aux", TRAIN_DEFAULTS["use_fraction_aux"]),
+        "attn_heads": cfg.get("attn_heads", 4),
+        "use_additive": cfg.get("use_additive", True),
+        "use_spatial_gate": cfg.get("use_spatial_gate", True),
     }
+
+
+def token_test_dirs(args):
+    return [
+        path for path in (
+            args.token_test_embeddings_dir,
+            args.secondary_token_test_embeddings_dir,
+            args.third_token_test_embeddings_dir,
+            args.fourth_token_test_embeddings_dir,
+        )
+        if path
+    ]
 
 
 def resolve_inputs(args):
     """Return embedding paths, or tuples ending in labels for validation mode."""
-    if args.token_test_embeddings_dir:
+    token_dirs = token_test_dirs(args)
+    if token_dirs:
         if not args.secondary_test_embeddings_dir:
             raise RuntimeError("--token-test-embeddings-dir requires --secondary-test-embeddings-dir")
         if args.test_targets_dir:
-            pairs = find_trisource_file_pairs(
+            if len(token_dirs) == 1:
+                pairs = find_trisource_file_pairs(
+                    args.test_embeddings_dir,
+                    args.secondary_test_embeddings_dir,
+                    token_dirs[0],
+                    args.test_targets_dir,
+                )
+            else:
+                pairs = find_multitoken_file_pairs(
+                    args.test_embeddings_dir,
+                    args.secondary_test_embeddings_dir,
+                    token_dirs,
+                    args.test_targets_dir,
+                )
+            if not pairs:
+                raise RuntimeError("No matching token-source file pairs found.")
+            return pairs
+        if len(token_dirs) == 1:
+            pairs = find_trisource_embedding_files(
                 args.test_embeddings_dir,
                 args.secondary_test_embeddings_dir,
-                args.token_test_embeddings_dir,
-                args.test_targets_dir,
+                token_dirs[0],
             )
-            if not pairs:
-                raise RuntimeError("No matching tri-source file pairs found.")
-            return pairs
-        pairs = find_trisource_embedding_files(
-            args.test_embeddings_dir,
-            args.secondary_test_embeddings_dir,
-            args.token_test_embeddings_dir,
-        )
+        else:
+            pairs = find_multitoken_embedding_files(
+                args.test_embeddings_dir,
+                args.secondary_test_embeddings_dir,
+                token_dirs,
+            )
         if not pairs:
-            raise RuntimeError("No matching tri-source .tif files found.")
+            raise RuntimeError("No matching token-source .tif files found.")
         return pairs
 
     if args.secondary_test_embeddings_dir:
@@ -200,12 +240,23 @@ def infer_channels_and_dataset(args, inputs):
     with rasterio.open(sample_emb_path) as src:
         n_channels = src.count
 
-    if args.token_test_embeddings_dir:
+    token_dirs = token_test_dirs(args)
+    if token_dirs:
         with rasterio.open(inputs[0][1]) as src:
             pixel_channels = n_channels + src.count
-        with rasterio.open(inputs[0][2]) as src:
-            token_channels = src.count
-        return (pixel_channels, token_channels), PixelTokenEmbeddingDataset
+        sample_tuple = inputs[0]
+        token_slice = (
+            sample_tuple[2:-1] if args.test_targets_dir else sample_tuple[2:]
+        )
+        token_channels = 0
+        for path in token_slice:
+            with rasterio.open(path) as src:
+                token_channels += src.count
+        dataset_cls = (
+            PixelTokenEmbeddingDataset if len(token_dirs) == 1
+            else PixelMultiTokenEmbeddingDataset
+        )
+        return (pixel_channels, token_channels), dataset_cls
 
     if args.secondary_test_embeddings_dir:
         with rasterio.open(inputs[0][1]) as src:
@@ -216,7 +267,7 @@ def infer_channels_and_dataset(args, inputs):
 
 
 def build_dataset(dataset_cls, inputs, patch_size):
-    if dataset_cls.__name__ == "PixelTokenEmbeddingDataset":
+    if dataset_cls.__name__ in ("PixelTokenEmbeddingDataset", "PixelMultiTokenEmbeddingDataset"):
         return dataset_cls(inputs, patch_size=patch_size, scale_factor=16, is_train=False)
     return dataset_cls(inputs, patch_size=patch_size, is_train=False)
 

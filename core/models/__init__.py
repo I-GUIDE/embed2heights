@@ -26,6 +26,7 @@ from .pixel_fusion import (
 )
 from .token_fusion import (
     GatedPixelFusionFiLMPerModalityLightUNet,
+    GatedPixelFusionHybridLightUNet,
     GatedPixelFusionTwoGateBnAttentionLightUNet,
 )
 
@@ -38,6 +39,7 @@ __all__ = [
     "ConvNeXtBlock",
     "DoubleConv",
     "GatedPixelFusionFiLMPerModalityLightUNet",
+    "GatedPixelFusionHybridLightUNet",
     "GatedPixelFusionTwoGateBnAttentionLightUNet",
     "HEIGHT_NORM_CONSTANT",
     "LightUNet",

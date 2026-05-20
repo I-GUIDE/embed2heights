@@ -20,6 +20,19 @@ def _read_raster(path):
         return clean_raster_array(src.read())
 
 
+def _normalize_token_arrays(token_arrays, token_normalization):
+    """Apply per-channel z-score to selected token sources in-place by index."""
+    if not token_normalization:
+        return token_arrays
+    source_indices = token_normalization["source_indices"]
+    means = token_normalization["means"]
+    stds = token_normalization["stds"]
+    arrays = list(token_arrays)
+    for stat_idx, source_idx in enumerate(source_indices):
+        arrays[source_idx] = (arrays[source_idx] - means[stat_idx]) / stds[stat_idx]
+    return arrays
+
+
 def _assert_same_spatial(left, right, left_path, right_path, kind):
     if left.shape[1:] != right.shape[1:]:
         raise ValueError(
@@ -67,6 +80,11 @@ def _sample_or_center_origin(height, width, crop_size, is_train):
             np.random.randint(0, width - crop_size + 1),
         )
     return (height - crop_size) // 2, (width - crop_size) // 2
+
+
+def pick_dataset_class(model_type, n_channels):
+    """Single-source datasets only handle pixel rasters in the clean repo."""
+    return PixelEmbeddingDataset
 
 
 def _prepare_target(tar_path, image_shape, patch_size=None):
@@ -189,11 +207,13 @@ class PixelTokenEmbeddingDataset(Dataset):
     AlphaEarth+Tessera concatenated at 256x256 and token_image is 768x16x16 for
     patch_size=256, scale_factor=16.
     """
-    def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True):
+    def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True,
+                 token_normalization=None):
         self.patch_size = patch_size
         self.scale_factor = scale_factor
         self.is_train = is_train
         self.file_pairs = file_pairs
+        self.token_normalization = token_normalization
 
     def __len__(self):
         return len(self.file_pairs)
@@ -211,6 +231,8 @@ class PixelTokenEmbeddingDataset(Dataset):
         primary = _read_raster(primary_path)
         secondary = _read_raster(secondary_path)
         token = _read_raster(token_path)
+        # Single-token dataset: normalize as a 1-element list and unpack.
+        token = _normalize_token_arrays([token], self.token_normalization)[0]
 
         _assert_same_spatial(primary, secondary, primary_path, secondary_path, "Embedding")
         pixel = np.concatenate([primary, secondary], axis=0)
@@ -259,18 +281,15 @@ class PixelTokenEmbeddingDataset(Dataset):
 
 class PixelMultiTokenEmbeddingDataset(Dataset):
     """
-    For probing same-model S1/S2 token fusion against the AlphaEarth+Tessera
-    champion.
+    For probing one or more token sources against the AlphaEarth+Tessera champion.
 
     file_pairs may contain:
-      - (primary_emb_path, secondary_emb_path, token_primary_path,
-         token_secondary_path, label_path)
-      - (primary_emb_path, secondary_emb_path, token_primary_path,
-         token_secondary_path) for label-free inference
+      - (primary_emb_path, secondary_emb_path, *token_paths, label_path)
+      - (primary_emb_path, secondary_emb_path, *token_paths) for label-free inference
 
     Returns ((pixel_image, token_image), target, valid_mask), where pixel_image
     is AlphaEarth+Tessera concatenated at 256x256 and token_image is
-    [S1, S2] channel-concatenated at 16x16.
+    channel-concatenated token sources at 16x16.
     """
     def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True):
         self.patch_size = patch_size
@@ -283,29 +302,33 @@ class PixelMultiTokenEmbeddingDataset(Dataset):
 
     def __getitem__(self, idx):
         pair = self.file_pairs[idx]
-        if len(pair) == 5:
-            primary_path, secondary_path, token_primary_path, token_secondary_path, tar_path = pair
-        elif len(pair) == 4:
-            primary_path, secondary_path, token_primary_path, token_secondary_path = pair
-            tar_path = None
+        if len(pair) < 4:
+            raise ValueError("PixelMultiTokenEmbeddingDataset expects at least 4-item tuples")
+        primary_path, secondary_path = pair[:2]
+        if len(pair) % 2 == 1:
+            token_paths = pair[2:-1]
+            tar_path = pair[-1]
         else:
-            raise ValueError("PixelMultiTokenEmbeddingDataset expects 4- or 5-item tuples")
+            token_paths = pair[2:]
+            tar_path = None
+        if not token_paths:
+            raise ValueError("PixelMultiTokenEmbeddingDataset requires at least one token path")
 
         primary = _read_raster(primary_path)
         secondary = _read_raster(secondary_path)
-        token_primary = _read_raster(token_primary_path)
-        token_secondary = _read_raster(token_secondary_path)
+        token_arrays = [_read_raster(path) for path in token_paths]
 
         _assert_same_spatial(primary, secondary, primary_path, secondary_path, "Embedding")
-        _assert_same_spatial(
-            token_primary,
-            token_secondary,
-            token_primary_path,
-            token_secondary_path,
-            "Token",
-        )
+        for token_path, token_array in zip(token_paths[1:], token_arrays[1:]):
+            _assert_same_spatial(
+                token_arrays[0],
+                token_array,
+                token_paths[0],
+                token_path,
+                "Token",
+            )
         pixel = np.concatenate([primary, secondary], axis=0)
-        token = np.concatenate([token_primary, token_secondary], axis=0)
+        token = np.concatenate(token_arrays, axis=0)
         target, valid_mask = _prepare_target(tar_path, pixel.shape[1:], patch_size=self.patch_size)
 
         emb_patch_size = self.patch_size // self.scale_factor
@@ -324,7 +347,7 @@ class PixelMultiTokenEmbeddingDataset(Dataset):
         max_left_emb = min(w_tok - emb_patch_size, (w_pix - self.patch_size) // self.scale_factor)
         if max_top_emb < 0 or max_left_emb < 0:
             raise ValueError(
-                f"Pixel/token shapes are incompatible for {primary_path} and {token_primary_path}: "
+                f"Pixel/token shapes are incompatible for {primary_path} and {token_paths[0]}: "
                 f"pixel={pixel.shape[1:]}, token={token.shape[1:]}"
             )
 

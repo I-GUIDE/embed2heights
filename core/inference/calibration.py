@@ -10,7 +10,7 @@ import rasterio
 
 from core.data.discovery import normalize_core_id
 from core.metrics import (
-    LABEL_THRESHOLD,
+    label_gt_mask,
     WEIGHTS,
     binary_iou,
     build_label_map,
@@ -220,10 +220,10 @@ def evaluate_at_thresholds(labels, predictions, thresholds, water_cc_min_size=0)
             pred_mask = pred[c] > thresholds[c]
             if c == 2 and water_cc_min_size > 0:
                 pred_mask = apply_water_cc_filter(pred_mask, water_cc_min_size)
-            iou_lists[c].append(binary_iou(pred_mask, label[c] > LABEL_THRESHOLD))
+            iou_lists[c].append(binary_iou(pred_mask, label_gt_mask(label, c)))
 
         for ch, bucket in ((0, rmse_bld), (1, rmse_veg)):
-            mask = label[ch] > LABEL_THRESHOLD
+            mask = label_gt_mask(label, ch)
             if mask.any():
                 diff = pred[3][mask] - label[3][mask]
                 bucket.append(float(np.sqrt(np.mean(diff.astype(np.float64) ** 2))))
@@ -320,7 +320,7 @@ def write_threshold_report(result, output_json, pred_dir):
     output_json.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "pred_dir": str(pred_dir),
-        "label_threshold": LABEL_THRESHOLD,
+        "label_binarization": "argmax",
         "class_names": CLASS_NAMES,
         "weights": WEIGHTS,
         "n_samples": result.n_samples,
@@ -345,7 +345,7 @@ def fit_height_affine(records, shrink):
     for record in records:
         pred, label = read_pair(record)
         for name, ch in (("building", 0), ("vegetation", 1)):
-            mask = label[ch] > LABEL_THRESHOLD
+            mask = label_gt_mask(label, ch)
             if not mask.any():
                 continue
             x = pred[3][mask].astype(np.float64)
@@ -400,10 +400,10 @@ def eval_records(records, params):
             masks[2] = np.zeros_like(masks[2], dtype=bool)
 
         for ch in range(3):
-            gt = label[ch] > LABEL_THRESHOLD
+            gt = label_gt_mask(label, ch)
             ious[ch].append(binary_iou(masks[ch], gt))
 
-        gt_water = label[2] > LABEL_THRESHOLD
+        gt_water = label_gt_mask(label, 2)
         if not gt_water.any():
             empty_water_total += 1
             if masks[2].any():
@@ -411,7 +411,7 @@ def eval_records(records, params):
 
         height = apply_height_channel(pred, params)
         for ch, bucket in ((0, rmse_b), (1, rmse_v)):
-            gt = label[ch] > LABEL_THRESHOLD
+            gt = label_gt_mask(label, ch)
             if gt.any():
                 diff = height[gt].astype(np.float64) - label[3][gt].astype(np.float64)
                 bucket.append(float(np.sqrt(np.mean(diff * diff))))
@@ -436,7 +436,7 @@ def tune_class_threshold(records, channel, grid):
     sums = np.zeros(len(grid), dtype=np.float64)
     for record in records:
         pred, label = read_pair(record)
-        gt = label[channel] > LABEL_THRESHOLD
+        gt = label_gt_mask(label, channel)
         prob = pred[channel]
         for i, threshold in enumerate(grid):
             sums[i] += binary_iou(prob > threshold, gt)
@@ -449,7 +449,7 @@ def tune_water(records, water_grid, k_grid):
     threshold_sums = np.zeros(len(water_grid), dtype=np.float64)
     for record in records:
         pred, label = read_pair(record)
-        gt = label[2] > LABEL_THRESHOLD
+        gt = label_gt_mask(label, 2)
         prob = pred[2]
         for i, threshold in enumerate(water_grid):
             threshold_sums[i] += binary_iou(prob > threshold, gt)
@@ -473,7 +473,7 @@ def tune_water(records, water_grid, k_grid):
     }
     for record in records:
         pred, label = read_pair(record)
-        gt = label[2] > LABEL_THRESHOLD
+        gt = label_gt_mask(label, 2)
         prob = pred[2]
         gt_empty = not gt.any()
         for threshold in candidate_thresholds:

@@ -30,9 +30,21 @@ WEIGHTS = {
     "RMSE_vegetation_height": 0.20,
 }
 
-# Label binarization threshold used by the server (any nonzero fraction is
-# positive). See METRIC_PROBE_REPORT.md.
+# Kept for backward compatibility (threshold sweep reports, etc.)
 LABEL_THRESHOLD = 0.0
+
+
+def label_gt_mask(label, channel):
+    """Argmax GT mask: a pixel is positive for `channel` iff it is the dominant class.
+
+    Among the three presence channels (0=building, 1=veg, 2=water), the pixel is
+    assigned to whichever has the largest fraction. Empty pixels (all fractions == 0)
+    are negative for every class.
+    """
+    presence = label[:3]
+    dominant = np.argmax(presence, axis=0)
+    has_any = presence.max(axis=0) > 0
+    return (dominant == channel) & has_any
 
 # Per-class RMSE normalization for `max(0, 1 - RMSE / X)`.
 RMSE_NORMALIZATION = {
