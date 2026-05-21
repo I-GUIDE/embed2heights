@@ -45,8 +45,6 @@ model:
   use_fraction_aux: true
   use_fraction_film: false
   attn_heads: 4
-  use_additive: true
-  use_spatial_gate: true
 
 training:
   batch_size: 16

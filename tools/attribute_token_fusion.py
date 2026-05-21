@@ -111,8 +111,6 @@ def args_from_resolved(cfg, run_dir):
         use_fraction_aux=model["use_fraction_aux"],
         token_calibration=model.get("token_calibration", False),
         attn_heads=model.get("attn_heads", 4),
-        use_additive=model.get("use_additive", True),
-        use_spatial_gate=model.get("use_spatial_gate", True),
         # loss
         weight_mae=train["weight_mae"],
         weight_presence_tversky=train["weight_presence_tversky"],
@@ -188,8 +186,7 @@ def build_loaded_model(args, n_channels, ckpt_path, device):
         use_fraction_film=args.use_fraction_film,
         use_fraction_aux=args.use_fraction_aux,
         attn_heads=args.attn_heads,
-        use_additive=args.use_additive,
-        use_spatial_gate=args.use_spatial_gate,
+        token_calibration=args.token_calibration,
     )
     state = torch.load(ckpt_path, map_location="cpu")
     model.load_state_dict(state)

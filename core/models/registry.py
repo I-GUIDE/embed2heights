@@ -52,9 +52,7 @@ def build_active_model(model_type, n_channels, n_classes, *,
                        token_aux_weight=0.2,
                        use_fraction_film=True,
                        use_fraction_aux=None,
-                       attn_heads=4,
-                       use_additive=True,
-                       use_spatial_gate=True):
+                       attn_heads=4):
     selected = canonical_model_type(model_type)
     if selected not in ACTIVE_MODEL_TYPES:
         return None
@@ -174,8 +172,6 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 presence_branch_ch=presence_branch_ch,
                 token_calibration=token_calibration,
                 attn_heads=attn_heads,
-                use_additive=use_additive,
-                use_spatial_gate=use_spatial_gate,
             ),
             selected,
         )

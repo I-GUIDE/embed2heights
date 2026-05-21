@@ -4,6 +4,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, Type
 
+import numpy as np
 import rasterio
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
@@ -24,6 +25,121 @@ from .discovery import (
 )
 
 TOKEN_SCALE_FACTOR = 16
+TOKEN_ZSCORE_EPS = 1e-6
+
+
+def _parse_token_source_indices(value, n_sources):
+    if value is None or value == "":
+        return list(range(n_sources))
+    if isinstance(value, (list, tuple)):
+        indices = [int(v) for v in value]
+    else:
+        indices = [int(part.strip()) for part in str(value).split(",") if part.strip()]
+    bad = [idx for idx in indices if idx < 0 or idx >= n_sources]
+    if bad:
+        raise ValueError(
+            f"token_normalization_source_indices contains invalid index {bad}; "
+            f"configured token source count is {n_sources}"
+        )
+    return indices
+
+
+def _read_token_for_stats(path):
+    with rasterio.open(path) as src:
+        array = src.read().astype(np.float32, copy=False)
+    return np.nan_to_num(array, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _load_token_channel_zscore_stats(path):
+    with np.load(path) as data:
+        source_indices = [int(v) for v in data["source_indices"].tolist()]
+        means = data["means"].astype(np.float32)
+        stds = data["stds"].astype(np.float32)
+    return {
+        "source_indices": source_indices,
+        "means": means[:, :, None, None],
+        "stds": stds[:, :, None, None],
+    }
+
+
+def _compute_token_channel_zscore_stats(train_pairs, source_indices):
+    sums = [None for _ in source_indices]
+    sumsq = [None for _ in source_indices]
+    counts = [0 for _ in source_indices]
+
+    for pair in train_pairs:
+        token_paths = pair[2:-1]
+        for stat_idx, source_idx in enumerate(source_indices):
+            array = _read_token_for_stats(token_paths[source_idx])
+            channels = array.reshape(array.shape[0], -1).astype(np.float64, copy=False)
+            channel_sum = channels.sum(axis=1)
+            channel_sumsq = np.square(channels).sum(axis=1)
+            if sums[stat_idx] is None:
+                sums[stat_idx] = channel_sum
+                sumsq[stat_idx] = channel_sumsq
+            else:
+                sums[stat_idx] += channel_sum
+                sumsq[stat_idx] += channel_sumsq
+            counts[stat_idx] += channels.shape[1]
+
+    means = []
+    stds = []
+    for stat_idx in range(len(source_indices)):
+        mean = sums[stat_idx] / counts[stat_idx]
+        var = np.maximum(sumsq[stat_idx] / counts[stat_idx] - np.square(mean), 0.0)
+        std = np.sqrt(var)
+        std = np.where(std < TOKEN_ZSCORE_EPS, 1.0, std)
+        means.append(mean.astype(np.float32))
+        stds.append(std.astype(np.float32))
+    return np.stack(means, axis=0), np.stack(stds, axis=0)
+
+
+def prepare_token_normalization(train_pairs, args):
+    """Resolve token z-score stats: load if cached, else compute and cache."""
+    mode = getattr(args, "token_normalization", "none") or "none"
+    if mode == "none":
+        return None
+    if mode != "train_channel_zscore":
+        raise ValueError(f"Unknown token_normalization mode: {mode!r}")
+
+    n_sources = len(token_train_dirs(args))
+    if n_sources == 0:
+        raise ValueError("token_normalization requires token embedding sources")
+    source_indices = _parse_token_source_indices(
+        getattr(args, "token_normalization_source_indices", None),
+        n_sources,
+    )
+    stats_path = getattr(args, "token_normalization_stats_path", None)
+    if not stats_path:
+        stats_path = os.path.join(
+            args.output_dir,
+            args.experiment_name,
+            "token_channel_zscore_stats.npz",
+        )
+    os.makedirs(os.path.dirname(stats_path), exist_ok=True)
+
+    if os.path.exists(stats_path):
+        print(f"Loading token z-score stats: {stats_path}")
+        return _load_token_channel_zscore_stats(stats_path)
+
+    print(
+        "Computing train-set token channel z-score stats "
+        f"for source indices {source_indices}..."
+    )
+    means, stds = _compute_token_channel_zscore_stats(train_pairs, source_indices)
+    np.savez(
+        stats_path,
+        source_indices=np.asarray(source_indices, dtype=np.int64),
+        means=means,
+        stds=stds,
+        token_dirs=np.asarray(token_train_dirs(args), dtype=str),
+    )
+    print(f"Saved token z-score stats: {stats_path}")
+    return {
+        "source_indices": source_indices,
+        "means": means[:, :, None, None],
+        "stds": stds[:, :, None, None],
+    }
 
 
 def token_train_dirs(args):
@@ -160,19 +276,23 @@ def build_training_dataset(dataset_cls, pairs, args, *, is_train, extra_kwargs=N
 def build_train_val_datasets(train_pairs, val_pairs, args):
     """Build train/validation Dataset instances and report model input channels."""
     spec = infer_training_dataset_spec(train_pairs, args)
+    token_normalization = prepare_token_normalization(train_pairs, args)
+    extra_kwargs = dict(spec.extra_kwargs)
+    if token_normalization is not None:
+        extra_kwargs["token_normalization"] = token_normalization
     train_ds = build_training_dataset(
         spec.dataset_cls,
         train_pairs,
         args,
         is_train=True,
-        extra_kwargs=spec.extra_kwargs,
+        extra_kwargs=extra_kwargs,
     )
     val_ds = build_training_dataset(
         spec.dataset_cls,
         val_pairs,
         args,
         is_train=False,
-        extra_kwargs=spec.extra_kwargs,
+        extra_kwargs=extra_kwargs,
     )
     return train_ds, val_ds, spec.n_channels
 

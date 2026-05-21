@@ -291,11 +291,13 @@ class PixelMultiTokenEmbeddingDataset(Dataset):
     is AlphaEarth+Tessera concatenated at 256x256 and token_image is
     channel-concatenated token sources at 16x16.
     """
-    def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True):
+    def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True,
+                 token_normalization=None):
         self.patch_size = patch_size
         self.scale_factor = scale_factor
         self.is_train = is_train
         self.file_pairs = file_pairs
+        self.token_normalization = token_normalization
 
     def __len__(self):
         return len(self.file_pairs)
@@ -317,6 +319,7 @@ class PixelMultiTokenEmbeddingDataset(Dataset):
         primary = _read_raster(primary_path)
         secondary = _read_raster(secondary_path)
         token_arrays = [_read_raster(path) for path in token_paths]
+        token_arrays = _normalize_token_arrays(token_arrays, self.token_normalization)
 
         _assert_same_spatial(primary, secondary, primary_path, secondary_path, "Embedding")
         for token_path, token_array in zip(token_paths[1:], token_arrays[1:]):

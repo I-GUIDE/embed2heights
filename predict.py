@@ -149,8 +149,7 @@ def model_kwargs_from_run_config(cfg):
         "use_fraction_film": cfg.get("use_fraction_film", TRAIN_DEFAULTS["use_fraction_film"]),
         "use_fraction_aux": cfg.get("use_fraction_aux", TRAIN_DEFAULTS["use_fraction_aux"]),
         "attn_heads": cfg.get("attn_heads", 4),
-        "use_additive": cfg.get("use_additive", True),
-        "use_spatial_gate": cfg.get("use_spatial_gate", True),
+        "token_calibration": cfg.get("token_calibration", False),
     }
 
 
@@ -266,9 +265,22 @@ def infer_channels_and_dataset(args, inputs):
     return n_channels, PixelEmbeddingDataset
 
 
-def build_dataset(dataset_cls, inputs, patch_size):
+def load_token_normalization_from_run(exp_dir):
+    """Load token z-score stats saved by training, if present."""
+    stats_path = os.path.join(exp_dir, "token_channel_zscore_stats.npz")
+    if not os.path.exists(stats_path):
+        return None
+    from core.data.training import _load_token_channel_zscore_stats
+    print(f"Loading token z-score stats for inference: {stats_path}")
+    return _load_token_channel_zscore_stats(stats_path)
+
+
+def build_dataset(dataset_cls, inputs, patch_size, *, token_normalization=None):
     if dataset_cls.__name__ in ("PixelTokenEmbeddingDataset", "PixelMultiTokenEmbeddingDataset"):
-        return dataset_cls(inputs, patch_size=patch_size, scale_factor=16, is_train=False)
+        return dataset_cls(
+            inputs, patch_size=patch_size, scale_factor=16, is_train=False,
+            token_normalization=token_normalization,
+        )
     return dataset_cls(inputs, patch_size=patch_size, is_train=False)
 
 
@@ -289,7 +301,11 @@ def main():
         inputs = inputs[:args.max_samples]
 
     n_channels, dataset_cls = infer_channels_and_dataset(args, inputs)
-    test_ds = build_dataset(dataset_cls, inputs, args.patch_size)
+    token_norm_stats = load_token_normalization_from_run(exp_dir)
+    test_ds = build_dataset(
+        dataset_cls, inputs, args.patch_size,
+        token_normalization=token_norm_stats,
+    )
     sample_img, _, _ = test_ds[0]
 
     model, selected_model = build_model(

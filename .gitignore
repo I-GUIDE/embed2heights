@@ -69,9 +69,10 @@ configs/*
 !configs/legacy/*.yml
 !configs/legacy/*.md
 
-slurm-*.out
+.out
 logs/*.pdf
 
 logs/
+submit_*.sbatch
 
 tools/*.ipynb

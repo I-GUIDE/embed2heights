@@ -1,12 +1,16 @@
 name: xfusion_085_hybrid_tied_no_residual_ep60
 description: >
-  xfusion_083 ablation: same hybrid cross-source token fusion module, but with
-  three settings shifted toward backbone xf076 conventions:
-    - gate_untied: true → false           (tied zero-sum gate, dose-control)
+  *** SoTA on val Score 0.5344 *** (5-metric leaderboard composite). xf085 is
+  xfusion_083 + three settings aligned with backbone xf076:
+    - gate_untied: true → false           (tied zero-sum pixel gate)
     - tessera_presence_ch: 16 → 0         (no Tessera→presence residual)
-    - veg_height_boost: 0.0 → 1.5         (match backbone xf076 height weighting)
-  All other settings (split_all heads, independent height branches, hybrid
-  fusion knobs, water_empty_topk etc.) inherited from xf083.
+    - veg_height_boost: 0.0 → 1.5         (match xf076 height weighting)
+  Score-based attribution (tools/attribute_token_fusion_score.py) showed the
+  hybrid fusion's additive A_i path drives IoU (kill_add → Score -0.0266),
+  spatial gate σ(g_i) drives height RMSE (kill_gate → RMSE_bH +0.0712,
+  RMSE_vH +0.1095), and self-attn is small but non-zero. The use_additive /
+  use_spatial_gate toggles have been removed (all three pathways now always-on).
+  Ablations xf086-089 (z-score / no self-attn / no additive) all lost on Score.
 reference: xfusion_083_hybrid_cross_source_ep60
 
 data:
@@ -46,8 +50,6 @@ model:
   use_fraction_aux: true
   use_fraction_film: false
   attn_heads: 4
-  use_additive: true
-  use_spatial_gate: true
 
 training:
   batch_size: 16

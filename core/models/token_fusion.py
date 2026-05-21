@@ -509,18 +509,21 @@ class GatedPixelFusionFiLMPerModalityLightUNet(nn.Module):
 
 
 class CrossSourceHybridFiLMFusion(nn.Module):
-    """xf083 fusion: cross-source self-attention + hybrid affine/additive modulation.
+    """xf085 SoTA fusion: cross-source self-attention + per-source FiLM + additive + spatial gate.
 
-    Stage 1 (16x16 token scale): the N token sources cross-attend to each other
-    via one self-attention layer with learned modality embeddings + 2D positional
-    encoding. The attention output projection is zero-initialised, so the refined
-    source equals the projected source at init.
+    Stage 1 (16x16 token scale): N token sources cross-attend to each other via
+    one self-attention layer with learned modality embeddings + 2D positional
+    encoding. Output projection is zero-initialised → refined ≈ projected at init.
 
     Stage 2 (H x W pixel scale): each refined source contributes three zero-init
     residuals applied as
         delta_i = sigmoid(g_i) * (gamma_i * F_pixel + beta_i + A_i)
         F_out   = F_pixel + sum_i delta_i
-    The A_i path is the new additive content that bypasses FiLM's affine bottleneck.
+
+    All three per-source pathways (FiLM γ/β, additive A_i, spatial gate σ(g_i))
+    are always built. Score-based attribution (tools/attribute_token_fusion_score.py)
+    showed each off-toggle degraded the leaderboard Score, so they are no longer
+    configurable.
     """
 
     _TOKEN_INPUT_CLAMP = 50.0
@@ -530,21 +533,21 @@ class CrossSourceHybridFiLMFusion(nn.Module):
 
     def __init__(self, pixel_ch, token_channels, token_source_ch=768,
                  ctx_ch=96, token_calibration=False, token_proj_depth=1,
-                 attn_heads=4, attn_dropout=0.05,
-                 use_additive=True, use_spatial_gate=True):
+                 attn_heads=4, attn_dropout=0.05):
         super().__init__()
         if token_channels % token_source_ch != 0:
             raise ValueError(
                 f"CrossSourceHybridFiLMFusion: token_channels={token_channels} must be "
                 f"divisible by token_source_ch={token_source_ch}"
             )
+        if attn_heads < 1:
+            raise ValueError(
+                f"CrossSourceHybridFiLMFusion: attn_heads must be >= 1, got {attn_heads}"
+            )
         self.token_source_ch = int(token_source_ch)
         self.n_sources = token_channels // token_source_ch
         self.ctx_ch = int(ctx_ch)
-        self.use_additive = bool(use_additive)
-        self.use_spatial_gate = bool(use_spatial_gate)
         self.attn_heads = int(attn_heads)
-        self.attn_enabled = self.attn_heads > 0
 
         self.token_calibs = (
             nn.ModuleList(
@@ -557,50 +560,34 @@ class CrossSourceHybridFiLMFusion(nn.Module):
             for _ in range(self.n_sources)
         ])
 
-        if self.attn_enabled:
-            self.pos_mlp = nn.Sequential(
-                nn.Linear(2, ctx_ch),
-                nn.GELU(),
-                nn.Linear(ctx_ch, ctx_ch),
-            )
-            self.modality_embed = nn.Parameter(
-                torch.zeros(self.n_sources, ctx_ch)
-            )
-            nn.init.normal_(self.modality_embed, std=0.02)
-            self.attn_norm = nn.LayerNorm(ctx_ch)
-            self.cross_source_attn = nn.MultiheadAttention(
-                ctx_ch, self.attn_heads,
-                dropout=attn_dropout, batch_first=True,
-            )
-            nn.init.zeros_(self.cross_source_attn.out_proj.weight)
-            nn.init.zeros_(self.cross_source_attn.out_proj.bias)
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(2, ctx_ch),
+            nn.GELU(),
+            nn.Linear(ctx_ch, ctx_ch),
+        )
+        self.modality_embed = nn.Parameter(torch.zeros(self.n_sources, ctx_ch))
+        nn.init.normal_(self.modality_embed, std=0.02)
+        self.attn_norm = nn.LayerNorm(ctx_ch)
+        self.cross_source_attn = nn.MultiheadAttention(
+            ctx_ch, self.attn_heads,
+            dropout=attn_dropout, batch_first=True,
+        )
+        nn.init.zeros_(self.cross_source_attn.out_proj.weight)
+        nn.init.zeros_(self.cross_source_attn.out_proj.bias)
 
         self.film_convs = nn.ModuleList([
             nn.Conv2d(ctx_ch, pixel_ch * 2, 1) for _ in range(self.n_sources)
         ])
-        for conv in self.film_convs:
-            nn.init.zeros_(conv.weight)
-            nn.init.zeros_(conv.bias)
-
-        if self.use_additive:
-            self.add_convs = nn.ModuleList([
-                nn.Conv2d(ctx_ch, pixel_ch, 1) for _ in range(self.n_sources)
-            ])
-            for conv in self.add_convs:
+        self.add_convs = nn.ModuleList([
+            nn.Conv2d(ctx_ch, pixel_ch, 1) for _ in range(self.n_sources)
+        ])
+        self.gate_convs = nn.ModuleList([
+            nn.Conv2d(ctx_ch, 1, 1) for _ in range(self.n_sources)
+        ])
+        for module_list in (self.film_convs, self.add_convs, self.gate_convs):
+            for conv in module_list:
                 nn.init.zeros_(conv.weight)
                 nn.init.zeros_(conv.bias)
-        else:
-            self.add_convs = None
-
-        if self.use_spatial_gate:
-            self.gate_convs = nn.ModuleList([
-                nn.Conv2d(ctx_ch, 1, 1) for _ in range(self.n_sources)
-            ])
-            for conv in self.gate_convs:
-                nn.init.zeros_(conv.weight)
-                nn.init.zeros_(conv.bias)
-        else:
-            self.gate_convs = None
 
     def _pos_tokens(self, h, w, device, dtype):
         ys = torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype)
@@ -610,9 +597,6 @@ class CrossSourceHybridFiLMFusion(nn.Module):
         return self.pos_mlp(coords)
 
     def _refine_sources(self, ctx_list):
-        if not self.attn_enabled:
-            return ctx_list
-
         b, _, h, w = ctx_list[0].shape
         pos = self._pos_tokens(h, w, ctx_list[0].device, ctx_list[0].dtype)
         seqs = []
@@ -666,32 +650,226 @@ class CrossSourceHybridFiLMFusion(nn.Module):
                 gamma, beta = self.film_convs[i](ctx_up).chunk(2, dim=1)
                 gamma = gamma.clamp(-self._FILM_PARAM_CLAMP, self._FILM_PARAM_CLAMP)
                 beta = beta.clamp(-self._FILM_PARAM_CLAMP, self._FILM_PARAM_CLAMP)
-                src_delta = gamma * F_p_f + beta
-
-                if self.add_convs is not None:
-                    add = self.add_convs[i](ctx_up).clamp(
-                        -self._ADD_CLAMP, self._ADD_CLAMP
-                    )
-                    src_delta = src_delta + add
-
-                if self.gate_convs is not None:
-                    g = torch.sigmoid(self.gate_convs[i](ctx_up))
-                    src_delta = g * src_delta
-
-                delta = delta + src_delta
+                add = self.add_convs[i](ctx_up).clamp(-self._ADD_CLAMP, self._ADD_CLAMP)
+                g = torch.sigmoid(self.gate_convs[i](ctx_up))
+                delta = delta + g * (gamma * F_p_f + beta + add)
 
             out = (F_p_f + delta).clamp(-self._CTX_CLAMP, self._CTX_CLAMP)
         return out.to(F_pixel.dtype)
 
 
+class HierarchicalPairFiLMFusion(nn.Module):
+    """xfusion_086 fusion: hierarchical pairwise fusion (no softmax over keys).
+
+    Replaces xfusion_085's single 4-source MultiheadAttention softmax with a
+    two-stage additive scheme that exploits the 2x2 structure of the 4 token
+    sources (model axis x modality axis):
+
+      Stage 1 (16x16): pair the 4 projected ctx_i according to `pair_axis`.
+        "modality" → pair_A = ctx_0 + ctx_2 (TM_s1 + THOR_s1)
+                     pair_B = ctx_1 + ctx_3 (TM_s2 + THOR_s2)
+        "model"    → pair_A = ctx_0 + ctx_1 (TM_s1 + TM_s2)
+                     pair_B = ctx_2 + ctx_3 (THOR_s1 + THOR_s2)
+        Each pair fused via sigmoid-gated additive (no key-softmax):
+            pair = ctx_a + ctx_b + sigmoid(gate(cat)) * delta(cat)
+        Both `gate` and `delta` are 1x1 convs, zero-init → pair = ctx_a + ctx_b
+        at init. Sigmoid is per-channel, not over keys → no zero-sum competition.
+
+      Stage 2 (16x16): symmetric cross-pair refinement (optional). Each pair
+      adds a zero-init residual computed from the other pair via a 1x1 conv.
+      No softmax.
+
+      Stage 3 (H x W): per-pair pixel modulation, exactly mirroring xf085 but
+      with n_sources=2 (the two refined pairs). 2x FiLM + (optional) 2x add +
+      (optional) 2x spatial gate, all zero-init.
+
+    Returns (F_out, ctx_list=[ctx_0..ctx_3]). The 4 raw per-source contexts
+    are kept around for the per-source auxiliary heads upstream.
+    """
+
+    _TOKEN_INPUT_CLAMP = 50.0
+    _CTX_CLAMP = 50.0
+    _FILM_PARAM_CLAMP = 4.0
+    _ADD_CLAMP = 4.0
+
+    _PAIR_INDICES = {
+        "modality": ((0, 2), (1, 3)),
+        "model":    ((0, 1), (2, 3)),
+    }
+
+    def __init__(self, pixel_ch, token_channels, token_source_ch=768,
+                 ctx_ch=96, token_calibration=False, token_proj_depth=1,
+                 pair_axis="modality", use_cross_pair=True,
+                 use_additive=True, use_spatial_gate=True):
+        super().__init__()
+        if token_channels % token_source_ch != 0:
+            raise ValueError(
+                f"HierarchicalPairFiLMFusion: token_channels={token_channels} "
+                f"must be divisible by token_source_ch={token_source_ch}"
+            )
+        n_sources = token_channels // token_source_ch
+        if n_sources != 4:
+            raise ValueError(
+                f"HierarchicalPairFiLMFusion requires exactly 4 token sources, "
+                f"got n_sources={n_sources}"
+            )
+        if pair_axis not in self._PAIR_INDICES:
+            raise ValueError(
+                f"pair_axis must be one of {list(self._PAIR_INDICES)}, got {pair_axis!r}"
+            )
+
+        self.token_source_ch = int(token_source_ch)
+        self.n_sources = 4
+        self.ctx_ch = int(ctx_ch)
+        self.pair_axis = str(pair_axis)
+        self.pair_idx = self._PAIR_INDICES[self.pair_axis]
+        self.use_cross_pair = bool(use_cross_pair)
+        self.use_additive = bool(use_additive)
+        self.use_spatial_gate = bool(use_spatial_gate)
+
+        self.token_calibs = (
+            nn.ModuleList(
+                ChannelCalibration(token_source_ch) for _ in range(4)
+            )
+            if token_calibration else None
+        )
+        self.token_projs = nn.ModuleList([
+            _make_token_proj(token_source_ch, ctx_ch, depth=token_proj_depth)
+            for _ in range(4)
+        ])
+
+        # Stage 1: per-pair sigmoid-gated additive fusion (zero-init).
+        self.pair_gate_convs = nn.ModuleList([
+            nn.Conv2d(2 * ctx_ch, ctx_ch, 1) for _ in range(2)
+        ])
+        self.pair_delta_convs = nn.ModuleList([
+            nn.Conv2d(2 * ctx_ch, ctx_ch, 1) for _ in range(2)
+        ])
+        for conv in self.pair_gate_convs:
+            nn.init.zeros_(conv.weight)
+            nn.init.zeros_(conv.bias)
+        for conv in self.pair_delta_convs:
+            nn.init.zeros_(conv.weight)
+            nn.init.zeros_(conv.bias)
+
+        # Stage 2: optional cross-pair refinement (zero-init).
+        if self.use_cross_pair:
+            self.cross_pair_convs = nn.ModuleList([
+                nn.Conv2d(ctx_ch, ctx_ch, 1) for _ in range(2)
+            ])
+            for conv in self.cross_pair_convs:
+                nn.init.zeros_(conv.weight)
+                nn.init.zeros_(conv.bias)
+        else:
+            self.cross_pair_convs = None
+
+        # Stage 3: per-pair pixel modulation (zero-init), n_sources=2.
+        self.film_convs = nn.ModuleList([
+            nn.Conv2d(ctx_ch, pixel_ch * 2, 1) for _ in range(2)
+        ])
+        for conv in self.film_convs:
+            nn.init.zeros_(conv.weight)
+            nn.init.zeros_(conv.bias)
+
+        if self.use_additive:
+            self.add_convs = nn.ModuleList([
+                nn.Conv2d(ctx_ch, pixel_ch, 1) for _ in range(2)
+            ])
+            for conv in self.add_convs:
+                nn.init.zeros_(conv.weight)
+                nn.init.zeros_(conv.bias)
+        else:
+            self.add_convs = None
+
+        if self.use_spatial_gate:
+            self.gate_convs = nn.ModuleList([
+                nn.Conv2d(ctx_ch, 1, 1) for _ in range(2)
+            ])
+            for conv in self.gate_convs:
+                nn.init.zeros_(conv.weight)
+                nn.init.zeros_(conv.bias)
+        else:
+            self.gate_convs = None
+
+    def _fuse_pair(self, ctx_a, ctx_b, k):
+        cat = torch.cat([ctx_a, ctx_b], dim=1)
+        g = torch.sigmoid(self.pair_gate_convs[k](cat))
+        delta = self.pair_delta_convs[k](cat)
+        return ctx_a + ctx_b + g * delta
+
+    def forward(self, F_pixel, token):
+        """
+        F_pixel: (B, pixel_ch, H, W)
+        token:   (B, 4 * token_source_ch, h, w)   [e.g. 4*768 at 16x16]
+        returns: (F_out, ctx_list)
+            F_out:    (B, pixel_ch, H, W)
+            ctx_list: list of 4 tensors each (B, ctx_ch, h, w) - raw per-source
+                      contexts post-projection, for upstream aux heads.
+        """
+        H, W = F_pixel.shape[-2:]
+        parts = token.float().split(self.token_source_ch, dim=1)
+        with torch.amp.autocast("cuda", enabled=False):
+            ctx_list = []
+            for i, src in enumerate(parts):
+                if self.token_calibs is not None:
+                    src = self.token_calibs[i](src)
+                src = src.clamp(-self._TOKEN_INPUT_CLAMP, self._TOKEN_INPUT_CLAMP)
+                ctx = self.token_projs[i](src).clamp(-self._CTX_CLAMP, self._CTX_CLAMP)
+                ctx_list.append(ctx)
+
+            # Stage 1: pair fusion.
+            pairs = []
+            for k, (ia, ib) in enumerate(self.pair_idx):
+                pair_k = self._fuse_pair(ctx_list[ia], ctx_list[ib], k)
+                pairs.append(pair_k.clamp(-self._CTX_CLAMP, self._CTX_CLAMP))
+
+            # Stage 2: optional symmetric cross-pair refinement.
+            if self.cross_pair_convs is not None:
+                pa_orig = pairs[0]
+                pb_orig = pairs[1]
+                pa_ref = (pa_orig + self.cross_pair_convs[0](pb_orig)).clamp(
+                    -self._CTX_CLAMP, self._CTX_CLAMP
+                )
+                pb_ref = (pb_orig + self.cross_pair_convs[1](pa_orig)).clamp(
+                    -self._CTX_CLAMP, self._CTX_CLAMP
+                )
+                pairs = [pa_ref, pb_ref]
+
+            # Stage 3: per-pair pixel modulation.
+            F_p_f = F_pixel.float()
+            delta_total = torch.zeros_like(F_p_f)
+            for k, pair_ctx in enumerate(pairs):
+                ctx_up = F.interpolate(
+                    pair_ctx, size=(H, W), mode="bilinear", align_corners=False
+                )
+                gamma, beta = self.film_convs[k](ctx_up).chunk(2, dim=1)
+                gamma = gamma.clamp(-self._FILM_PARAM_CLAMP, self._FILM_PARAM_CLAMP)
+                beta = beta.clamp(-self._FILM_PARAM_CLAMP, self._FILM_PARAM_CLAMP)
+                src_delta = gamma * F_p_f + beta
+
+                if self.add_convs is not None:
+                    add = self.add_convs[k](ctx_up).clamp(
+                        -self._ADD_CLAMP, self._ADD_CLAMP
+                    )
+                    src_delta = src_delta + add
+
+                if self.gate_convs is not None:
+                    g = torch.sigmoid(self.gate_convs[k](ctx_up))
+                    src_delta = g * src_delta
+
+                delta_total = delta_total + src_delta
+
+            out = (F_p_f + delta_total).clamp(-self._CTX_CLAMP, self._CTX_CLAMP)
+        return out.to(F_pixel.dtype), ctx_list
+
+
 class GatedPixelFusionHybridLightUNet(nn.Module):
-    """xfusion_083: dual-LightUNet pixel backbone + cross-source hybrid token fusion.
+    """xfusion_085 SoTA: dual-LightUNet pixel backbone + cross-source hybrid token fusion.
 
     Pixel backbone is identical to GatedPixelFusionFiLMPerModalityLightUNet
-    (xfusion_082). Token conditioning swaps PerModalityFiLMFusion for
-    CrossSourceHybridFiLMFusion: token sources are first refined via cross-source
-    self-attention, then each refined source contributes a zero-init
-    (FiLM + additive + spatial-gate) residual.
+    (xfusion_082). Token conditioning is CrossSourceHybridFiLMFusion: token sources
+    are refined via cross-source self-attention, then each refined source
+    contributes a zero-init (FiLM γ/β + additive A + spatial-gate σ(g)) residual.
     """
 
     def __init__(self, pixel_channels, token_channels, n_classes=4,
@@ -707,8 +885,7 @@ class GatedPixelFusionHybridLightUNet(nn.Module):
                  use_fraction_aux=None, norm_kind="bn",
                  presence_head_kind="shared", presence_head_depth=1,
                  presence_branch_ch=None, token_calibration=False,
-                 token_ctx_ch=96,
-                 attn_heads=4, use_additive=True, use_spatial_gate=True,
+                 token_ctx_ch=96, attn_heads=4,
                  **unused):
         super().__init__()
         if n_classes != 4:
@@ -754,8 +931,6 @@ class GatedPixelFusionHybridLightUNet(nn.Module):
             ctx_ch=token_ctx_ch,
             token_calibration=token_calibration,
             attn_heads=attn_heads,
-            use_additive=use_additive,
-            use_spatial_gate=use_spatial_gate,
         )
 
         self.tessera_presence_ch = int(tessera_presence_ch)
