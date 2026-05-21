@@ -79,10 +79,11 @@ class MixStyle(nn.Module):
     Inserted after the first DoubleConv. Disabled at eval. Direct attack on
     the OOF→LB domain gap (test set has different per-region statistics).
     """
-    def __init__(self, p=0.5, alpha=0.1, eps=1e-6):
+    def __init__(self, p=0.5, alpha=0.1, eps=1e-4):
         super().__init__()
         self.p = float(p)
         self.alpha = float(alpha)
+        # Use larger eps to prevent fp16/AMP underflow on low-variance features.
         self.eps = float(eps)
         self._beta = torch.distributions.Beta(self.alpha, self.alpha)
 
@@ -91,19 +92,24 @@ class MixStyle(nn.Module):
             return x
         if torch.rand(1).item() > self.p:
             return x
-        b = x.shape[0]
-        # Per-sample feature statistics over spatial dims
-        mu = x.mean(dim=[2, 3], keepdim=True)
-        var = x.var(dim=[2, 3], keepdim=True, unbiased=False)
-        sig = (var + self.eps).sqrt()
-        # Normalize to instance-norm space
-        x_norm = (x - mu) / sig
-        # Mix stats with a permutation of the batch
-        perm = torch.randperm(b, device=x.device)
-        lam = self._beta.sample((b, 1, 1, 1)).to(x.device).to(x.dtype)
-        mu_mix = lam * mu + (1.0 - lam) * mu[perm]
-        sig_mix = lam * sig + (1.0 - lam) * sig[perm]
-        return x_norm * sig_mix + mu_mix
+        # Compute mixstyle in fp32 to avoid AMP fp16 numerical issues (variance
+        # of low-variance feature maps can underflow to 0 in fp16, blowing up
+        # the normalization step).
+        with torch.cuda.amp.autocast(enabled=False):
+            x_fp32 = x.float()
+            b = x_fp32.shape[0]
+            mu = x_fp32.mean(dim=[2, 3], keepdim=True)
+            var = x_fp32.var(dim=[2, 3], keepdim=True, unbiased=False)
+            sig = (var + self.eps).sqrt()
+            # Clamp sig to a meaningful minimum even after eps to be safe
+            sig = sig.clamp(min=1e-3)
+            x_norm = (x_fp32 - mu) / sig
+            perm = torch.randperm(b, device=x.device)
+            lam = self._beta.sample((b, 1, 1, 1)).to(x.device, dtype=torch.float32)
+            mu_mix = lam * mu + (1.0 - lam) * mu[perm]
+            sig_mix = lam * sig + (1.0 - lam) * sig[perm]
+            out = x_norm * sig_mix + mu_mix
+        return out.to(x.dtype)
 
 
 class BottleneckSelfAttention(nn.Module):
