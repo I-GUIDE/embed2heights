@@ -112,18 +112,10 @@ class MixStyle(nn.Module):
         return out.to(x.dtype)
 
 
-class BottleneckSelfAttention(nn.Module):
-    """Single Transformer block on the UNet bottleneck features (32×32 at 256 input).
-
-    Provides global context that the convolutional receptive field cannot reach
-    in 3 downsamples. Lighter than a full ViT trunk: one MSA + MLP, ~0.9-1.5M
-    params at base_ch=48 (bottleneck dim 384). Skipped when input is below
-    a minimum spatial size to avoid using on tiny patches.
-    """
-    def __init__(self, channels, n_heads=4, mlp_ratio=1.0, min_size=4):
+class _TransformerBlock(nn.Module):
+    """Pre-norm Transformer block (MSA + MLP). Building block for stacks."""
+    def __init__(self, channels, n_heads=4, mlp_ratio=1.0):
         super().__init__()
-        self.channels = channels
-        self.min_size = int(min_size)
         self.norm1 = nn.LayerNorm(channels)
         self.attn = nn.MultiheadAttention(channels, n_heads, batch_first=True)
         self.norm2 = nn.LayerNorm(channels)
@@ -134,46 +126,126 @@ class BottleneckSelfAttention(nn.Module):
             nn.Linear(hidden, channels),
         )
 
+    def forward(self, x_seq):
+        n1 = self.norm1(x_seq)
+        attn_out, _ = self.attn(n1, n1, n1, need_weights=False)
+        x_seq = x_seq + attn_out
+        return x_seq + self.mlp(self.norm2(x_seq))
+
+
+class BottleneckSelfAttention(nn.Module):
+    """Stack of Transformer blocks on the UNet bottleneck features (32×32 at 256 input).
+
+    Provides global context that the convolutional receptive field cannot reach
+    in 3 downsamples. depth=1 is the proven botattn config; depth>1 stacks
+    more attention to test whether shallow attention was the bottleneck.
+    """
+    def __init__(self, channels, n_heads=4, mlp_ratio=1.0, min_size=4, depth=1):
+        super().__init__()
+        self.channels = channels
+        self.min_size = int(min_size)
+        self.depth = int(depth)
+        self.blocks = nn.ModuleList(
+            [_TransformerBlock(channels, n_heads=n_heads, mlp_ratio=mlp_ratio)
+             for _ in range(self.depth)]
+        )
+
     def forward(self, x):
         b, c, h, w = x.shape
         if h < self.min_size or w < self.min_size:
             return x
         x_seq = x.flatten(2).transpose(1, 2)  # [B, H*W, C]
-        n1 = self.norm1(x_seq)
-        attn_out, _ = self.attn(n1, n1, n1, need_weights=False)
-        x_seq = x_seq + attn_out
-        x_seq = x_seq + self.mlp(self.norm2(x_seq))
+        for blk in self.blocks:
+            x_seq = blk(x_seq)
         return x_seq.transpose(1, 2).reshape(b, c, h, w)
 
 
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels, norm_kind="bn", use_se=False, use_coord_attn=False):
+class AttentionGate(nn.Module):
+    """Attention U-Net skip-connection gate (Oktay et al. 2018).
+
+    g: gating signal from coarser scale (upsampled decoder feature).
+    x: skip-connection feature from encoder, same spatial resolution as g.
+    Output: x weighted by a sigmoid mask = sigmoid(conv1x1(ReLU(W_g(g) + W_x(x)))).
+    Mask is learned, initialized to ~0.5 (psi bias=0), so the gate starts as
+    a near-identity copy of the skip and can only sharpen as training proceeds.
+    """
+    def __init__(self, gate_channels, skip_channels, inter_channels=None):
         super().__init__()
-        layers = [
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            _light_norm(out_channels, norm_kind),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            _light_norm(out_channels, norm_kind),
-            nn.ReLU(inplace=True),
-        ]
-        if use_se:
-            layers.append(SEBlock(out_channels))
-        if use_coord_attn:
-            layers.append(CoordAttention(out_channels))
-        self.double_conv = nn.Sequential(*layers)
+        inter = inter_channels or max(skip_channels // 2, 8)
+        self.W_g = nn.Conv2d(gate_channels, inter, kernel_size=1, bias=False)
+        self.W_x = nn.Conv2d(skip_channels, inter, kernel_size=1, bias=False)
+        self.psi = nn.Conv2d(inter, 1, kernel_size=1, bias=True)
+        self.act = nn.ReLU(inplace=True)
+        nn.init.zeros_(self.psi.bias)
+
+    def forward(self, g, x):
+        a = self.act(self.W_g(g) + self.W_x(x))
+        mask = torch.sigmoid(self.psi(a))
+        return x * mask
+
+
+class DoubleConv(nn.Module):
+    """Two 3x3 conv blocks with norm + activation. Optional residual skip
+    connection (ResU-Net style) and GELU activation (modern, used in
+    ConvNeXt/SegFormer). use_modern=True turns both on for the conv block.
+    """
+    def __init__(self, in_channels, out_channels, norm_kind="bn",
+                 use_se=False, use_coord_attn=False, use_modern=False):
+        super().__init__()
+        self.use_modern = bool(use_modern)
+        Act = nn.GELU if self.use_modern else (lambda: nn.ReLU(inplace=True))
+        if self.use_modern:
+            # Pre-norm-style residual block: conv-norm-act-conv-norm + skip → act
+            self.conv1 = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+                _light_norm(out_channels, norm_kind),
+                Act(),
+            )
+            self.conv2 = nn.Sequential(
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+                _light_norm(out_channels, norm_kind),
+            )
+            self.skip = (nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+                         if in_channels != out_channels else nn.Identity())
+            self.final_act = Act()
+            attn_layers = []
+            if use_se:
+                attn_layers.append(SEBlock(out_channels))
+            if use_coord_attn:
+                attn_layers.append(CoordAttention(out_channels))
+            self.attn = nn.Sequential(*attn_layers) if attn_layers else nn.Identity()
+            self.double_conv = None
+        else:
+            layers = [
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False),
+                _light_norm(out_channels, norm_kind),
+                Act(),
+                nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+                _light_norm(out_channels, norm_kind),
+                Act(),
+            ]
+            if use_se:
+                layers.append(SEBlock(out_channels))
+            if use_coord_attn:
+                layers.append(CoordAttention(out_channels))
+            self.double_conv = nn.Sequential(*layers)
 
     def forward(self, x):
+        if self.use_modern:
+            h = self.conv1(x)
+            h = self.conv2(h)
+            h = h + self.skip(x)
+            return self.attn(self.final_act(h))
         return self.double_conv(x)
 
 
 class UpsampleBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, norm_kind="bn"):
+    def __init__(self, in_channels, out_channels, norm_kind="bn", use_modern=False):
         super().__init__()
         self.upsample = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
         self.bn = _light_norm(out_channels, norm_kind)
-        self.act = nn.ReLU(inplace=True)
+        self.act = nn.GELU() if use_modern else nn.ReLU(inplace=True)
 
     def forward(self, x):
         x = self.upsample(x)
@@ -186,7 +258,9 @@ class LightUNet(nn.Module):
     def __init__(self, n_channels, n_classes, base_ch=32, norm_kind="bn",
                  presence_head_kind="shared", presence_head_depth=1,
                  presence_branch_ch=None, use_se=False, use_coord_attn=False,
-                 use_bottleneck_attn=False, use_mixstyle=False):
+                 use_bottleneck_attn=False, use_mixstyle=False,
+                 use_attn_gates=False, use_aspp=False, bottleneck_attn_depth=1,
+                 use_modern=False):
         super().__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
@@ -196,25 +270,46 @@ class LightUNet(nn.Module):
         self.use_coord_attn = bool(use_coord_attn)
         self.use_bottleneck_attn = bool(use_bottleneck_attn)
         self.use_mixstyle = bool(use_mixstyle)
+        self.use_attn_gates = bool(use_attn_gates)
+        self.use_aspp = bool(use_aspp)
+        self.bottleneck_attn_depth = int(bottleneck_attn_depth)
+        self.use_modern = bool(use_modern)
         self.supports_aux_outputs = True
 
         c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
-        dc_kw = dict(norm_kind=norm_kind, use_se=self.use_se, use_coord_attn=self.use_coord_attn)
+        dc_kw = dict(norm_kind=norm_kind, use_se=self.use_se,
+                     use_coord_attn=self.use_coord_attn,
+                     use_modern=self.use_modern)
         self.inc = DoubleConv(n_channels, c1, **dc_kw)
         self.mixstyle = MixStyle() if self.use_mixstyle else None
         self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c1, c2, **dc_kw))
         self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c2, c3, **dc_kw))
         self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c3, c4, **dc_kw))
-        self.bottleneck_attn = BottleneckSelfAttention(c4) if self.use_bottleneck_attn else None
+        self.bottleneck_attn = (
+            BottleneckSelfAttention(c4, depth=self.bottleneck_attn_depth)
+            if self.use_bottleneck_attn else None
+        )
+        if self.use_aspp:
+            from .blocks import ASPP
+            self.aspp = ASPP(c4, c4, rates=(1, 6, 12, 18), dropout=0.1)
+        else:
+            self.aspp = None
 
-        self.up1 = UpsampleBlock(c4, c3, norm_kind=norm_kind)
+        self.up1 = UpsampleBlock(c4, c3, norm_kind=norm_kind, use_modern=self.use_modern)
         self.conv1 = DoubleConv(c4, c3, **dc_kw)
 
-        self.up2 = UpsampleBlock(c3, c2, norm_kind=norm_kind)
+        self.up2 = UpsampleBlock(c3, c2, norm_kind=norm_kind, use_modern=self.use_modern)
         self.conv2 = DoubleConv(c3, c2, **dc_kw)
 
-        self.up3 = UpsampleBlock(c2, c1, norm_kind=norm_kind)
+        self.up3 = UpsampleBlock(c2, c1, norm_kind=norm_kind, use_modern=self.use_modern)
         self.conv3 = DoubleConv(c2, c1, **dc_kw)
+
+        if self.use_attn_gates:
+            self.ag1 = AttentionGate(gate_channels=c3, skip_channels=c3)
+            self.ag2 = AttentionGate(gate_channels=c2, skip_channels=c2)
+            self.ag3 = AttentionGate(gate_channels=c1, skip_channels=c1)
+        else:
+            self.ag1 = self.ag2 = self.ag3 = None
 
         self.head = MultiTaskPredictionHead(
             in_ch=c1,
@@ -234,19 +329,24 @@ class LightUNet(nn.Module):
         x4 = self.down3(x3)
         if self.bottleneck_attn is not None:
             x4 = self.bottleneck_attn(x4)
+        if self.aspp is not None:
+            x4 = self.aspp(x4)
         return x4, (x1, x2, x3)
 
     def forward_decoder(self, x4, skips):
         """Runs decoder from bottleneck + skip connections."""
         x1, x2, x3 = skips
-        x = self.up1(x4)
-        x = torch.cat([x3, x], dim=1)
+        u = self.up1(x4)
+        s = self.ag1(u, x3) if self.ag1 is not None else x3
+        x = torch.cat([s, u], dim=1)
         x = self.conv1(x)
-        x = self.up2(x)
-        x = torch.cat([x2, x], dim=1)
+        u = self.up2(x)
+        s = self.ag2(u, x2) if self.ag2 is not None else x2
+        x = torch.cat([s, u], dim=1)
         x = self.conv2(x)
-        x = self.up3(x)
-        x = torch.cat([x1, x], dim=1)
+        u = self.up3(x)
+        s = self.ag3(u, x1) if self.ag3 is not None else x1
+        x = torch.cat([s, u], dim=1)
         x = self.conv3(x)
         return x
 

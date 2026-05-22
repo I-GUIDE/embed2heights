@@ -15,6 +15,8 @@ from .pixel_fusion import (
     TesseraCrossAttnLightUNet,
     TesseraIoUFusionGatedLightUNet,
     TesseraIoUFusionLightUNet,
+    TesseraIoUFusionMultiLevelGatedLightUNet,
+    TesseraIoUFusionSegFormerLite,
 )
 from .token_fusion import TesseraTokenCrossLevelFusionLightUNet, HierarchicalGatedFusion
 
@@ -48,6 +50,15 @@ ACTIVE_MODEL_ALIASES = {
     # over 4 lightweight experts; sparse activation regularizes small-data
     # training while expanding effective parameter capacity.
     "ae_tessera_moe": "ae_tessera_moe_fusion",
+    # Multi-level cross-modal gated fusion (CMGFNet-style): parallel
+    # AE and Tessera encoders, sigmoid gate at EVERY decoder level (not just
+    # the final output). Targets the fusion bottleneck — current best fold0
+    # arch fuses only at the head; multilevel lets the model decide per-scale.
+    "ae_tessera_multilevel": "tessera_iou_fusion_multilevel_gated",
+    # SegFormer-Lite encoder swap: replaces LightUNet's conv encoder with a
+    # 4-stage hierarchical transformer (efficient self-attn + Mix-FFN), then
+    # uses the canon LightUNet decoder + gated Tessera fusion at the head.
+    "ae_tessera_segformer": "tessera_iou_fusion_segformer_lite",
 }
 
 ACTIVE_MODEL_TYPES = set(ACTIVE_MODEL_ALIASES) | set(ACTIVE_MODEL_ALIASES.values())
@@ -88,6 +99,10 @@ def build_active_model(model_type, n_channels, n_classes, *,
                        use_coord_attn=False,
                        use_bottleneck_attn=False,
                        use_mixstyle=False,
+                       use_attn_gates=False,
+                       use_aspp=False,
+                       bottleneck_attn_depth=1,
+                       use_modern=False,
                        disable_head_film=False):
     selected = canonical_model_type(model_type)
     if selected not in ACTIVE_MODEL_TYPES:
@@ -172,6 +187,72 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 use_coord_attn=use_coord_attn,
                 use_bottleneck_attn=use_bottleneck_attn,
                 use_mixstyle=use_mixstyle,
+                use_attn_gates=use_attn_gates,
+                use_aspp=use_aspp,
+                bottleneck_attn_depth=bottleneck_attn_depth,
+                use_modern=use_modern,
+            ),
+            selected,
+        )
+
+    if selected == "tessera_iou_fusion_multilevel_gated":
+        return (
+            TesseraIoUFusionMultiLevelGatedLightUNet(
+                n_channels=n_channels,
+                n_classes=n_classes,
+                base_ch=lightunet_base_ch,
+                gate_init_bias=gate_init_bias,
+                norm_kind=lightunet_norm_kind,
+                height_specialist_depth=height_specialist_depth,
+                height_gate_source=height_gate_source,
+                height_hidden_ch=height_hidden_ch,
+                height_trunk_depth=height_trunk_depth,
+                height_independent_branches=height_independent_branches,
+                height_head_kind=height_head_kind,
+                height_n_bins=height_n_bins,
+                height_bin_max_m=height_bin_max_m,
+                presence_head_kind=presence_head_kind,
+                presence_head_depth=presence_head_depth,
+                presence_branch_ch=presence_branch_ch,
+                bidirectional_ctask=bidirectional_ctask,
+                height_blend_mode=height_blend_mode,
+                dual_presence=dual_presence,
+                use_se=use_se,
+                use_coord_attn=use_coord_attn,
+                use_bottleneck_attn=use_bottleneck_attn,
+                use_mixstyle=use_mixstyle,
+                use_attn_gates=use_attn_gates,
+                disable_head_film=disable_head_film,
+            ),
+            selected,
+        )
+
+    if selected == "tessera_iou_fusion_segformer_lite":
+        return (
+            TesseraIoUFusionSegFormerLite(
+                n_channels=n_channels,
+                n_classes=n_classes,
+                tessera_presence_ch=tessera_presence_ch,
+                tessera_hidden_ch=tessera_hidden_ch,
+                tessera_hidden_depth=tessera_hidden_depth,
+                height_specialist_depth=height_specialist_depth,
+                base_ch=lightunet_base_ch,
+                gate_init_bias=gate_init_bias,
+                norm_kind=lightunet_norm_kind,
+                height_gate_source=height_gate_source,
+                height_hidden_ch=height_hidden_ch,
+                height_trunk_depth=height_trunk_depth,
+                height_independent_branches=height_independent_branches,
+                height_head_kind=height_head_kind,
+                height_n_bins=height_n_bins,
+                height_bin_max_m=height_bin_max_m,
+                presence_head_kind=presence_head_kind,
+                presence_head_depth=presence_head_depth,
+                presence_branch_ch=presence_branch_ch,
+                bidirectional_ctask=bidirectional_ctask,
+                height_blend_mode=height_blend_mode,
+                dual_presence=dual_presence,
+                disable_head_film=disable_head_film,
             ),
             selected,
         )

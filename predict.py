@@ -152,6 +152,10 @@ def model_kwargs_from_run_config(cfg):
         "use_coord_attn": cfg.get("use_coord_attn", False),
         "use_bottleneck_attn": cfg.get("use_bottleneck_attn", False),
         "use_mixstyle": cfg.get("use_mixstyle", False),
+        "use_attn_gates": cfg.get("use_attn_gates", False),
+        "use_aspp": cfg.get("use_aspp", False),
+        "bottleneck_attn_depth": cfg.get("bottleneck_attn_depth", 1),
+        "use_modern": cfg.get("use_modern", False),
         "disable_head_film": cfg.get("disable_head_film", False),
     }
 

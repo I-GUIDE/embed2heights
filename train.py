@@ -82,6 +82,8 @@ MODEL_CHOICES = [
     "simple_concat_convnext", "simple_concat_aspp",
     "ae_tessera_mlp", "ae_tessera_mlp_fusion",
     "ae_tessera_moe", "ae_tessera_moe_fusion",
+    "ae_tessera_multilevel", "tessera_iou_fusion_multilevel_gated",
+    "ae_tessera_segformer", "tessera_iou_fusion_segformer_lite",
 ]
 LOSS_PRESET_CHOICES = ["auto", "current", "no_ssim_grad", "presence_centered"]
 
@@ -242,6 +244,25 @@ def parse_args():
                    help="MixStyle (Zhou 2021): mix per-sample feature statistics across "
                         "the batch during training to make the model robust to style/"
                         "domain shifts. Direct attack on the OOF→LB style gap.")
+    p.add_argument("--use-attn-gates", action="store_true",
+                   help="Attention U-Net skip gating (Oktay 2018): learn a sigmoid mask "
+                        "on each skip connection conditioned on the decoder gating signal. "
+                        "Filters encoder skip features so only relevant pixels flow into "
+                        "the decoder, suppressing noise from KE-like dense regions.")
+    p.add_argument("--use-aspp", action="store_true",
+                   help="DeepLab-style Atrous Spatial Pyramid Pooling at the UNet "
+                        "bottleneck (c4, 32x32 at 256 input). Parallel dilated convs at "
+                        "rates {1,6,12,18} + global pool, GroupNorm. Expands receptive "
+                        "field for multi-scale building context without downsampling.")
+    p.add_argument("--bottleneck-attn-depth", type=int, default=1,
+                   help="Number of Transformer blocks stacked at the UNet bottleneck "
+                        "when --use-bottleneck-attn is on. depth=1 is the proven botattn "
+                        "config; depth>1 deepens attention to test whether 1 block was a "
+                        "bottleneck. Each block adds ~0.6M params at base_ch=48.")
+    p.add_argument("--use-modern", action="store_true",
+                   help="Modernize LightUNet conv blocks: add residual skip connections "
+                        "(ResU-Net style) inside each DoubleConv + swap ReLU for GELU. "
+                        "Targets gradient flow + smoother activations on deeper stacks.")
     p.add_argument("--argmax-presence-target", action="store_true",
                    help="Use argmax across class fractions for the presence supervision "
                         "target (each multi-class pixel is positive ONLY for its dominant "
@@ -979,6 +1000,10 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "use_coord_attn":      getattr(args, "use_coord_attn", False),
         "use_bottleneck_attn": getattr(args, "use_bottleneck_attn", False),
         "use_mixstyle":        getattr(args, "use_mixstyle", False),
+        "use_attn_gates":      getattr(args, "use_attn_gates", False),
+        "use_aspp":            getattr(args, "use_aspp", False),
+        "bottleneck_attn_depth": getattr(args, "bottleneck_attn_depth", 1),
+        "use_modern":          getattr(args, "use_modern", False),
         "argmax_presence_target": getattr(args, "argmax_presence_target", False),
         "argmax_bce_only":     getattr(args, "argmax_bce_only", False),
         "disable_head_film":   getattr(args, "disable_head_film", False),
@@ -1139,6 +1164,10 @@ def main():
         use_coord_attn=getattr(args, "use_coord_attn", False),
         use_bottleneck_attn=getattr(args, "use_bottleneck_attn", False),
         use_mixstyle=getattr(args, "use_mixstyle", False),
+        use_attn_gates=getattr(args, "use_attn_gates", False),
+        use_aspp=getattr(args, "use_aspp", False),
+        bottleneck_attn_depth=getattr(args, "bottleneck_attn_depth", 1),
+        use_modern=getattr(args, "use_modern", False),
         disable_head_film=getattr(args, "disable_head_film", False),
     )
     if args.init_from_pretrain:
