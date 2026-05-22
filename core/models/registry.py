@@ -6,6 +6,7 @@ from .pixel_fusion import (
 )
 from .token_fusion import (
     GatedPixelFusionFiLMPerModalityLightUNet,
+    GatedPixelFusionHierarchicalPairLightUNet,
     GatedPixelFusionHybridLightUNet,
     GatedPixelFusionTwoGateBnAttentionLightUNet,
 )
@@ -17,6 +18,7 @@ ACTIVE_MODEL_ALIASES = {
     "xfusion_twogate_bn_attention":  "gated_pixel_fusion_twogate_bn_attention",
     "xfusion_unet_film_per_modality": "gated_pixel_fusion_film_per_modality",
     "xfusion_unet_hybrid_cross_source": "gated_pixel_fusion_hybrid_cross_source",
+    "xfusion_unet_hierarchical_pair": "gated_pixel_fusion_hierarchical_pair",
 }
 
 ACTIVE_MODEL_TYPES = set(ACTIVE_MODEL_ALIASES) | set(ACTIVE_MODEL_ALIASES.values())
@@ -52,7 +54,8 @@ def build_active_model(model_type, n_channels, n_classes, *,
                        token_aux_weight=0.2,
                        use_fraction_film=True,
                        use_fraction_aux=None,
-                       attn_heads=4):
+                       attn_heads=4,
+                       use_additive=True):
     selected = canonical_model_type(model_type)
     if selected not in ACTIVE_MODEL_TYPES:
         return None
@@ -172,6 +175,46 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 presence_branch_ch=presence_branch_ch,
                 token_calibration=token_calibration,
                 attn_heads=attn_heads,
+                use_additive=use_additive,
+            ),
+            selected,
+        )
+
+    if selected == "gated_pixel_fusion_hierarchical_pair":
+        if not isinstance(n_channels, (tuple, list)) or len(n_channels) != 2:
+            raise ValueError(
+                "xfusion_unet_hierarchical_pair expects "
+                "n_channels=(pixel_channels, token_channels)"
+            )
+        pixel_channels, token_channels = n_channels
+        return (
+            GatedPixelFusionHierarchicalPairLightUNet(
+                pixel_channels=pixel_channels,
+                token_channels=token_channels,
+                n_classes=n_classes,
+                tessera_presence_ch=tessera_presence_ch,
+                tessera_hidden_ch=tessera_hidden_ch,
+                tessera_hidden_depth=tessera_hidden_depth,
+                height_specialist_depth=height_specialist_depth,
+                base_ch=lightunet_base_ch,
+                gate_mode=gate_mode,
+                gate_untied=gate_untied,
+                gate_init_bias=gate_init_bias,
+                modality_dropout=modality_dropout,
+                height_gate_source=height_gate_source,
+                height_hidden_ch=height_hidden_ch,
+                height_trunk_depth=height_trunk_depth,
+                height_independent_branches=height_independent_branches,
+                height_head_kind=height_head_kind,
+                height_n_bins=height_n_bins,
+                height_bin_max_m=height_bin_max_m,
+                use_fraction_film=use_fraction_film,
+                use_fraction_aux=use_fraction_aux,
+                norm_kind=lightunet_norm_kind,
+                presence_head_kind=presence_head_kind,
+                presence_head_depth=presence_head_depth,
+                presence_branch_ch=presence_branch_ch,
+                token_calibration=token_calibration,
             ),
             selected,
         )

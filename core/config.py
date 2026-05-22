@@ -18,6 +18,7 @@ MODEL_CHOICES = [
     "xfusion_twogate_bn_attention",
     "xfusion_unet_film_per_modality",
     "xfusion_unet_hybrid_cross_source",
+    "xfusion_unet_hierarchical_pair",
     "auto",
 ]
 CONFIG_SECTIONS = ("data", "model", "training", "runtime")
@@ -264,6 +265,7 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "use_fraction_film": args.use_fraction_film,
             "use_fraction_aux": args.use_fraction_aux,
             "attn_heads": getattr(args, "attn_heads", 4),
+            "use_additive": getattr(args, "use_additive", True),
         },
         "training": {
             "batch_size": args.batch_size,

@@ -61,6 +61,7 @@ def build_active_model(args, n_channels):
         use_fraction_aux=args.use_fraction_aux,
         attn_heads=getattr(args, "attn_heads", 4),
         token_calibration=getattr(args, "token_calibration", False),
+        use_additive=getattr(args, "use_additive", True),
     )
 
 
