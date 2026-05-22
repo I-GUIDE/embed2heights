@@ -150,6 +150,7 @@ def model_kwargs_from_run_config(cfg):
         "use_fraction_aux": cfg.get("use_fraction_aux", TRAIN_DEFAULTS["use_fraction_aux"]),
         "attn_heads": cfg.get("attn_heads", 4),
         "token_calibration": cfg.get("token_calibration", False),
+        "use_additive": cfg.get("use_additive", True),
     }
 
 
@@ -315,7 +316,12 @@ def main():
         **model_kwargs_from_run_config(train_cfg),
     )
     model = model.to(device)
-    model.load_state_dict(torch.load(model_path, map_location=device))
+    sd = torch.load(model_path, map_location=device)
+    result = model.load_state_dict(sd, strict=False)
+    if result.missing_keys:
+        print(f"WARNING: missing keys in checkpoint: {result.missing_keys}")
+    if result.unexpected_keys:
+        print(f"INFO: extra keys in checkpoint (unused by current arch): {result.unexpected_keys}")
     model.eval()
 
     print(f"Loaded model: {selected_model} from {model_path} (input channels={input_channels(sample_img)})")
