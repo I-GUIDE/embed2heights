@@ -62,6 +62,8 @@ def build_active_model(args, n_channels):
         attn_heads=getattr(args, "attn_heads", 4),
         token_calibration=getattr(args, "token_calibration", False),
         use_additive=getattr(args, "use_additive", True),
+        token_ctx_ch=getattr(args, "token_ctx_ch", 96),
+        token_proj_depth=getattr(args, "token_proj_depth", 1) or 1,
     )
 
 
@@ -80,9 +82,13 @@ def build_loss(args, device):
         aux_veg_weight=args.aux_veg_weight,
         height_bin_aux_weight=args.height_bin_aux_weight,
         height_bin_sigma_bins=args.height_bin_sigma_bins,
+        tversky_building_alpha=args.tversky_building_alpha,
         tversky_water_alpha=args.tversky_water_alpha,
         water_empty_topk=args.water_empty_topk,
         weight_water_empty_topk=args.weight_water_empty_topk,
+        building_presence_pos_weight=getattr(args, "building_presence_pos_weight", 1.0),
+        small_building_presence_weight=getattr(args, "small_building_presence_weight", 1.0),
+        small_building_max_pixels=getattr(args, "small_building_max_pixels", 0),
     ).to(device)
     print(
         "Using loss: "
@@ -100,9 +106,13 @@ def build_loss(args, device):
         f"height_head_kind={args.height_head_kind}, "
         f"height_n_bins={args.height_n_bins}, "
         f"height_bin_max_m={args.height_bin_max_m}, "
+        f"tversky_building_alpha={args.tversky_building_alpha}, "
         f"tversky_water_alpha={args.tversky_water_alpha}, "
         f"water_empty_topk={args.water_empty_topk}, "
-        f"weight_water_empty_topk={args.weight_water_empty_topk}"
+        f"weight_water_empty_topk={args.weight_water_empty_topk}, "
+        f"building_presence_pos_weight={getattr(args, 'building_presence_pos_weight', 1.0)}, "
+        f"small_building_presence_weight={getattr(args, 'small_building_presence_weight', 1.0)}, "
+        f"small_building_max_pixels={getattr(args, 'small_building_max_pixels', 0)}"
     )
     return criterion
 
@@ -155,16 +165,19 @@ def main():
     best_val_loss = float("inf")
     best_epoch = None
 
+    ds_weight = float(getattr(args, "deep_supervision_weight", 0.0) or 0.0)
     for epoch in range(args.epochs):
         tr_loss, tr_comp = run_epoch(
             model, train_loader, criterion, optimizer, scaler, device,
             train=True, grad_accum_steps=grad_accum_steps, use_amp=use_amp,
             desc=f"Epoch {epoch + 1}/{args.epochs} [train]",
+            deep_supervision_weight=ds_weight,
         )
         val_loss, val_comp = run_epoch(
             model, val_loader, criterion, optimizer, scaler, device,
             train=False, use_amp=use_amp,
             desc=f"Epoch {epoch + 1}/{args.epochs} [val]",
+            deep_supervision_weight=0.0,
         )
         train_losses.append(tr_loss)
         val_losses.append(val_loss)

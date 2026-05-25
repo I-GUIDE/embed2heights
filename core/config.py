@@ -15,10 +15,8 @@ DEFAULT_CONFIG_PATH = os.path.join(REPO_DIR, "configs", "defaults.yml")
 MODEL_CHOICES = [
     "ae_only",
     "ae_tessera_gated",
-    "xfusion_twogate_bn_attention",
-    "xfusion_unet_film_per_modality",
     "xfusion_unet_hybrid_cross_source",
-    "xfusion_unet_hierarchical_pair",
+    "xfusion_unet_per_source_ensemble",
     "auto",
 ]
 CONFIG_SECTIONS = ("data", "model", "training", "runtime")
@@ -197,6 +195,19 @@ def parse_args():
                    help="Use predicted fractions as FiLM conditioning for height.")
     p.add_argument("--use-fraction-aux", action=argparse.BooleanOptionalAction,
                    help="Keep the fraction auxiliary head/loss even when height FiLM is disabled.")
+    p.add_argument("--deep-supervision-weight", type=float,
+                   help="Per-branch aux-loss weight for per-source ensemble models. "
+                        "0 disables; typical 0.2-0.5.")
+    p.add_argument("--token-proj-depth", type=int,
+                   help="Per-source-ensemble: depth of each branch's token "
+                        "projection (768 -> ctx_ch). 1=linear (default), "
+                        "2=GN+GELU+linear.")
+    p.add_argument("--building-presence-pos-weight", type=float,
+                   help="Extra BCE weight for positive building pixels in the presence head.")
+    p.add_argument("--small-building-presence-weight", type=float,
+                   help="Additional BCE weight for positive building pixels on small-building tiles.")
+    p.add_argument("--small-building-max-pixels", type=int,
+                   help="Tile-level positive building pixel cutoff for small-building BCE weighting.")
 
     p.set_defaults(**DEFAULTS)
     p.set_defaults(**config_defaults)
@@ -259,6 +270,7 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "gate_init_bias": args.gate_init_bias,
             "modality_dropout": args.modality_dropout,
             "token_calibration": getattr(args, "token_calibration", False),
+            "token_ctx_ch": getattr(args, "token_ctx_ch", 96),
             "presence_head_kind": args.presence_head_kind,
             "presence_head_depth": args.presence_head_depth,
             "presence_branch_ch": args.presence_branch_ch,
@@ -266,6 +278,7 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "use_fraction_aux": args.use_fraction_aux,
             "attn_heads": getattr(args, "attn_heads", 4),
             "use_additive": getattr(args, "use_additive", True),
+            "token_proj_depth": getattr(args, "token_proj_depth", 1) or 1,
         },
         "training": {
             "batch_size": args.batch_size,
@@ -296,6 +309,10 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "tversky_water_alpha": args.tversky_water_alpha,
             "water_empty_topk": args.water_empty_topk,
             "weight_water_empty_topk": args.weight_water_empty_topk,
+            "deep_supervision_weight": getattr(args, "deep_supervision_weight", 0.0),
+            "building_presence_pos_weight": getattr(args, "building_presence_pos_weight", 1.0),
+            "small_building_presence_weight": getattr(args, "small_building_presence_weight", 1.0),
+            "small_building_max_pixels": getattr(args, "small_building_max_pixels", 0),
         },
         "runtime": runtime,
     }

@@ -25,10 +25,8 @@ from .pixel_fusion import (
     _maybe_drop_modality,
 )
 from .token_fusion import (
-    GatedPixelFusionFiLMPerModalityLightUNet,
-    GatedPixelFusionHierarchicalPairLightUNet,
     GatedPixelFusionHybridLightUNet,
-    GatedPixelFusionTwoGateBnAttentionLightUNet,
+    GatedPixelFusionPerSourceEnsembleLightUNet,
 )
 
 __all__ = [
@@ -39,10 +37,8 @@ __all__ = [
     "ConvGNAct",
     "ConvNeXtBlock",
     "DoubleConv",
-    "GatedPixelFusionFiLMPerModalityLightUNet",
-    "GatedPixelFusionHierarchicalPairLightUNet",
     "GatedPixelFusionHybridLightUNet",
-    "GatedPixelFusionTwoGateBnAttentionLightUNet",
+    "GatedPixelFusionPerSourceEnsembleLightUNet",
     "HEIGHT_NORM_CONSTANT",
     "LightUNet",
     "MultiTaskPredictionHead",

@@ -6,260 +6,10 @@ from .blocks import ChannelCalibration, ConvGNAct, _group_count
 from .backbones import LightUNet
 from .heads import MultiTaskPredictionHead
 from .pixel_fusion import (
-    TesseraCompressionStem,
     _apply_fusion_gate,
     _build_fusion_gate,
     _maybe_drop_modality,
 )
-
-
-class _CrossAttentionBlock(nn.Module):
-    def __init__(self, dim, num_heads=4, dropout=0.05):
-        super().__init__()
-        self.q_norm = nn.LayerNorm(dim)
-        self.kv_norm = nn.LayerNorm(dim)
-        self.attn = nn.MultiheadAttention(
-            dim, num_heads, dropout=dropout, batch_first=True
-        )
-
-    def forward(self, query, key_value, key_bias=None):
-        q = self.q_norm(query)
-        kv = self.kv_norm(key_value)
-        attn_mask = None
-        if key_bias is not None:
-            if key_bias.shape != key_value.shape[:2]:
-                raise ValueError(
-                    "key_bias must have shape [batch, key_len], got "
-                    f"{tuple(key_bias.shape)} for key_value {tuple(key_value.shape)}"
-                )
-            b, query_len, _ = q.shape
-            key_len = kv.size(1)
-            attn_mask = key_bias.float().unsqueeze(1).expand(
-                b, query_len, key_len
-            )
-            attn_mask = attn_mask.repeat_interleave(
-                self.attn.num_heads, dim=0
-            )
-        # Run attention in float32: float16 QK^T can overflow (max ~65504),
-        # causing softmax to produce NaN under AMP autocast.
-        with torch.amp.autocast("cuda", enabled=False):
-            out, _ = self.attn(
-                q.float(), kv.float(), kv.float(),
-                attn_mask=attn_mask,
-                need_weights=False,
-            )
-        return query + out.to(query.dtype)
-
-
-class BottleneckTwoGateAttentionFusion(nn.Module):
-    """Token cross-attention injected at the UNet bottleneck (32×32).
-
-    Key difference from TwoGateAttentionFusion (output-level):
-    - No pooling: bottleneck is already at 32×32, matching token scale closely.
-    - No upsampling: attention output stays at 32×32 = bottleneck resolution.
-    - Q=1024 (32×32 bottleneck), KV=4×256=1024 (four 16×16 token sources) — balanced.
-    - The 8× spatial upsampling artefact of output-level fusion is eliminated.
-    """
-
-    def __init__(self, bottleneck_ch, token_channels, dim=96,
-                 token_source_ch=768, num_heads=4, dropout=0.05):
-        super().__init__()
-        if token_channels % token_source_ch != 0:
-            raise ValueError(
-                f"token_channels={token_channels} must be divisible by "
-                f"token_source_ch={token_source_ch}"
-            )
-        self.token_source_ch = int(token_source_ch)
-        self.num_token_sources = token_channels // token_source_ch
-        self.dim = int(dim)
-
-        self.main_proj = nn.Conv2d(bottleneck_ch, dim, 1)
-        self.token_projs = nn.ModuleList(
-            nn.Conv2d(token_source_ch, dim, 1)
-            for _ in range(self.num_token_sources)
-        )
-        self.pos_mlp = nn.Sequential(
-            nn.Linear(2, dim),
-            nn.GELU(),
-            nn.Linear(dim, dim),
-        )
-        self.modality_embed = nn.Parameter(torch.zeros(1 + self.num_token_sources, dim))
-        nn.init.normal_(self.modality_embed, std=0.02)
-
-        self.cross_attn = _CrossAttentionBlock(dim, num_heads=num_heads, dropout=dropout)
-
-        self.mix_proj = nn.Sequential(
-            ConvGNAct(dim, dim, kernel_size=3),
-            nn.Conv2d(dim, bottleneck_ch, 1),
-        )
-
-        gate_hidden = max(bottleneck_ch // 4, 32)
-        self.gate_net = nn.Sequential(
-            nn.Conv2d(2 * bottleneck_ch, gate_hidden, 1, bias=False),
-            nn.GroupNorm(_group_count(gate_hidden), gate_hidden),
-            nn.GELU(),
-            nn.Conv2d(gate_hidden, 2, 1),
-        )
-        nn.init.zeros_(self.gate_net[-1].weight)
-        self.gate_net[-1].bias.data.copy_(
-            torch.tensor([2.0, -2.0], dtype=self.gate_net[-1].bias.dtype)
-        )
-
-    def _pos_tokens(self, h, w, device, dtype):
-        ys = torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype)
-        xs = torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype)
-        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
-        coords = torch.stack([yy, xx], dim=-1).reshape(1, h * w, 2)
-        return self.pos_mlp(coords)
-
-    def _tokens_from_map(self, feat, modality_idx):
-        b, _, h, w = feat.shape
-        tokens = feat.flatten(2).transpose(1, 2)
-        tokens = tokens + self._pos_tokens(h, w, feat.device, feat.dtype)
-        return tokens + self.modality_embed[modality_idx].view(1, 1, -1)
-
-    def forward(self, bottleneck, token):
-        b, _, h, w = bottleneck.shape
-
-        main_feat = self.main_proj(bottleneck)
-        query = self._tokens_from_map(main_feat, 0)
-
-        token_parts = torch.split(token, self.token_source_ch, dim=1)
-        kv_tokens = [
-            self._tokens_from_map(proj(tp), idx)
-            for idx, (proj, tp) in enumerate(zip(self.token_projs, token_parts), start=1)
-        ]
-        key_value = torch.cat(kv_tokens, dim=1)
-
-        mix_tokens = self.cross_attn(query, key_value)
-
-        mix = mix_tokens.transpose(1, 2).reshape(b, self.dim, h, w)
-        mix = self.mix_proj(mix)
-
-        gates = torch.sigmoid(self.gate_net(torch.cat([bottleneck, mix], dim=1)))
-        return gates[:, 0:1] * bottleneck + gates[:, 1:2] * mix
-
-
-class GatedPixelFusionTwoGateBnAttentionLightUNet(nn.Module):
-    """027 architecture with token cross-attention at the UNet bottleneck.
-
-    Replaces the output-level TwoGateAttentionFusion with bottleneck injection:
-    token features are fused at the 32×32 bottleneck before the decoder runs,
-    so the token signal propagates through all decoder skip connections. This
-    eliminates the 8× upsampling artefact of output-level fusion and places
-    the token injection at the spatial scale closest to the token grid (16×16).
-    Tessera pixel fusion remains at the output level (same as 027).
-    """
-
-    def __init__(self, pixel_channels, token_channels, n_classes=4,
-                 alpha_channels=64, tessera_presence_ch=0,
-                 tessera_hidden_ch=None, tessera_hidden_depth=0,
-                 height_specialist_depth=0, base_ch=32,
-                 gate_init_bias=4.0, gate_mode="simple", gate_untied=False,
-                 modality_dropout=0.0,
-                 height_gate_source="alpha", height_hidden_ch=None,
-                 height_trunk_depth=2, height_independent_branches=False,
-                 height_head_kind="linear", height_n_bins=64,
-                 height_bin_max_m=80.0, norm_kind="bn",
-                 presence_head_kind="shared", presence_head_depth=1,
-                 presence_branch_ch=None, **unused):
-        super().__init__()
-        if n_classes != 4:
-            raise ValueError("GatedPixelFusionTwoGateBnAttentionLightUNet assumes 4 output channels")
-        if pixel_channels <= alpha_channels:
-            raise ValueError(
-                "GatedPixelFusionTwoGateBnAttentionLightUNet expects AlphaEarth+Tessera "
-                f"pixel input with >{alpha_channels} channels, got {pixel_channels}"
-            )
-
-        self.supports_aux_outputs = True
-        self.alpha_channels = alpha_channels
-        self.gate_untied = bool(gate_untied)
-        self.modality_dropout = float(modality_dropout)
-        tessera_channels = pixel_channels - alpha_channels
-        bottleneck_ch = base_ch * 8
-
-        self.alpha_unet = LightUNet(
-            alpha_channels, n_classes, base_ch=base_ch, norm_kind=norm_kind
-        )
-        self.alpha_unet.head = nn.Identity()
-        self.tessera_feature_stem = TesseraCompressionStem(
-            tessera_channels,
-            out_ch=base_ch,
-            hidden_ch=tessera_hidden_ch,
-            hidden_depth=tessera_hidden_depth,
-        )
-        self.gate_conv = _build_fusion_gate(
-            base_ch,
-            mode=gate_mode,
-            untied=self.gate_untied,
-            init_bias=gate_init_bias,
-        )
-        self.bottleneck_token_fusion = BottleneckTwoGateAttentionFusion(
-            bottleneck_ch=bottleneck_ch,
-            token_channels=token_channels,
-        )
-
-        self.tessera_presence_ch = int(tessera_presence_ch)
-        self.presence_extra_proj = (
-            nn.Conv2d(base_ch, self.tessera_presence_ch, 1)
-            if self.tessera_presence_ch > 0 else None
-        )
-        self.head = MultiTaskPredictionHead(
-            in_ch=base_ch,
-            out_channels=n_classes,
-            presence_extra_ch=self.tessera_presence_ch,
-            height_specialist_depth=height_specialist_depth,
-            height_gate_source=height_gate_source,
-            height_hidden_ch=height_hidden_ch,
-            height_trunk_depth=height_trunk_depth,
-            height_independent_branches=height_independent_branches,
-            height_head_kind=height_head_kind,
-            height_n_bins=height_n_bins,
-            height_bin_max_m=height_bin_max_m,
-            presence_head_kind=presence_head_kind,
-            presence_head_depth=presence_head_depth,
-            presence_branch_ch=presence_branch_ch,
-        )
-
-    def forward(self, x, return_aux=False):
-        if not isinstance(x, (tuple, list)) or len(x) != 2:
-            raise ValueError("GatedPixelFusionTwoGateBnAttentionLightUNet expects (pixel, token) input")
-        pixel, token = x
-        alpha = pixel[:, :self.alpha_channels, :, :]
-        tessera = pixel[:, self.alpha_channels:, :, :]
-
-        x1 = self.alpha_unet.inc(alpha)
-        x2 = self.alpha_unet.down1(x1)
-        x3 = self.alpha_unet.down2(x2)
-        x4 = self.alpha_unet.down3(x3)
-
-        x4 = self.bottleneck_token_fusion(x4, token)
-
-        feat = self.alpha_unet.up1(x4)
-        feat = torch.cat([x3, feat], dim=1)
-        feat = self.alpha_unet.conv1(feat)
-
-        feat = self.alpha_unet.up2(feat)
-        feat = torch.cat([x2, feat], dim=1)
-        feat = self.alpha_unet.conv2(feat)
-
-        feat = self.alpha_unet.up3(feat)
-        feat = torch.cat([x1, feat], dim=1)
-        feat = self.alpha_unet.conv3(feat)
-
-        tessera_feat = self.tessera_feature_stem(tessera)
-        tessera_feat = _maybe_drop_modality(
-            tessera_feat, self.modality_dropout, self.training
-        )
-        fused = _apply_fusion_gate(
-            self.gate_conv, feat, tessera_feat, untied=self.gate_untied
-        )
-        presence_extra = (
-            self.presence_extra_proj(tessera_feat)
-            if self.presence_extra_proj is not None else None
-        )
-        return self.head(fused, return_aux=return_aux, presence_extra=presence_extra)
 
 
 def _make_token_proj(in_ch, out_ch, depth=1):
@@ -278,234 +28,6 @@ def _make_token_proj(in_ch, out_ch, depth=1):
         ]
     layers.append(nn.Conv2d(out_ch, out_ch, 1, bias=False))
     return nn.Sequential(*layers)
-
-
-class PerModalityFiLMFusion(nn.Module):
-    """Per-source FiLM: each token source independently modulates pixel features.
-
-    Each source i:
-        token_src_i (768ch) → [calib →] proj_i(ctx_ch) → upsample(H, W)
-        → film_conv_i(ctx_ch → 2*pixel_ch) → γ_i, β_i  [zero-initialized]
-
-    Output: F_pixel + Σ_i (γ_i ⊙ F_pixel + β_i)
-
-    Zero-init → identity at init; each source independently learns to contribute.
-    Unhelpful sources converge γ_i ≈ 0, β_i ≈ 0 without penalising others.
-    token_proj_depth controls projection depth: 1=linear (default), 2=GN+GELU
-    between two conv layers, allowing non-linear token feature extraction.
-    """
-
-    _TOKEN_INPUT_CLAMP = 50.0
-    _CTX_CLAMP = 50.0
-    _FILM_PARAM_CLAMP = 4.0
-
-    def __init__(self, pixel_ch, token_channels, token_source_ch=768,
-                 ctx_ch=96, token_calibration=False, token_proj_depth=1):
-        super().__init__()
-        if token_channels % token_source_ch != 0:
-            raise ValueError(
-                f"PerModalityFiLMFusion: token_channels={token_channels} must be "
-                f"divisible by token_source_ch={token_source_ch}"
-            )
-        self.token_source_ch = int(token_source_ch)
-        self.n_sources = token_channels // token_source_ch
-
-        self.token_calibs = (
-            nn.ModuleList(
-                ChannelCalibration(token_source_ch) for _ in range(self.n_sources)
-            )
-            if token_calibration else None
-        )
-        self.token_projs = nn.ModuleList([
-            _make_token_proj(token_source_ch, ctx_ch, depth=token_proj_depth)
-            for _ in range(self.n_sources)
-        ])
-        self.film_convs = nn.ModuleList([
-            nn.Conv2d(ctx_ch, pixel_ch * 2, 1)
-            for _ in range(self.n_sources)
-        ])
-        for conv in self.film_convs:
-            nn.init.zeros_(conv.weight)
-            nn.init.zeros_(conv.bias)
-
-    def forward(self, F_pixel, token):
-        """
-        F_pixel: (B, pixel_ch, H, W)
-        token:   (B, n_sources * token_source_ch, h, w)  [e.g. 4×768 at 16×16]
-        returns: (B, pixel_ch, H, W)
-        """
-        H, W = F_pixel.shape[-2:]
-        parts = token.float().split(self.token_source_ch, dim=1)
-        with torch.amp.autocast("cuda", enabled=False):
-            F_p_f = F_pixel.float()
-            delta = torch.zeros_like(F_p_f)
-            for i, (src, proj, film_conv) in enumerate(
-                zip(parts, self.token_projs, self.film_convs)
-            ):
-                if self.token_calibs is not None:
-                    src = self.token_calibs[i](src)
-                src = src.clamp(-self._TOKEN_INPUT_CLAMP, self._TOKEN_INPUT_CLAMP)
-                ctx = proj(src).clamp(-self._CTX_CLAMP, self._CTX_CLAMP)
-                ctx_up = F.interpolate(ctx, size=(H, W), mode="bilinear", align_corners=False)
-                gamma, beta = film_conv(ctx_up).chunk(2, dim=1)
-                gamma = gamma.clamp(-self._FILM_PARAM_CLAMP, self._FILM_PARAM_CLAMP)
-                beta = beta.clamp(-self._FILM_PARAM_CLAMP, self._FILM_PARAM_CLAMP)
-                delta = delta + gamma * F_p_f + beta
-            out = (F_p_f + delta).clamp(-self._CTX_CLAMP, self._CTX_CLAMP)
-        return out.to(F_pixel.dtype)
-
-    def forward_with_deltas(self, F_pixel, token):
-        """Like forward() but also returns per-source deltas as a list of [B, C, H, W].
-
-        Returns:
-            out    : (B, pixel_ch, H, W)  — same as forward()
-            deltas : list of n_sources tensors, each (B, pixel_ch, H, W)
-                     where deltas[i] = gamma_i * F_pixel + beta_i
-        """
-        H, W = F_pixel.shape[-2:]
-        parts = token.float().split(self.token_source_ch, dim=1)
-        with torch.amp.autocast("cuda", enabled=False):
-            F_p_f = F_pixel.float()
-            delta_list = []
-            for i, (src, proj, film_conv) in enumerate(
-                zip(parts, self.token_projs, self.film_convs)
-            ):
-                if self.token_calibs is not None:
-                    src = self.token_calibs[i](src)
-                src = src.clamp(-self._TOKEN_INPUT_CLAMP, self._TOKEN_INPUT_CLAMP)
-                ctx = proj(src).clamp(-self._CTX_CLAMP, self._CTX_CLAMP)
-                ctx_up = F.interpolate(ctx, size=(H, W), mode="bilinear", align_corners=False)
-                gamma, beta = film_conv(ctx_up).chunk(2, dim=1)
-                gamma = gamma.clamp(-self._FILM_PARAM_CLAMP, self._FILM_PARAM_CLAMP)
-                beta = beta.clamp(-self._FILM_PARAM_CLAMP, self._FILM_PARAM_CLAMP)
-                delta_list.append(gamma * F_p_f + beta)
-            out = (F_p_f + sum(delta_list)).clamp(-self._CTX_CLAMP, self._CTX_CLAMP)
-        dtype = F_pixel.dtype
-        return out.to(dtype), [d.to(dtype) for d in delta_list]
-
-
-class GatedPixelFusionFiLMPerModalityLightUNet(nn.Module):
-    """xfusion_076: dual-LightUNet pixel backbone + per-source FiLM token conditioning.
-
-    Pixel backbone (symmetric LightUNet for both AE and Tessera):
-        AE(64)       → LightUNet → alpha_feat (base_ch)
-        Tessera(128) → tessera_entry → LightUNet → tessera_feat (base_ch)
-        rich gate → fused (base_ch)
-
-    Token conditioning: each of N token sources contributes an independent
-    FiLM residual (zero-initialized):
-        F_fused = fused + Σ_i (γ_i ⊙ fused + β_i)
-    """
-
-    def __init__(self, pixel_channels, token_channels, n_classes=4,
-                 alpha_channels=64, tessera_presence_ch=0,
-                 tessera_hidden_ch=None, tessera_hidden_depth=0,
-                 height_specialist_depth=0, base_ch=32,
-                 gate_init_bias=4.0, gate_mode="simple", gate_untied=False,
-                 modality_dropout=0.0,
-                 height_gate_source="alpha", height_hidden_ch=None,
-                 height_trunk_depth=2, height_independent_branches=False,
-                 height_head_kind="linear", height_n_bins=64,
-                 height_bin_max_m=80.0, use_fraction_film=True,
-                 use_fraction_aux=None, norm_kind="bn",
-                 presence_head_kind="shared", presence_head_depth=1,
-                 presence_branch_ch=None, token_calibration=False,
-                 token_ctx_ch=96, **unused):
-        super().__init__()
-        if n_classes != 4:
-            raise ValueError(
-                "GatedPixelFusionFiLMPerModalityLightUNet assumes 4 output channels"
-            )
-        if pixel_channels <= alpha_channels:
-            raise ValueError(
-                "GatedPixelFusionFiLMPerModalityLightUNet expects AlphaEarth+Tessera "
-                f"pixel input with >{alpha_channels} channels, got {pixel_channels}"
-            )
-
-        self.supports_aux_outputs = True
-        self.alpha_channels = alpha_channels
-        self.gate_untied = bool(gate_untied)
-        self.modality_dropout = float(modality_dropout)
-        tessera_channels = pixel_channels - alpha_channels
-
-        self.alpha_unet = LightUNet(
-            alpha_channels, n_classes, base_ch=base_ch, norm_kind=norm_kind
-        )
-        self.alpha_unet.head = nn.Identity()
-
-        # Symmetric LightUNet for Tessera (xf076-style), preceded by a small
-        # channel-calibration + 1x1 entry block to align scale across the
-        # 128-dim Tessera embedding.
-        self.tessera_entry = nn.Sequential(
-            ChannelCalibration(tessera_channels),
-            ConvGNAct(tessera_channels, tessera_channels, kernel_size=1, padding=0),
-        )
-        self.tessera_unet = LightUNet(
-            tessera_channels, n_classes, base_ch=base_ch, norm_kind=norm_kind
-        )
-        self.tessera_unet.head = nn.Identity()
-
-        self.gate_conv = _build_fusion_gate(
-            base_ch,
-            mode=gate_mode,
-            untied=self.gate_untied,
-            init_bias=gate_init_bias,
-        )
-
-        self.film_per_modality = PerModalityFiLMFusion(
-            pixel_ch=base_ch,
-            token_channels=token_channels,
-            ctx_ch=token_ctx_ch,
-            token_calibration=token_calibration,
-        )
-
-        self.tessera_presence_ch = int(tessera_presence_ch)
-        self.presence_extra_proj = (
-            nn.Conv2d(base_ch, self.tessera_presence_ch, 1)
-            if self.tessera_presence_ch > 0 else None
-        )
-        self.head = MultiTaskPredictionHead(
-            in_ch=base_ch,
-            out_channels=n_classes,
-            presence_extra_ch=self.tessera_presence_ch,
-            height_specialist_depth=height_specialist_depth,
-            height_gate_source=height_gate_source,
-            height_hidden_ch=height_hidden_ch,
-            height_trunk_depth=height_trunk_depth,
-            height_independent_branches=height_independent_branches,
-            height_head_kind=height_head_kind,
-            height_n_bins=height_n_bins,
-            height_bin_max_m=height_bin_max_m,
-            use_fraction_film=use_fraction_film,
-            use_fraction_aux=use_fraction_aux,
-            presence_head_kind=presence_head_kind,
-            presence_head_depth=presence_head_depth,
-            presence_branch_ch=presence_branch_ch,
-        )
-
-    def forward(self, x, return_aux=False):
-        if not isinstance(x, (tuple, list)) or len(x) != 2:
-            raise ValueError(
-                "GatedPixelFusionFiLMPerModalityLightUNet expects (pixel, token) input"
-            )
-        pixel, token = x
-        alpha = pixel[:, :self.alpha_channels]
-        tessera = pixel[:, self.alpha_channels:]
-
-        alpha_feat = self.alpha_unet.forward_features(alpha)
-        tessera_feat = self.tessera_unet.forward_features(self.tessera_entry(tessera))
-        tessera_feat = _maybe_drop_modality(
-            tessera_feat, self.modality_dropout, self.training
-        )
-        fused = _apply_fusion_gate(
-            self.gate_conv, alpha_feat, tessera_feat, untied=self.gate_untied
-        )
-        fused = self.film_per_modality(fused, token)
-        presence_extra = (
-            self.presence_extra_proj(tessera_feat)
-            if self.presence_extra_proj is not None else None
-        )
-        return self.head(fused, return_aux=return_aux, presence_extra=presence_extra)
 
 
 class CrossSourceHybridFiLMFusion(nn.Module):
@@ -557,12 +79,12 @@ class CrossSourceHybridFiLMFusion(nn.Module):
             for _ in range(self.n_sources)
         ])
 
-        self.pos_mlp = nn.Sequential(
-            nn.Linear(2, ctx_ch),
-            nn.GELU(),
-            nn.Linear(ctx_ch, ctx_ch),
-        )
         if self.attn_heads >= 1:
+            self.pos_mlp = nn.Sequential(
+                nn.Linear(2, ctx_ch),
+                nn.GELU(),
+                nn.Linear(ctx_ch, ctx_ch),
+            )
             self.modality_embed = nn.Parameter(torch.zeros(self.n_sources, ctx_ch))
             nn.init.normal_(self.modality_embed, std=0.02)
             self.attn_norm = nn.LayerNorm(ctx_ch)
@@ -573,6 +95,7 @@ class CrossSourceHybridFiLMFusion(nn.Module):
             nn.init.zeros_(self.cross_source_attn.out_proj.weight)
             nn.init.zeros_(self.cross_source_attn.out_proj.bias)
         else:
+            self.pos_mlp = None
             self.modality_embed = None
             self.attn_norm = None
             self.cross_source_attn = None
@@ -580,14 +103,21 @@ class CrossSourceHybridFiLMFusion(nn.Module):
         self.film_convs = nn.ModuleList([
             nn.Conv2d(ctx_ch, pixel_ch * 2, 1) for _ in range(self.n_sources)
         ])
-        self.add_convs = nn.ModuleList([
-            nn.Conv2d(ctx_ch, pixel_ch, 1) for _ in range(self.n_sources)
-        ])
+        if self.use_additive:
+            self.add_convs = nn.ModuleList([
+                nn.Conv2d(ctx_ch, pixel_ch, 1) for _ in range(self.n_sources)
+            ])
+        else:
+            self.add_convs = None
         self.gate_convs = nn.ModuleList([
             nn.Conv2d(ctx_ch, 1, 1) for _ in range(self.n_sources)
         ])
-        for module_list in (self.film_convs, self.add_convs, self.gate_convs):
+        for module_list in (self.film_convs, self.gate_convs):
             for conv in module_list:
+                nn.init.zeros_(conv.weight)
+                nn.init.zeros_(conv.bias)
+        if self.add_convs is not None:
+            for conv in self.add_convs:
                 nn.init.zeros_(conv.weight)
                 nn.init.zeros_(conv.bias)
 
@@ -665,225 +195,23 @@ class CrossSourceHybridFiLMFusion(nn.Module):
         return out.to(F_pixel.dtype)
 
 
-class HierarchicalPairFiLMFusion(nn.Module):
-    """xfusion_086 fusion: hierarchical pairwise fusion (no softmax over keys).
+class GatedPixelFusionPerSourceEnsembleLightUNet(nn.Module):
+    """xf100: 4 single-source fusion branches + shared head + output averaging.
 
-    Replaces xfusion_085's single 4-source MultiheadAttention softmax with a
-    two-stage additive scheme that exploits the 2x2 structure of the 4 token
-    sources (model axis x modality axis):
+    Mimics the 4-tri-modal ensemble pattern (alpha+tessera+single token, 4 such
+    models, averaged at inference) inside one end-to-end model. Pixel backbone
+    is the standard alpha_unet + tessera_unet + gated combination. The single
+    bottleneck CrossSourceHybridFiLMFusion of xf086 is replaced by 4 parallel
+    SINGLE-source fusion branches (each is CrossSourceHybridFiLMFusion with
+    n_sources=1 → no cross-source attention coupling between sources). Each
+    branch produces its own feat_i; the head is invoked 4 times and the dict
+    outputs are averaged.
 
-      Stage 1 (16x16): pair the 4 projected ctx_i according to `pair_axis`.
-        "modality" → pair_A = ctx_0 + ctx_2 (TM_s1 + THOR_s1)
-                     pair_B = ctx_1 + ctx_3 (TM_s2 + THOR_s2)
-        "model"    → pair_A = ctx_0 + ctx_1 (TM_s1 + TM_s2)
-                     pair_B = ctx_2 + ctx_3 (THOR_s1 + THOR_s2)
-        Each pair fused via sigmoid-gated additive (no key-softmax):
-            pair = ctx_a + ctx_b + sigmoid(gate(cat)) * delta(cat)
-        Both `gate` and `delta` are 1x1 convs, zero-init → pair = ctx_a + ctx_b
-        at init. Sigmoid is per-channel, not over keys → no zero-sum competition.
-
-      Stage 2 (16x16): symmetric cross-pair refinement (optional). Each pair
-      adds a zero-init residual computed from the other pair via a 1x1 conv.
-      No softmax.
-
-      Stage 3 (H x W): per-pair pixel modulation, exactly mirroring xf085 but
-      with n_sources=2 (the two refined pairs). 2x FiLM + (optional) 2x add +
-      (optional) 2x spatial gate, all zero-init.
-
-    Returns (F_out, ctx_list=[ctx_0..ctx_3]). The 4 raw per-source contexts
-    are kept around for the per-source auxiliary heads upstream.
-    """
-
-    _TOKEN_INPUT_CLAMP = 50.0
-    _CTX_CLAMP = 50.0
-    _FILM_PARAM_CLAMP = 4.0
-    _ADD_CLAMP = 4.0
-
-    _PAIR_INDICES = {
-        "modality": ((0, 2), (1, 3)),
-        "model":    ((0, 1), (2, 3)),
-    }
-
-    def __init__(self, pixel_ch, token_channels, token_source_ch=768,
-                 ctx_ch=96, token_calibration=False, token_proj_depth=1,
-                 pair_axis="modality", use_cross_pair=True,
-                 use_additive=True, use_spatial_gate=True):
-        super().__init__()
-        if token_channels % token_source_ch != 0:
-            raise ValueError(
-                f"HierarchicalPairFiLMFusion: token_channels={token_channels} "
-                f"must be divisible by token_source_ch={token_source_ch}"
-            )
-        n_sources = token_channels // token_source_ch
-        if n_sources != 4:
-            raise ValueError(
-                f"HierarchicalPairFiLMFusion requires exactly 4 token sources, "
-                f"got n_sources={n_sources}"
-            )
-        if pair_axis not in self._PAIR_INDICES:
-            raise ValueError(
-                f"pair_axis must be one of {list(self._PAIR_INDICES)}, got {pair_axis!r}"
-            )
-
-        self.token_source_ch = int(token_source_ch)
-        self.n_sources = 4
-        self.ctx_ch = int(ctx_ch)
-        self.pair_axis = str(pair_axis)
-        self.pair_idx = self._PAIR_INDICES[self.pair_axis]
-        self.use_cross_pair = bool(use_cross_pair)
-        self.use_additive = bool(use_additive)
-        self.use_spatial_gate = bool(use_spatial_gate)
-
-        self.token_calibs = (
-            nn.ModuleList(
-                ChannelCalibration(token_source_ch) for _ in range(4)
-            )
-            if token_calibration else None
-        )
-        self.token_projs = nn.ModuleList([
-            _make_token_proj(token_source_ch, ctx_ch, depth=token_proj_depth)
-            for _ in range(4)
-        ])
-
-        # Stage 1: per-pair sigmoid-gated additive fusion (zero-init).
-        self.pair_gate_convs = nn.ModuleList([
-            nn.Conv2d(2 * ctx_ch, ctx_ch, 1) for _ in range(2)
-        ])
-        self.pair_delta_convs = nn.ModuleList([
-            nn.Conv2d(2 * ctx_ch, ctx_ch, 1) for _ in range(2)
-        ])
-        for conv in self.pair_gate_convs:
-            nn.init.zeros_(conv.weight)
-            nn.init.zeros_(conv.bias)
-        for conv in self.pair_delta_convs:
-            nn.init.zeros_(conv.weight)
-            nn.init.zeros_(conv.bias)
-
-        # Stage 2: optional cross-pair refinement (zero-init).
-        if self.use_cross_pair:
-            self.cross_pair_convs = nn.ModuleList([
-                nn.Conv2d(ctx_ch, ctx_ch, 1) for _ in range(2)
-            ])
-            for conv in self.cross_pair_convs:
-                nn.init.zeros_(conv.weight)
-                nn.init.zeros_(conv.bias)
-        else:
-            self.cross_pair_convs = None
-
-        # Stage 3: per-pair pixel modulation (zero-init), n_sources=2.
-        self.film_convs = nn.ModuleList([
-            nn.Conv2d(ctx_ch, pixel_ch * 2, 1) for _ in range(2)
-        ])
-        for conv in self.film_convs:
-            nn.init.zeros_(conv.weight)
-            nn.init.zeros_(conv.bias)
-
-        if self.use_additive:
-            self.add_convs = nn.ModuleList([
-                nn.Conv2d(ctx_ch, pixel_ch, 1) for _ in range(2)
-            ])
-            for conv in self.add_convs:
-                nn.init.zeros_(conv.weight)
-                nn.init.zeros_(conv.bias)
-        else:
-            self.add_convs = None
-
-        if self.use_spatial_gate:
-            self.gate_convs = nn.ModuleList([
-                nn.Conv2d(ctx_ch, 1, 1) for _ in range(2)
-            ])
-            for conv in self.gate_convs:
-                nn.init.zeros_(conv.weight)
-                nn.init.zeros_(conv.bias)
-        else:
-            self.gate_convs = None
-
-    def _fuse_pair(self, ctx_a, ctx_b, k):
-        cat = torch.cat([ctx_a, ctx_b], dim=1)
-        g = torch.sigmoid(self.pair_gate_convs[k](cat))
-        delta = self.pair_delta_convs[k](cat)
-        return ctx_a + ctx_b + g * delta
-
-    def forward(self, F_pixel, token):
-        """
-        F_pixel: (B, pixel_ch, H, W)
-        token:   (B, 4 * token_source_ch, h, w)   [e.g. 4*768 at 16x16]
-        returns: (F_out, ctx_list)
-            F_out:    (B, pixel_ch, H, W)
-            ctx_list: list of 4 tensors each (B, ctx_ch, h, w) - raw per-source
-                      contexts post-projection, for upstream aux heads.
-        """
-        H, W = F_pixel.shape[-2:]
-        parts = token.float().split(self.token_source_ch, dim=1)
-        with torch.amp.autocast("cuda", enabled=False):
-            ctx_list = []
-            for i, src in enumerate(parts):
-                if self.token_calibs is not None:
-                    src = self.token_calibs[i](src)
-                src = src.clamp(-self._TOKEN_INPUT_CLAMP, self._TOKEN_INPUT_CLAMP)
-                ctx = self.token_projs[i](src).clamp(-self._CTX_CLAMP, self._CTX_CLAMP)
-                ctx_list.append(ctx)
-
-            # Stage 1: pair fusion.
-            pairs = []
-            for k, (ia, ib) in enumerate(self.pair_idx):
-                pair_k = self._fuse_pair(ctx_list[ia], ctx_list[ib], k)
-                pairs.append(pair_k.clamp(-self._CTX_CLAMP, self._CTX_CLAMP))
-
-            # Stage 2: optional symmetric cross-pair refinement.
-            if self.cross_pair_convs is not None:
-                pa_orig = pairs[0]
-                pb_orig = pairs[1]
-                pa_ref = (pa_orig + self.cross_pair_convs[0](pb_orig)).clamp(
-                    -self._CTX_CLAMP, self._CTX_CLAMP
-                )
-                pb_ref = (pb_orig + self.cross_pair_convs[1](pa_orig)).clamp(
-                    -self._CTX_CLAMP, self._CTX_CLAMP
-                )
-                pairs = [pa_ref, pb_ref]
-
-            # Stage 3: per-pair pixel modulation.
-            F_p_f = F_pixel.float()
-            delta_total = torch.zeros_like(F_p_f)
-            for k, pair_ctx in enumerate(pairs):
-                ctx_up = F.interpolate(
-                    pair_ctx, size=(H, W), mode="bilinear", align_corners=False
-                )
-                gamma, beta = self.film_convs[k](ctx_up).chunk(2, dim=1)
-                gamma = gamma.clamp(-self._FILM_PARAM_CLAMP, self._FILM_PARAM_CLAMP)
-                beta = beta.clamp(-self._FILM_PARAM_CLAMP, self._FILM_PARAM_CLAMP)
-                src_delta = gamma * F_p_f + beta
-
-                if self.add_convs is not None:
-                    add = self.add_convs[k](ctx_up).clamp(
-                        -self._ADD_CLAMP, self._ADD_CLAMP
-                    )
-                    src_delta = src_delta + add
-
-                if self.gate_convs is not None:
-                    g = torch.sigmoid(self.gate_convs[k](ctx_up))
-                    src_delta = g * src_delta
-
-                delta_total = delta_total + src_delta
-
-            out = (F_p_f + delta_total).clamp(-self._CTX_CLAMP, self._CTX_CLAMP)
-        return out.to(F_pixel.dtype), ctx_list
-
-
-class GatedPixelFusionHierarchicalPairLightUNet(nn.Module):
-    """xf091: hierarchical-pair token fusion — THOR/TM encoder-axis separation.
-
-    Pixel backbone identical to xf085 (GatedPixelFusionHybridLightUNet).
-    Token fusion replaced: CrossSourceHybridFiLMFusion → HierarchicalPairFiLMFusion
-    with pair_axis="model" so (TM_s1, TM_s2) and (THOR_s1, THOR_s2) each fuse
-    within their own encoder pool before cross-pair interaction.
-
-    Motivation: xf085 attribution shows masking THOR sources slightly *improves*
-    Score (+0.0007/+0.0008), meaning THOR adds noise in the flat 4-source
-    self-attention. Root cause: TM tokens dominate the shared attention pool and
-    overwrite THOR's distinct feature space. Hierarchical pairing gives each
-    encoder its own Stage-1 fusion, then Stage-2 cross-pair refinement allows
-    selective information transfer between TM and THOR.
+    Motivation: the user's 4-tri-modal ensemble outperforms xf086, indicating
+    that giving each token source its own independent gradient pathway and
+    output head matters more than coupling them in one fusion attention. The
+    multi-position experiment (xf099) tests adding more positions; this run
+    tests removing per-source competition entirely.
     """
 
     def __init__(self, pixel_channels, token_channels, n_classes=4,
@@ -899,18 +227,27 @@ class GatedPixelFusionHierarchicalPairLightUNet(nn.Module):
                  use_fraction_aux=None, norm_kind="bn",
                  presence_head_kind="shared", presence_head_depth=1,
                  presence_branch_ch=None, token_calibration=False,
-                 token_ctx_ch=96, pair_axis="model",
+                 token_ctx_ch=96, attn_heads=4, use_additive=True,
+                 token_source_ch=768,
+                 token_proj_depth=1,
                  **unused):
         super().__init__()
         if n_classes != 4:
             raise ValueError(
-                "GatedPixelFusionHierarchicalPairLightUNet assumes 4 output channels"
+                "GatedPixelFusionPerSourceEnsembleLightUNet assumes 4 output channels"
             )
         if pixel_channels <= alpha_channels:
             raise ValueError(
-                "GatedPixelFusionHierarchicalPairLightUNet expects AlphaEarth+Tessera "
+                "GatedPixelFusionPerSourceEnsembleLightUNet expects AlphaEarth+Tessera "
                 f"pixel input with >{alpha_channels} channels, got {pixel_channels}"
             )
+        if token_channels % token_source_ch != 0:
+            raise ValueError(
+                f"token_channels={token_channels} must be divisible by "
+                f"token_source_ch={token_source_ch}"
+            )
+        self.n_sources = token_channels // token_source_ch
+        self.token_source_ch = int(token_source_ch)
 
         self.supports_aux_outputs = True
         self.alpha_channels = alpha_channels
@@ -939,16 +276,23 @@ class GatedPixelFusionHierarchicalPairLightUNet(nn.Module):
             init_bias=gate_init_bias,
         )
 
-        self.hier_fusion = HierarchicalPairFiLMFusion(
-            pixel_ch=base_ch,
-            token_channels=token_channels,
-            ctx_ch=token_ctx_ch,
-            token_calibration=token_calibration,
-            pair_axis=pair_axis,
-            use_cross_pair=True,
-            use_additive=True,
-            use_spatial_gate=True,
-        )
+        # 4 independent single-source fusion branches. Each is
+        # CrossSourceHybridFiLMFusion with n_sources=1 → its internal
+        # MultiheadAttention becomes intra-source spatial attention (256 tokens
+        # of dim ctx_ch over a single source) rather than cross-source coupling.
+        self.branch_fusions = nn.ModuleList([
+            CrossSourceHybridFiLMFusion(
+                pixel_ch=base_ch,
+                token_channels=token_source_ch,
+                token_source_ch=token_source_ch,
+                ctx_ch=token_ctx_ch,
+                token_calibration=token_calibration,
+                token_proj_depth=token_proj_depth,
+                attn_heads=attn_heads,
+                use_additive=use_additive,
+            )
+            for _ in range(self.n_sources)
+        ])
 
         self.tessera_presence_ch = int(tessera_presence_ch)
         self.presence_extra_proj = (
@@ -977,7 +321,7 @@ class GatedPixelFusionHierarchicalPairLightUNet(nn.Module):
     def forward(self, x, return_aux=False):
         if not isinstance(x, (tuple, list)) or len(x) != 2:
             raise ValueError(
-                "GatedPixelFusionHierarchicalPairLightUNet expects (pixel, token) input"
+                "GatedPixelFusionPerSourceEnsembleLightUNet expects (pixel, token) input"
             )
         pixel, token = x
         alpha = pixel[:, :self.alpha_channels]
@@ -991,21 +335,50 @@ class GatedPixelFusionHierarchicalPairLightUNet(nn.Module):
         fused = _apply_fusion_gate(
             self.gate_conv, alpha_feat, tessera_feat, untied=self.gate_untied
         )
-        fused, _ = self.hier_fusion(fused, token)
         presence_extra = (
             self.presence_extra_proj(tessera_feat)
             if self.presence_extra_proj is not None else None
         )
-        return self.head(fused, return_aux=return_aux, presence_extra=presence_extra)
+
+        token_parts = token.split(self.token_source_ch, dim=1)
+        branch_outs = []
+        for i, tok_i in enumerate(token_parts):
+            feat_i = self.branch_fusions[i](fused, tok_i)
+            out_i = self.head(
+                feat_i, return_aux=return_aux, presence_extra=presence_extra
+            )
+            branch_outs.append(out_i)
+
+        if not return_aux:
+            return torch.stack(branch_outs, dim=0).mean(0)
+
+        # Average each entry in the aux dict across branches. Some entries may be None.
+        averaged = {}
+        keys = branch_outs[0].keys()
+        for k in keys:
+            vals = [b[k] for b in branch_outs]
+            if all(v is None for v in vals):
+                averaged[k] = None
+            elif any(v is None for v in vals):
+                stack = torch.stack([v for v in vals if v is not None], dim=0)
+                averaged[k] = stack.mean(0)
+            else:
+                averaged[k] = torch.stack(vals, dim=0).mean(0)
+        # Expose per-branch dicts for deep-supervision aux loss in train_loop.
+        # Inference uses only 'out'; loss reads 'branch_outs' when
+        # deep_supervision_weight > 0.
+        averaged["branch_outs"] = branch_outs
+        return averaged
 
 
 class GatedPixelFusionHybridLightUNet(nn.Module):
     """xfusion_085 SoTA: dual-LightUNet pixel backbone + cross-source hybrid token fusion.
 
-    Pixel backbone is identical to GatedPixelFusionFiLMPerModalityLightUNet
-    (xfusion_082). Token conditioning is CrossSourceHybridFiLMFusion: token sources
-    are refined via cross-source self-attention, then each refined source
-    contributes a zero-init (FiLM γ/β + additive A + spatial-gate σ(g)) residual.
+    Pixel backbone: symmetric AlphaEarth + Tessera LightUNet branches merged by
+    a learned spatial gate. Token conditioning is CrossSourceHybridFiLMFusion:
+    the N token sources are refined via cross-source self-attention, then each
+    refined source contributes a zero-init (FiLM γ/β + additive A + spatial-gate
+    σ(g)) residual.
     """
 
     def __init__(self, pixel_channels, token_channels, n_classes=4,

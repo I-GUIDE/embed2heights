@@ -26,7 +26,8 @@ def forward_for_training(model, imgs):
 
 
 def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
-              grad_accum_steps=1, use_amp=False, desc=""):
+              grad_accum_steps=1, use_amp=False, desc="",
+              deep_supervision_weight=0.0):
     """Train or eval one epoch. Returns (avg_loss, component_avgs)."""
     model.train(train)
     running_loss = 0.0
@@ -48,6 +49,19 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
             with torch.amp.autocast("cuda", enabled=use_amp):
                 outputs = forward_for_training(model, imgs)
                 loss, loss_components = criterion(outputs, targets, masks)
+                if (deep_supervision_weight > 0.0
+                        and isinstance(outputs, dict)
+                        and "branch_outs" in outputs
+                        and outputs["branch_outs"] is not None):
+                    branch_outs = outputs["branch_outs"]
+                    branch_losses = []
+                    for b_out in branch_outs:
+                        bl, _ = criterion(b_out, targets, masks)
+                        branch_losses.append(bl)
+                    if branch_losses:
+                        ds_loss = sum(branch_losses) / len(branch_losses)
+                        loss = loss + deep_supervision_weight * ds_loss
+                        loss_components["deep_supervision"] = ds_loss.detach()
                 step_loss = loss / grad_accum_steps if train else loss
 
             if not torch.isfinite(loss):

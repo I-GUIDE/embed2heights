@@ -151,6 +151,8 @@ def model_kwargs_from_run_config(cfg):
         "attn_heads": cfg.get("attn_heads", 4),
         "token_calibration": cfg.get("token_calibration", False),
         "use_additive": cfg.get("use_additive", True),
+        "token_ctx_ch": cfg.get("token_ctx_ch", 96),
+        "token_proj_depth": cfg.get("token_proj_depth", 1) or 1,
     }
 
 

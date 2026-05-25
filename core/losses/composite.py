@@ -24,8 +24,12 @@ class ImprovedCompositeLoss(nn.Module):
                  height_loss_kind="l1", huber_delta=1.0,
                  build_height_boost=5.0, veg_height_boost=0.0,
                  aux_veg_weight=1.0, height_bin_aux_weight=0.0,
-                 height_bin_sigma_bins=1.5, tversky_water_alpha=0.3,
-                 water_empty_topk=0, weight_water_empty_topk=0.0):
+                 height_bin_sigma_bins=1.5, tversky_building_alpha=0.3,
+                 tversky_water_alpha=0.3,
+                 water_empty_topk=0, weight_water_empty_topk=0.0,
+                 building_presence_pos_weight=1.0,
+                 small_building_presence_weight=1.0,
+                 small_building_max_pixels=0):
         super().__init__()
         if loss_preset != "presence_centered":
             raise ValueError("loss_preset must be presence_centered")
@@ -35,6 +39,11 @@ class ImprovedCompositeLoss(nn.Module):
         self.ssim = SSIMLoss(window_size=11)
         self.gdl = GradientDifferenceLoss()
         self.tversky = TverskyLoss(alpha=0.3, beta=0.7)
+        building_alpha = float(tversky_building_alpha)
+        self.tversky_building = TverskyLoss(
+            alpha=building_alpha,
+            beta=1.0 - building_alpha,
+        )
         water_alpha = float(tversky_water_alpha)
         self.tversky_water = TverskyLoss(alpha=water_alpha, beta=1.0 - water_alpha)
 
@@ -57,6 +66,9 @@ class ImprovedCompositeLoss(nn.Module):
         self.height_bin_sigma_bins = float(height_bin_sigma_bins)
         self.water_empty_topk = max(0, int(water_empty_topk))
         self.weight_water_empty_topk = float(weight_water_empty_topk)
+        self.building_presence_pos_weight = float(building_presence_pos_weight)
+        self.small_building_presence_weight = float(small_building_presence_weight)
+        self.small_building_max_pixels = max(0, int(small_building_max_pixels))
 
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
         self.fraction_mae_weights = torch.tensor([1.0, 1.0, 1.0]).float()
@@ -198,12 +210,39 @@ class ImprovedCompositeLoss(nn.Module):
                 loss = F.binary_cross_entropy_with_logits(
                     safe_logits, safe_target, reduction="none"
                 )
-                return torch.sum(loss * lc_mask) / (torch.sum(lc_mask) + 1e-6)
+                bce_weight = lc_mask
+                if (self.building_presence_pos_weight != 1.0
+                        or self.small_building_presence_weight != 1.0):
+                    bce_weight = lc_mask.clone()
+                    b_pos = safe_target[:, 0:1, :, :] > 0
+                    b_weight = torch.ones_like(bce_weight[:, 0:1, :, :])
+                    b_weight = torch.where(
+                        b_pos,
+                        b_weight * self.building_presence_pos_weight,
+                        b_weight,
+                    )
+                    if (self.small_building_max_pixels > 0
+                            and self.small_building_presence_weight != 1.0):
+                        b_area = torch.sum(
+                            safe_target[:, 0:1, :, :] * global_mask,
+                            dim=(1, 2, 3),
+                        )
+                        small = (
+                            (b_area > 0)
+                            & (b_area <= self.small_building_max_pixels)
+                        ).view(-1, 1, 1, 1)
+                        b_weight = torch.where(
+                            small & b_pos,
+                            b_weight * self.small_building_presence_weight,
+                            b_weight,
+                        )
+                    bce_weight[:, 0:1, :, :] = bce_weight[:, 0:1, :, :] * b_weight
+                return torch.sum(loss * bce_weight) / (torch.sum(bce_weight) + 1e-6)
 
             presence_loss = masked_presence_bce(aux_outputs["presence_logits"])
             if self.loss_preset == "presence_centered":
                 presence_prob = torch.sigmoid(aux_outputs["presence_logits"])
-                p_build = self.tversky(
+                p_build = self.tversky_building(
                     presence_prob[:, 0, :, :],
                     presence_target[:, 0, :, :],
                     valid_mask=gm_bool,

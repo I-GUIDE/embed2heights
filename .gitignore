@@ -1,13 +1,4 @@
-# Data (downloaded via eotdl, large GeoTIFF files)
-data/
-!core/data/
-!core/data/*.py
-
-# Experiment outputs (checkpoints, loss curves, predictions)
-runs/
-
-
-# Python
+# --- Python ---
 __pycache__/
 *.py[cod]
 *$py.class
@@ -16,63 +7,64 @@ dist/
 build/
 *.egg
 
-
-# Jupyter
+# --- Jupyter ---
 .ipynb_checkpoints/
+tools/*.ipynb
 
-# Environment
+# --- Environment ---
 .env
 *.env
 
-# IDE
+# --- IDE / OS ---
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
 Thumbs.db
 
-
-# logs
-# logs/train/*
-submission/
+# --- Private / agent state ---
 .claude
 .codex
-run.sbatch
-configs/
-!configs/
-!configs/*.yml
-!configs/*.md
-!configs/active/
-!configs/active/*.yml
-!configs/legacy/
-!configs/legacy/*.yml
-!configs/legacy/*.md
+
+# --- Data (downloaded, large GeoTIFFs) ---
+data/
+!core/data/
+!core/data/*.py
+
+# --- Experiment outputs ---
+runs/
+submission/
+
+# --- Generated figures / large binary docs ---
+figures/
+tools/plot*
+*.svg
+*.png
+*.md
+!readme.md
+!core/**/README.md
+
+# --- SLURM scripts and output ---
 *.sbatch
 !sample.sbatch
 *.out
 
-tools/plot*
-
+# --- Logs (keep curated docs) ---
 logs/*
+logs/*.pdf
 !logs/BEST_RESULT.md
 !logs/GOAL.md
+
+# --- Configs: whitelist defaults + SoTA only ---
 configs/*
 !configs/*.yml
-!configs/*.md
+!configs/README.md
 !configs/active/
-!configs/active/*.yml
+configs/active/*.yml
+!configs/active/xfusion_085_hybrid_tied_no_residual_ep60.yml
+!configs/active/xfusion_107_per_source_ds05_fold0_ep60.yml
 !configs/legacy/
 !configs/legacy/*.yml
-!configs/legacy/*.md
-
-.out
-logs/*.pdf
-
-logs/
-submit_*.sbatch
-
-tools/*.ipynb
+!configs/legacy/README.md

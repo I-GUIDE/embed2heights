@@ -4,7 +4,7 @@ from .registry import ACTIVE_MODEL_ALIASES, ACTIVE_MODEL_TYPES, build_active_mod
 def infer_model_type(n_channels):
     """Best-effort default for active experiments."""
     if isinstance(n_channels, (tuple, list)):
-        return "xfusion_unet_film_per_modality"
+        return "xfusion_unet_per_source_ensemble"
     if n_channels > 64:
         return "ae_tessera_gated"
     return "ae_only"
@@ -21,7 +21,9 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 modality_dropout=0.0, presence_head_kind="shared",
                 presence_head_depth=1, presence_branch_ch=None,
                 use_fraction_film=True, use_fraction_aux=None,
-                attn_heads=4, token_calibration=False, use_additive=True):
+                attn_heads=4, token_calibration=False, use_additive=True,
+                token_ctx_ch=96,
+                token_proj_depth=1):
     selected = model_type.lower()
     if selected == "auto":
         selected = infer_model_type(n_channels)
@@ -55,6 +57,8 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
         attn_heads=attn_heads,
         token_calibration=token_calibration,
         use_additive=use_additive,
+        token_ctx_ch=token_ctx_ch,
+        token_proj_depth=token_proj_depth,
     )
     if active is not None:
         return active
