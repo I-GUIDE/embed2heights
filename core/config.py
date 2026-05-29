@@ -202,6 +202,18 @@ def parse_args():
                    help="Per-source-ensemble: depth of each branch's token "
                         "projection (768 -> ctx_ch). 1=linear (default), "
                         "2=GN+GELU+linear.")
+    p.add_argument("--token-in-source-attn", action=argparse.BooleanOptionalAction,
+                   help="Run per-source spatial self-attention before the "
+                        "cross-source token attention in hybrid token fusion.")
+    p.add_argument("--token-cross-source-attn", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Run cross-source token attention after optional per-source "
+                        "spatial self-attention in hybrid token fusion.")
+    p.add_argument("--height-from-pixel", action=argparse.BooleanOptionalAction,
+                   help="Per-source-ensemble: route the height trunk through the "
+                        "pre-token-fusion pixel feature (alpha+tessera gate output) "
+                        "while presence still uses the token-fused feat_i. "
+                        "Decouples height regression from token smoothing.")
     p.add_argument("--building-presence-pos-weight", type=float,
                    help="Extra BCE weight for positive building pixels in the presence head.")
     p.add_argument("--small-building-presence-weight", type=float,
@@ -249,6 +261,7 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "train_targets_dir": args.train_targets_dir,
             "split_file": args.split_file,
             "patch_size": args.patch_size,
+            "d4_aug": getattr(args, "d4_aug", False),
         },
         "model": {
             "model_type": args.model_type,
@@ -270,6 +283,11 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "gate_init_bias": args.gate_init_bias,
             "modality_dropout": args.modality_dropout,
             "token_calibration": getattr(args, "token_calibration", False),
+            "token_calibration_source_indices": getattr(args, "token_calibration_source_indices", None),
+            "pixel_noise_std": getattr(args, "pixel_noise_std", 0.0),
+            "n_head_replicas": getattr(args, "n_head_replicas", 1),
+            "symmetric_modality_dropout": getattr(args, "symmetric_modality_dropout", 0.0),
+            "symmetric_modality_dropout_alpha_share": getattr(args, "symmetric_modality_dropout_alpha_share", 0.5),
             "token_ctx_ch": getattr(args, "token_ctx_ch", 96),
             "presence_head_kind": args.presence_head_kind,
             "presence_head_depth": args.presence_head_depth,
@@ -279,12 +297,20 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "attn_heads": getattr(args, "attn_heads", 4),
             "use_additive": getattr(args, "use_additive", True),
             "token_proj_depth": getattr(args, "token_proj_depth", 1) or 1,
+            "token_in_source_attn": getattr(args, "token_in_source_attn", False),
+            "token_cross_source_attn": getattr(args, "token_cross_source_attn", True),
+            "height_from_pixel": getattr(args, "height_from_pixel", False),
+            "feat_aggregation": getattr(args, "feat_aggregation", "mean"),
+            "token_input_clamp": getattr(args, "token_input_clamp", None),
+            "pixel_backbone_kind": getattr(args, "pixel_backbone_kind", "unet"),
         },
         "training": {
             "batch_size": args.batch_size,
             "epochs": args.epochs,
             "lr": args.lr,
             "weight_decay": args.weight_decay,
+            "lr_patience": getattr(args, "lr_patience", 2),
+            "lr_factor": getattr(args, "lr_factor", 0.5),
             "seed": args.seed,
             "grad_accum_steps": args.grad_accum_steps,
             "freeze_except": args.freeze_except,
@@ -298,6 +324,7 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "aux_weight": args.aux_weight,
             "height_loss_kind": args.height_loss_kind,
             "huber_delta": args.huber_delta,
+            "pinball_tau": getattr(args, "pinball_tau", 0.5),
             "build_height_boost": args.build_height_boost,
             "veg_height_boost": args.veg_height_boost,
             "aux_veg_weight": args.aux_veg_weight,
@@ -313,6 +340,11 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "building_presence_pos_weight": getattr(args, "building_presence_pos_weight", 1.0),
             "small_building_presence_weight": getattr(args, "small_building_presence_weight", 1.0),
             "small_building_max_pixels": getattr(args, "small_building_max_pixels", 0),
+            "ema_decay": getattr(args, "ema_decay", 0.0),
+            "lr_scheduler": getattr(args, "lr_scheduler", "plateau"),
+            "lr_eta_min": getattr(args, "lr_eta_min", 1e-5),
+            "lr_patience": getattr(args, "lr_patience", 2),
+            "lr_factor": getattr(args, "lr_factor", 0.5),
         },
         "runtime": runtime,
     }

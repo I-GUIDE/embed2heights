@@ -1,9 +1,30 @@
 """Model-forward helpers for inference and TTA."""
 
+import os
+
 import numpy as np
 import torch
 
 from core.data.datasets import HEIGHT_NORM_CONSTANT
+
+
+# Ablation toggles (must mirror core/engine/train_loop.py):
+#   ZERO_TOKENS=1  -> replace token tensor with zeros
+#   NOISE_TOKENS=1 -> replace token tensor with torch.randn_like(token)
+# ZERO takes precedence if both are set.
+_ZERO_TOKENS = os.environ.get("ZERO_TOKENS", "0") == "1"
+_NOISE_TOKENS = os.environ.get("NOISE_TOKENS", "0") == "1"
+
+
+def _maybe_zero_tokens(img_batch):
+    if not (_ZERO_TOKENS or _NOISE_TOKENS):
+        return img_batch
+    if isinstance(img_batch, (tuple, list)) and len(img_batch) == 2:
+        pixel, token = img_batch
+        if _ZERO_TOKENS:
+            return (pixel, torch.zeros_like(token))
+        return (pixel, torch.randn_like(token))
+    return img_batch
 
 
 def input_channels(sample_img):
@@ -49,6 +70,7 @@ def transform_input(img_batch, rot_k, mirror):
 
 
 def predict_batch(model, img_batch, views):
+    img_batch = _maybe_zero_tokens(img_batch)
     if len(views) == 1:
         return model(img_batch).squeeze(0)
 

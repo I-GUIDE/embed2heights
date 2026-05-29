@@ -36,6 +36,7 @@ data/
 # --- Experiment outputs ---
 runs/
 submission/
+artifacts/
 
 # --- Generated figures / large binary docs ---
 figures/
@@ -64,7 +65,18 @@ configs/*
 !configs/active/
 configs/active/*.yml
 !configs/active/xfusion_085_hybrid_tied_no_residual_ep60.yml
+!configs/active/xfusion_095_hybrid_tm_calib_only_ep60.yml
 !configs/active/xfusion_107_per_source_ds05_fold0_ep60.yml
+!configs/active/xfusion_107_noisetok_fold0_seed0_ep100.yml
 !configs/legacy/
 !configs/legacy/*.yml
 !configs/legacy/README.md
+
+# --- Local-only experimental tools / submit scripts (kept on disk, never committed) ---
+/tools/attribute_xf107_per_branch.py
+/tools/make_submission_by_area.py
+/tools/sweep_thresholds_by_area.py
+/submit_xf095_unetpp.sh
+/submit_xf095_wave_a.sh
+/submit_xf095_wave_b.sh
+/submit_xf095_wave_c.sh

@@ -110,7 +110,12 @@ def args_from_resolved(cfg, run_dir):
         use_fraction_film=model["use_fraction_film"],
         use_fraction_aux=model["use_fraction_aux"],
         token_calibration=model.get("token_calibration", False),
+        token_calibration_source_indices=model.get("token_calibration_source_indices"),
         attn_heads=model.get("attn_heads", 4),
+        token_in_source_attn=model.get("token_in_source_attn", False),
+        token_cross_source_attn=model.get("token_cross_source_attn", True),
+        pixel_noise_std=model.get("pixel_noise_std", 0.0),
+        n_head_replicas=model.get("n_head_replicas", 1),
         # loss
         weight_mae=train["weight_mae"],
         weight_presence_tversky=train["weight_presence_tversky"],
@@ -187,6 +192,11 @@ def build_loaded_model(args, n_channels, ckpt_path, device):
         use_fraction_aux=args.use_fraction_aux,
         attn_heads=args.attn_heads,
         token_calibration=args.token_calibration,
+        token_calibration_source_indices=getattr(args, "token_calibration_source_indices", None),
+        token_in_source_attn=getattr(args, "token_in_source_attn", False),
+        token_cross_source_attn=getattr(args, "token_cross_source_attn", True),
+        pixel_noise_std=getattr(args, "pixel_noise_std", 0.0),
+        n_head_replicas=getattr(args, "n_head_replicas", 1),
     )
     state = torch.load(ckpt_path, map_location="cpu")
     model.load_state_dict(state)

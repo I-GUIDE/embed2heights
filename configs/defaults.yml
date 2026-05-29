@@ -22,6 +22,7 @@ model:
   height_bin_max_m: 80.0
   lightunet_base_ch: 48
   lightunet_norm_kind: bn
+  pixel_backbone_kind: unet
   gate_mode: rich
   gate_untied: false
   gate_init_bias: 4.0
@@ -32,6 +33,7 @@ model:
   use_fraction_film: true
   use_fraction_aux: true
   token_proj_depth: 1
+  token_in_source_attn: false
 
 training:
   batch_size: 32

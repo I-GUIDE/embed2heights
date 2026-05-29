@@ -6,13 +6,21 @@ import torch.nn.functional as F
 from core.data.datasets import HEIGHT_NORM_CONSTANT
 
 
-def height_error(pred, target, *, kind, huber_delta):
-    """Elementwise height error under the configured regression loss."""
+def height_error(pred, target, *, kind, huber_delta, pinball_tau=0.5):
+    """Elementwise height error under the configured regression loss.
+
+    pinball: L_tau = max(tau*(target-pred), (tau-1)*(target-pred)).
+    With diff = pred - target this is max(-tau*diff, (1-tau)*diff).
+    tau > 0.5 penalizes under-estimate (diff<0) more than over-estimate.
+    """
     diff = pred - target
     if kind == "l1":
         return torch.abs(diff)
     if kind == "mse":
         return diff * diff
+    if kind == "pinball":
+        tau = float(pinball_tau)
+        return torch.where(diff <= 0, -tau * diff, (1.0 - tau) * diff)
 
     abs_diff = torch.abs(diff)
     delta = float(huber_delta)

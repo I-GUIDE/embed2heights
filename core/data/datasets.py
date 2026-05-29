@@ -73,6 +73,20 @@ def _crop_chw(array, top, left, height, width=None):
     return array[:, top:top + height, left:left + width]
 
 
+def _apply_d4(array, rot_k, mirror):
+    """Apply a D4 symmetry (rot ∈ {0..3} × mirror ∈ {True,False}) to a CHW
+    numpy array. Used for training-time geometric augmentation.
+    Both pixel images and tokens must share the same (rot_k, mirror) draw so
+    the spatial correspondence is preserved.
+    """
+    if rot_k:
+        array = np.rot90(array, k=rot_k, axes=(-2, -1))
+    if mirror:
+        array = np.flip(array, axis=-1)
+    # rot90/flip return non-contiguous views; copy so torch.from_numpy is happy
+    return np.ascontiguousarray(array)
+
+
 def _sample_or_center_origin(height, width, crop_size, is_train):
     if is_train:
         return (
@@ -208,12 +222,14 @@ class PixelTokenEmbeddingDataset(Dataset):
     patch_size=256, scale_factor=16.
     """
     def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True,
-                 token_normalization=None):
+                 token_normalization=None, d4_aug=False):
         self.patch_size = patch_size
         self.scale_factor = scale_factor
         self.is_train = is_train
         self.file_pairs = file_pairs
         self.token_normalization = token_normalization
+        # D4 dihedral augmentation: see PixelMultiTokenEmbeddingDataset doc.
+        self.d4_aug = bool(d4_aug)
 
     def __len__(self):
         return len(self.file_pairs)
@@ -273,6 +289,16 @@ class PixelTokenEmbeddingDataset(Dataset):
         target = _crop_chw(target, top_pix, left_pix, self.patch_size)
         valid_mask = _crop_chw(valid_mask, top_pix, left_pix, self.patch_size)
 
+        # D4 augmentation (training only). Same draw applied to pixel/token/target
+        # so spatial correspondence (and 16:1 token-pixel scale) is preserved.
+        if self.is_train and self.d4_aug:
+            rot_k = np.random.randint(0, 4)
+            mirror = bool(np.random.randint(0, 2))
+            pixel      = _apply_d4(pixel,      rot_k, mirror)
+            token      = _apply_d4(token,      rot_k, mirror)
+            target     = _apply_d4(target,     rot_k, mirror)
+            valid_mask = _apply_d4(valid_mask, rot_k, mirror)
+
         return (
             torch.from_numpy(pixel),
             torch.from_numpy(token),
@@ -292,12 +318,16 @@ class PixelMultiTokenEmbeddingDataset(Dataset):
     channel-concatenated token sources at 16x16.
     """
     def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True,
-                 token_normalization=None):
+                 token_normalization=None, d4_aug=False):
         self.patch_size = patch_size
         self.scale_factor = scale_factor
         self.is_train = is_train
         self.file_pairs = file_pairs
         self.token_normalization = token_normalization
+        # D4 dihedral augmentation: 8 orientations (4 rotations × {identity, mirror}).
+        # Applied AFTER cropping; pixel + token + target share the same draw so
+        # the 16:1 spatial correspondence is preserved. Training only.
+        self.d4_aug = bool(d4_aug)
 
     def __len__(self):
         return len(self.file_pairs)
@@ -368,6 +398,16 @@ class PixelMultiTokenEmbeddingDataset(Dataset):
         token = _crop_chw(token, top_emb, left_emb, emb_patch_size)
         target = _crop_chw(target, top_pix, left_pix, self.patch_size)
         valid_mask = _crop_chw(valid_mask, top_pix, left_pix, self.patch_size)
+
+        # D4 augmentation (training only). Same draw applied to pixel/token/target
+        # so spatial correspondence (and 16:1 token-pixel scale) is preserved.
+        if self.is_train and self.d4_aug:
+            rot_k = np.random.randint(0, 4)
+            mirror = bool(np.random.randint(0, 2))
+            pixel      = _apply_d4(pixel,      rot_k, mirror)
+            token      = _apply_d4(token,      rot_k, mirror)
+            target     = _apply_d4(target,     rot_k, mirror)
+            valid_mask = _apply_d4(valid_mask, rot_k, mirror)
 
         return (
             torch.from_numpy(pixel),

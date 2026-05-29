@@ -21,7 +21,7 @@ class ImprovedCompositeLoss(nn.Module):
     def __init__(self, weight_mae=1.0, weight_presence_tversky=1.0,
                  weight_fraction_mae=0.1, weight_height_boost=2.0,
                  bg_weight=0.05, aux_weight=0.25, loss_preset="presence_centered",
-                 height_loss_kind="l1", huber_delta=1.0,
+                 height_loss_kind="l1", huber_delta=1.0, pinball_tau=0.5,
                  build_height_boost=5.0, veg_height_boost=0.0,
                  aux_veg_weight=1.0, height_bin_aux_weight=0.0,
                  height_bin_sigma_bins=1.5, tversky_building_alpha=0.3,
@@ -33,8 +33,8 @@ class ImprovedCompositeLoss(nn.Module):
         super().__init__()
         if loss_preset != "presence_centered":
             raise ValueError("loss_preset must be presence_centered")
-        if height_loss_kind not in {"l1", "huber", "mse"}:
-            raise ValueError("height_loss_kind must be one of: l1, huber, mse")
+        if height_loss_kind not in {"l1", "huber", "mse", "pinball"}:
+            raise ValueError("height_loss_kind must be one of: l1, huber, mse, pinball")
         self.loss_preset = loss_preset
         self.ssim = SSIMLoss(window_size=11)
         self.gdl = GradientDifferenceLoss()
@@ -59,6 +59,7 @@ class ImprovedCompositeLoss(nn.Module):
 
         self.height_loss_kind = height_loss_kind
         self.huber_delta = float(huber_delta)
+        self.pinball_tau = float(pinball_tau)
         self.build_height_boost = float(build_height_boost)
         self.veg_height_boost = float(veg_height_boost)
         self.aux_veg_weight = float(aux_veg_weight)
@@ -79,6 +80,7 @@ class ImprovedCompositeLoss(nn.Module):
             target,
             kind=self.height_loss_kind,
             huber_delta=self.huber_delta,
+            pinball_tau=self.pinball_tau,
         )
 
     def _height_bin_ce(self, logits, target_norm, mask, log_centers):

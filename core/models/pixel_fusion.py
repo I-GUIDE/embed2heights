@@ -53,6 +53,38 @@ def _maybe_drop_modality(tes_feat, p, training):
     return tes_feat * keep / max(1e-6, 1.0 - p)
 
 
+def _maybe_drop_modality_symmetric(alpha_feat, tes_feat, p, training, alpha_share=0.5):
+    """At-most-one symmetric pixel-modality dropout.
+
+    With total probability p, drop EITHER alpha_feat OR tes_feat for each
+    sample. alpha_share controls the fraction of the drop budget allocated to
+    alpha (default 0.5 = even split).
+        p_alpha_drop = p * alpha_share        (e.g. p=0.2, share=0.25 → 0.05)
+        p_tes_drop   = p * (1 - alpha_share)  (e.g. p=0.2, share=0.25 → 0.15)
+    Per-sample uniform random in [0,1):
+        r < p * alpha_share         → drop alpha
+        p * alpha_share <= r < p    → drop tessera
+        r >= p                       → keep both
+    Never drops both. Inverted-dropout scale 1/(1-p) on kept paths preserves
+    expected value.
+
+    xf120 = symmetric_modality_dropout=0.2, alpha_share=0.5 (symmetric).
+    xf121 = symmetric_modality_dropout=0.2, alpha_share=0.25 (protects alpha,
+            drops tessera more often, since alpha+THOR drive water gate
+            polarization per project_xf095_new_sota).
+    """
+    if not training or p <= 0.0:
+        return alpha_feat, tes_feat
+    batch = alpha_feat.size(0)
+    r = torch.rand(batch, 1, 1, 1, device=alpha_feat.device)
+    p_alpha = p * float(alpha_share)
+    keep_alpha = (r >= p_alpha).float()
+    drop_tessera_band = (r >= p_alpha) & (r < p)
+    keep_tessera = (~drop_tessera_band).float()
+    scale = 1.0 / max(1e-6, 1.0 - p)
+    return alpha_feat * keep_alpha * scale, tes_feat * keep_tessera * scale
+
+
 class TesseraCompressionStem(nn.Module):
     def __init__(self, in_ch, out_ch=16, hidden_ch=None, hidden_depth=0):
         super().__init__()

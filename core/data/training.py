@@ -270,6 +270,20 @@ def build_training_dataset(dataset_cls, pairs, args, *, is_train, extra_kwargs=N
     }
     if extra_kwargs:
         dataset_kwargs.update(extra_kwargs)
+    # Only pass d4_aug to dataset classes that declare it AND only enable for
+    # training. Eval datasets always see d4_aug=False (handled by self.is_train
+    # gate inside __getitem__ anyway).
+    d4_aug = bool(getattr(args, "d4_aug", False)) and is_train
+    if d4_aug and "d4_aug" not in dataset_kwargs:
+        # Datasets that don't accept d4_aug will quietly raise during construction;
+        # only pass when the requested class supports it.
+        try:
+            import inspect
+            params = inspect.signature(dataset_cls).parameters
+            if "d4_aug" in params:
+                dataset_kwargs["d4_aug"] = d4_aug
+        except (TypeError, ValueError):
+            pass
     return dataset_cls(pairs, **dataset_kwargs)
 
 

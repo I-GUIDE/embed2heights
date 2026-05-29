@@ -82,6 +82,8 @@ def parse_args():
     parser.add_argument("--tta", default="none", choices=TTA_CHOICES,
                         help="Test-time augmentation mode. 'flip' uses identity + h/v flips; "
                              "'d4' uses rotations plus mirrored rotations.")
+    parser.add_argument("--token-normalization-stats-path", default=None,
+                        help="Override token z-score stats npz (default: <exp_dir>/token_channel_zscore_stats.npz).")
     return parser.parse_args()
 
 
@@ -150,9 +152,20 @@ def model_kwargs_from_run_config(cfg):
         "use_fraction_aux": cfg.get("use_fraction_aux", TRAIN_DEFAULTS["use_fraction_aux"]),
         "attn_heads": cfg.get("attn_heads", 4),
         "token_calibration": cfg.get("token_calibration", False),
+        "token_calibration_source_indices": cfg.get("token_calibration_source_indices", None),
+        "pixel_noise_std": cfg.get("pixel_noise_std", 0.0),
+        "n_head_replicas": cfg.get("n_head_replicas", 1),
+        "symmetric_modality_dropout": cfg.get("symmetric_modality_dropout", 0.0),
+        "symmetric_modality_dropout_alpha_share": cfg.get("symmetric_modality_dropout_alpha_share", 0.5),
         "use_additive": cfg.get("use_additive", True),
         "token_ctx_ch": cfg.get("token_ctx_ch", 96),
         "token_proj_depth": cfg.get("token_proj_depth", 1) or 1,
+        "token_in_source_attn": cfg.get("token_in_source_attn", False),
+        "token_cross_source_attn": cfg.get("token_cross_source_attn", True),
+        "height_from_pixel": cfg.get("height_from_pixel", False),
+        "feat_aggregation": cfg.get("feat_aggregation", "mean"),
+        "token_input_clamp": cfg.get("token_input_clamp", None),
+        "pixel_backbone_kind": cfg.get("pixel_backbone_kind", "unet"),
     }
 
 
@@ -268,9 +281,9 @@ def infer_channels_and_dataset(args, inputs):
     return n_channels, PixelEmbeddingDataset
 
 
-def load_token_normalization_from_run(exp_dir):
-    """Load token z-score stats saved by training, if present."""
-    stats_path = os.path.join(exp_dir, "token_channel_zscore_stats.npz")
+def load_token_normalization_from_run(exp_dir, override_path=None):
+    """Load token z-score stats saved by training, if present (or from override path)."""
+    stats_path = override_path or os.path.join(exp_dir, "token_channel_zscore_stats.npz")
     if not os.path.exists(stats_path):
         return None
     from core.data.training import _load_token_channel_zscore_stats
@@ -304,7 +317,9 @@ def main():
         inputs = inputs[:args.max_samples]
 
     n_channels, dataset_cls = infer_channels_and_dataset(args, inputs)
-    token_norm_stats = load_token_normalization_from_run(exp_dir)
+    token_norm_stats = load_token_normalization_from_run(
+        exp_dir, override_path=args.token_normalization_stats_path,
+    )
     test_ds = build_dataset(
         dataset_cls, inputs, args.patch_size,
         token_normalization=token_norm_stats,

@@ -22,8 +22,19 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 presence_head_depth=1, presence_branch_ch=None,
                 use_fraction_film=True, use_fraction_aux=None,
                 attn_heads=4, token_calibration=False, use_additive=True,
+                token_calibration_source_indices=None,
                 token_ctx_ch=96,
-                token_proj_depth=1):
+                token_proj_depth=1,
+                token_in_source_attn=False,
+                token_cross_source_attn=True,
+                pixel_noise_std=0.0,
+                n_head_replicas=1,
+                symmetric_modality_dropout=0.0,
+                symmetric_modality_dropout_alpha_share=0.5,
+                height_from_pixel=False,
+                feat_aggregation="mean",
+                token_input_clamp=None,
+                pixel_backbone_kind="unet"):
     selected = model_type.lower()
     if selected == "auto":
         selected = infer_model_type(n_channels)
@@ -56,9 +67,20 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
         use_fraction_aux=use_fraction_aux,
         attn_heads=attn_heads,
         token_calibration=token_calibration,
+        token_calibration_source_indices=token_calibration_source_indices,
         use_additive=use_additive,
         token_ctx_ch=token_ctx_ch,
         token_proj_depth=token_proj_depth,
+        token_in_source_attn=token_in_source_attn,
+        token_cross_source_attn=token_cross_source_attn,
+        pixel_noise_std=pixel_noise_std,
+        n_head_replicas=n_head_replicas,
+        symmetric_modality_dropout=symmetric_modality_dropout,
+        symmetric_modality_dropout_alpha_share=symmetric_modality_dropout_alpha_share,
+        height_from_pixel=height_from_pixel,
+        feat_aggregation=feat_aggregation,
+        token_input_clamp=token_input_clamp,
+        pixel_backbone_kind=pixel_backbone_kind,
     )
     if active is not None:
         return active

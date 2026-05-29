@@ -12,6 +12,7 @@ import torch.optim as optim
 
 from core.losses import ImprovedCompositeLoss
 from core.engine import (
+    ModelEMA,
     format_components,
     plot_loss_curve,
     run_epoch,
@@ -61,9 +62,21 @@ def build_active_model(args, n_channels):
         use_fraction_aux=args.use_fraction_aux,
         attn_heads=getattr(args, "attn_heads", 4),
         token_calibration=getattr(args, "token_calibration", False),
+        token_calibration_source_indices=getattr(
+            args, "token_calibration_source_indices", None),
         use_additive=getattr(args, "use_additive", True),
         token_ctx_ch=getattr(args, "token_ctx_ch", 96),
         token_proj_depth=getattr(args, "token_proj_depth", 1) or 1,
+        token_in_source_attn=getattr(args, "token_in_source_attn", False),
+        token_cross_source_attn=getattr(args, "token_cross_source_attn", True),
+        pixel_noise_std=getattr(args, "pixel_noise_std", 0.0),
+        n_head_replicas=getattr(args, "n_head_replicas", 1),
+        symmetric_modality_dropout=getattr(args, "symmetric_modality_dropout", 0.0),
+        symmetric_modality_dropout_alpha_share=getattr(args, "symmetric_modality_dropout_alpha_share", 0.5),
+        height_from_pixel=getattr(args, "height_from_pixel", False),
+        feat_aggregation=getattr(args, "feat_aggregation", "mean"),
+        token_input_clamp=getattr(args, "token_input_clamp", None),
+        pixel_backbone_kind=getattr(args, "pixel_backbone_kind", "unet"),
     )
 
 
@@ -77,6 +90,7 @@ def build_loss(args, device):
         loss_preset="presence_centered",
         height_loss_kind=args.height_loss_kind,
         huber_delta=args.huber_delta,
+        pinball_tau=getattr(args, "pinball_tau", 0.5),
         build_height_boost=args.build_height_boost,
         veg_height_boost=args.veg_height_boost,
         aux_veg_weight=args.aux_veg_weight,
@@ -100,6 +114,7 @@ def build_loss(args, device):
         f"aux_weight={args.aux_weight}, "
         f"height_loss_kind={args.height_loss_kind}, "
         f"huber_delta={args.huber_delta}, "
+        f"pinball_tau={getattr(args, 'pinball_tau', 0.5)}, "
         f"build_height_boost={args.build_height_boost}, "
         f"veg_height_boost={args.veg_height_boost}, "
         f"aux_veg_weight={args.aux_veg_weight}, "
@@ -127,6 +142,7 @@ def main():
     exp_dir = os.path.join(args.output_dir, args.experiment_name)
     best_model_path = os.path.join(exp_dir, "model_best.pth")
     last_model_path = os.path.join(exp_dir, "model_last.pth")
+    ema_model_path = os.path.join(exp_dir, "model_ema.pth")
     loss_curve_path = os.path.join(exp_dir, "loss_curve.png")
     loss_history_path = os.path.join(exp_dir, "loss_history.jsonl")
 
@@ -154,10 +170,29 @@ def main():
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=2
-    )
+    # ReduceLROnPlateau params are configurable so noisy training signals
+    # (e.g. d4 aug) can use a longer patience to avoid premature LR cascade.
+    # Or switch to cosine annealing for noisy regimes that need full-budget decay.
+    lr_scheduler_kind = str(getattr(args, "lr_scheduler", "plateau") or "plateau").lower()
+    if lr_scheduler_kind == "cosine":
+        eta_min = float(getattr(args, "lr_eta_min", 1e-5) or 1e-5)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=eta_min
+        )
+        print(f"LR scheduler: CosineAnnealingLR(T_max={args.epochs}, eta_min={eta_min})")
+    else:
+        lr_patience = int(getattr(args, "lr_patience", 2) or 2)
+        lr_factor = float(getattr(args, "lr_factor", 0.5) or 0.5)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=lr_factor, patience=lr_patience
+        )
+        print(f"LR scheduler: ReduceLROnPlateau(factor={lr_factor}, patience={lr_patience})")
     criterion = build_loss(args, device)
+
+    ema_decay = float(getattr(args, "ema_decay", 0.0) or 0.0)
+    ema = ModelEMA(model, ema_decay) if ema_decay > 0.0 else None
+    if ema is not None:
+        print(f"EMA enabled: decay={ema_decay}")
 
     print(f"Starting training on {device}...")
     train_losses, val_losses = [], []
@@ -172,6 +207,7 @@ def main():
             train=True, grad_accum_steps=grad_accum_steps, use_amp=use_amp,
             desc=f"Epoch {epoch + 1}/{args.epochs} [train]",
             deep_supervision_weight=ds_weight,
+            ema=ema,
         )
         val_loss, val_comp = run_epoch(
             model, val_loader, criterion, optimizer, scaler, device,
@@ -181,7 +217,10 @@ def main():
         )
         train_losses.append(tr_loss)
         val_losses.append(val_loss)
-        scheduler.step(val_loss)
+        if isinstance(scheduler, optim.lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(val_loss)
+        else:
+            scheduler.step()
         record = {
             "epoch": epoch + 1,
             "train_loss": tr_loss,
@@ -207,6 +246,9 @@ def main():
 
     print("--- 3. Saving ---")
     torch.save(state_dict_for_save(model), last_model_path)
+    if ema is not None:
+        torch.save(ema.state_dict(), ema_model_path)
+        print(f"   >> EMA weights saved to {ema_model_path}")
     plot_loss_curve(train_losses, val_losses, loss_curve_path, args.experiment_name)
     save_metrics_summary(
         exp_dir,

@@ -265,10 +265,33 @@ class MultiTaskPredictionHead(nn.Module):
         ], dim=1)
 
     def forward(self, x, return_aux=False, presence_extra=None,
-                water_bypass_x=None):
+                water_bypass_x=None, height_feature_x=None,
+                head_modulation=None):
         # Shared trunk with residual
         x = self.shared(x)
         x = self.shared_act(x + self.shared_res(x))
+        if head_modulation is not None:
+            gamma = head_modulation["gamma"]
+            beta = head_modulation["beta"]
+            add = head_modulation["add"]
+            gate = head_modulation["gate"]
+            x_norm = F.group_norm(
+                x.float(), _group_count(x.shape[1])
+            ).to(dtype=x.dtype)
+            x = x + gate * (gamma * x_norm + beta + add)
+
+        # Optional pixel-only bypass for the height path. When provided, the
+        # height trunk/projections consume a separate feature processed by the
+        # SAME shared weights, decoupling height regression from token-fused
+        # context. Presence / fraction / FiLM-conditioning logic still runs on
+        # the token-fused `x`. Motivated by xf107 height regression vs the
+        # pixel-only (alpha+tessera) baseline: token additive/FiLM residuals
+        # smooth high-frequency height detail while still boosting IoU.
+        if height_feature_x is not None:
+            x_height = self.shared(height_feature_x)
+            x_height = self.shared_act(x_height + self.shared_res(x_height))
+        else:
+            x_height = x
 
         # Optional water-only bypass: run the same shared trunk weights on a
         # parallel feature that did not see the TerraMind cross-level adapter,
@@ -312,9 +335,9 @@ class MultiTaskPredictionHead(nn.Module):
         if self.use_fraction_film and fractions is not None:
             scale = self.film_scale(fractions)
             shift = self.film_shift(fractions)
-            h = x * (1.0 + scale) + shift
+            h = x_height * (1.0 + scale) + shift
         else:
-            h = x
+            h = x_height
 
         if self.height_independent_branches:
             h_base = self.height_base_trunk(h)

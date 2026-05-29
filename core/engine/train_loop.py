@@ -27,7 +27,7 @@ def forward_for_training(model, imgs):
 
 def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
               grad_accum_steps=1, use_amp=False, desc="",
-              deep_supervision_weight=0.0):
+              deep_supervision_weight=0.0, ema=None):
     """Train or eval one epoch. Returns (avg_loss, component_avgs)."""
     model.train(train)
     running_loss = 0.0
@@ -38,11 +38,27 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
     if train:
         optimizer.zero_grad(set_to_none=True)
 
+    # Ablation toggles (mutually exclusive; ZERO_TOKENS takes precedence):
+    #   ZERO_TOKENS=1  -> token tensor replaced by zeros every step
+    #   NOISE_TOKENS=1 -> token tensor replaced by torch.randn_like(token) every step
+    # NOISE tests whether token's role is "per-branch symmetry breaker" — if any
+    # i.i.d. noise replicates xf107's val_loss advantage, tokens-as-information
+    # is not needed, only diversity. See project_zerotok_ablation.
+    zero_tokens = os.environ.get("ZERO_TOKENS", "0") == "1"
+    noise_tokens = os.environ.get("NOISE_TOKENS", "0") == "1"
+
     context = torch.enable_grad() if train else torch.no_grad()
     non_blocking = device.type == "cuda"
     with context:
         for step, (imgs, targets, masks) in enumerate(pbar, start=1):
             imgs = move_to_device(imgs, device, non_blocking=non_blocking)
+            if isinstance(imgs, (tuple, list)) and len(imgs) == 2:
+                if zero_tokens:
+                    pixel, token = imgs
+                    imgs = (pixel, torch.zeros_like(token))
+                elif noise_tokens:
+                    pixel, token = imgs
+                    imgs = (pixel, torch.randn_like(token))
             targets = targets.to(device, non_blocking=non_blocking)
             masks = masks.to(device, non_blocking=non_blocking)
 
@@ -82,6 +98,8 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
                     scaler.step(optimizer)
                     scaler.update()
                     optimizer.zero_grad(set_to_none=True)
+                    if ema is not None:
+                        ema.update(model)
 
             bs = batch_size_of(imgs)
             running_loss += loss.item() * bs

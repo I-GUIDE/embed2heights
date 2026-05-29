@@ -1,0 +1,81 @@
+name: xfusion_107_noisetok_fold0_seed0_ep100
+description: >
+  Extension of xf107_noisetok_fold0_seed0_ep25 to 100 epochs for direct Score
+  parity with xf107_noz_fold0_seed0_ep100 (0.5069). The ep25 noisetok had
+  val_loss 0.9096 (lower than xf107 ep25 0.9170), Score 0.4973. ep100 should
+  reveal whether random noise — at full training budget — matches or exceeds
+  xf107's real-token Score on fold_0. If yes: xf107 line's token input is
+  dead weight and can be replaced by randn at the data loader for 12 MB/sample
+  I/O savings without Score loss.
+reference: xfusion_107_noisetok_fold0_seed0_ep25
+
+data:
+  train_embeddings_dir: ${REPO_DIR}/../data/train/alphaearth_emb
+  secondary_train_embeddings_dir: ${REPO_DIR}/../data/train/tessera_emb
+  token_train_embeddings_dir: ${REPO_DIR}/../data/train/terramind_s1_emb
+  secondary_token_train_embeddings_dir: ${REPO_DIR}/../data/train/terramind_s2_emb
+  third_token_train_embeddings_dir: ${REPO_DIR}/../data/train/thor_s1_emb
+  fourth_token_train_embeddings_dir: ${REPO_DIR}/../data/train/thor_s2_emb
+  token_normalization: none
+  train_targets_dir: ${REPO_DIR}/../data/train/labels
+  split_file: ${REPO_DIR}/splits/group_code_5fold_seed42/fold_0/split.json
+  patch_size: 256
+
+model:
+  model_type: xfusion_unet_per_source_ensemble
+  lightunet_base_ch: 48
+  lightunet_norm_kind: bn
+  tessera_presence_ch: 0
+  tessera_hidden_ch: 96
+  tessera_hidden_depth: 2
+  height_specialist_depth: 1
+  height_gate_source: alpha
+  height_hidden_ch: 96
+  height_trunk_depth: 2
+  height_independent_branches: true
+  height_head_kind: linear
+  height_n_bins: 64
+  height_bin_max_m: 80.0
+  gate_mode: rich
+  gate_untied: false
+  gate_init_bias: 4.0
+  modality_dropout: 0.0
+  presence_head_kind: split_all
+  presence_head_depth: 1
+  presence_branch_ch: 48
+  use_fraction_aux: true
+  use_fraction_film: false
+  token_calibration: true
+  attn_heads: 4
+
+training:
+  batch_size: 8
+  epochs: 100
+  lr: 0.0002
+  weight_decay: 0.0001
+  seed: 0
+  grad_accum_steps: 2
+  weight_mae: 1.0
+  weight_presence_tversky: 1.0
+  weight_fraction_mae: 0.1
+  weight_height_boost: 2.0
+  aux_weight: 1.0
+  height_loss_kind: l1
+  huber_delta: 1.0
+  build_height_boost: 5.0
+  veg_height_boost: 1.5
+  aux_veg_weight: 1.0
+  height_bin_aux_weight: 0.0
+  height_bin_sigma_bins: 1.5
+  tversky_water_alpha: 0.3
+  water_empty_topk: 512
+  weight_water_empty_topk: 0.03
+  deep_supervision_weight: 0.5
+
+runtime:
+  experiment_name: xf107_noisetok_fold0_seed0_ep100
+  output_dir: ${REPO_DIR}/runs
+  amp: false
+  data_parallel: false
+  num_workers: 4
+  prefetch_factor: 1

@@ -103,3 +103,76 @@ class LightUNet(nn.Module):
     def forward(self, x, return_aux=False):
         x = self.forward_features(x)
         return self.head(x, return_aux=return_aux)
+
+
+class LightUNetPP(nn.Module):
+    """U-Net++ (nested) variant of LightUNet.
+
+    Same 4-level encoder (X^i_0 for i=0..3) and the same final-feature channel
+    width (base_ch) as LightUNet, so it is a drop-in replacement for any
+    backbone that consumes `forward_features(x)`. Decoder is densely nested:
+    every node X^i_j with j>0 fuses (j previous same-level outputs) with an
+    upsampled X^(i+1)_(j-1). The forward feature is X^0_3.
+    """
+
+    def __init__(self, n_channels, n_classes, base_ch=32, norm_kind="bn",
+                 presence_head_kind="shared", presence_head_depth=1,
+                 presence_branch_ch=None):
+        super().__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+        self.base_ch = base_ch
+        self.norm_kind = norm_kind
+        self.supports_aux_outputs = True
+
+        c = [base_ch, base_ch * 2, base_ch * 4, base_ch * 8]
+
+        # Column 0 = encoder.
+        self.x0_0 = DoubleConv(n_channels, c[0], norm_kind=norm_kind)
+        self.x1_0 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c[0], c[1], norm_kind=norm_kind))
+        self.x2_0 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c[1], c[2], norm_kind=norm_kind))
+        self.x3_0 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c[2], c[3], norm_kind=norm_kind))
+
+        # Up-projections feeding each X^i_j (j>=1): X^(i+1)_(j-1) -> c[i].
+        self.up0_1 = UpsampleBlock(c[1], c[0], norm_kind=norm_kind)
+        self.up1_1 = UpsampleBlock(c[2], c[1], norm_kind=norm_kind)
+        self.up2_1 = UpsampleBlock(c[3], c[2], norm_kind=norm_kind)
+        self.up0_2 = UpsampleBlock(c[1], c[0], norm_kind=norm_kind)
+        self.up1_2 = UpsampleBlock(c[2], c[1], norm_kind=norm_kind)
+        self.up0_3 = UpsampleBlock(c[1], c[0], norm_kind=norm_kind)
+
+        # Nested decoder convs. Input ch for X^i_j = (j+1)*c[i].
+        self.x0_1 = DoubleConv(2 * c[0], c[0], norm_kind=norm_kind)
+        self.x1_1 = DoubleConv(2 * c[1], c[1], norm_kind=norm_kind)
+        self.x2_1 = DoubleConv(2 * c[2], c[2], norm_kind=norm_kind)
+        self.x0_2 = DoubleConv(3 * c[0], c[0], norm_kind=norm_kind)
+        self.x1_2 = DoubleConv(3 * c[1], c[1], norm_kind=norm_kind)
+        self.x0_3 = DoubleConv(4 * c[0], c[0], norm_kind=norm_kind)
+
+        self.head = MultiTaskPredictionHead(
+            in_ch=c[0],
+            out_channels=n_classes,
+            presence_head_kind=presence_head_kind,
+            presence_head_depth=presence_head_depth,
+            presence_branch_ch=presence_branch_ch,
+        )
+
+    def forward_features(self, x):
+        x00 = self.x0_0(x)
+        x10 = self.x1_0(x00)
+        x20 = self.x2_0(x10)
+        x30 = self.x3_0(x20)
+
+        x01 = self.x0_1(torch.cat([x00, self.up0_1(x10)], dim=1))
+        x11 = self.x1_1(torch.cat([x10, self.up1_1(x20)], dim=1))
+        x21 = self.x2_1(torch.cat([x20, self.up2_1(x30)], dim=1))
+
+        x02 = self.x0_2(torch.cat([x00, x01, self.up0_2(x11)], dim=1))
+        x12 = self.x1_2(torch.cat([x10, x11, self.up1_2(x21)], dim=1))
+
+        x03 = self.x0_3(torch.cat([x00, x01, x02, self.up0_3(x12)], dim=1))
+        return x03
+
+    def forward(self, x, return_aux=False):
+        x = self.forward_features(x)
+        return self.head(x, return_aux=return_aux)
