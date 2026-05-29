@@ -28,7 +28,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
 
 from core.data.discovery import submission_id  # noqa: E402
 
-DEFAULT_TEST_DIR = Path("/u/dingqi2/workspace/esa/data/test/alphaearth_test_emb")
+DEFAULT_TEST_DIR = Path("/projects/bcrm/emb2height/data/test/alphaearth_test_emb")
 
 
 def parse_args():

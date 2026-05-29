@@ -1,0 +1,63 @@
+name: uw_gated_F
+description: >
+  Champion 2-modality recipe. AlphaEarth + Tessera gated trunk fusion
+  (simple GMU, gate_mode=simple). Moved score from 0.4644 → 0.5072
+  random-split val; 5-fold group-stratified mean 0.4999 ± 0.0147.
+  No flip/rotation augmentation (empirically hurts on this dataset).
+  Use ae_tessera_gated model type (= tessera_iou_fusion_gated internally).
+
+reference:
+  fasttrain_flags: "tessera_iou_fusion --fusion-mode gated_feature"
+  score_random_val: 0.5072
+  score_5fold_mean: 0.4999
+  score_5fold_std: 0.0147
+  score_worst_fold: 0.4766        # fold 0 — hardest, tracks leaderboard best
+  submission_thresholds:
+    building: 0.620
+    vegetation: 0.575
+    water: 0.875
+
+data:
+  train_embeddings_dir: /projects/bcrm/emb2height/data/train/alphaearth_emb
+  secondary_train_embeddings_dir: /projects/bcrm/emb2height/data/train/tessera_emb
+  train_targets_dir: /projects/bcrm/emb2height/data/train/labels
+  patch_size: 256
+  # split_file set per-fold by the SLURM script
+
+model:
+  model_type: ae_tessera_gated          # = tessera_iou_fusion_gated
+  tessera_presence_ch: 16
+  tessera_hidden_ch: 96
+  tessera_hidden_depth: 2
+  height_specialist_depth: 2
+  lightunet_base_ch: 48
+  gate_mode: simple                     # champion uses simple 1×1 gate, not rich MLP
+  gate_untied: false
+  gate_init_bias: 4.0                   # sigmoid(4)≈0.98 → AE-only at init
+  modality_dropout: 0.0
+
+training:
+  batch_size: 32
+  epochs: 30
+  lr: 0.0002
+  weight_decay: 0.0001
+  seed: 42                              # override per fold in SLURM script
+  loss_preset: presence_centered
+  aux_weight: 1.0
+  presence_tversky_weight: 1.0
+  fraction_mae_weight: 0.1
+  build_height_boost: 5.0
+  veg_height_boost: 1.5
+  aux_veg_weight: 1.0
+  iou_loss_kind: tversky
+  focal_gamma: 2.0
+  focal_alpha: 0.25
+  structure_weight: 2.0
+  height_loss_kind: l1
+  huber_delta: 1.0
+
+runtime:
+  compile: true                         # mode='default' — balanced, not max-autotune
+  amp: true
+  num_workers: 8
+  prefetch_factor: 2

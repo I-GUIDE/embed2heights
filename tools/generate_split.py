@@ -28,7 +28,8 @@ sys.path.insert(0, os.path.dirname(SCRIPT_DIR))
 
 from core.data.discovery import normalize_core_id  # noqa: E402
 
-DEFAULT_LABELS_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", "data", "train", "labels"))
+DATA_ROOT = "/projects/bcrm/emb2height/data"
+DEFAULT_LABELS_DIR = os.path.join(DATA_ROOT, "train", "labels")
 DEFAULT_OUTPUT_DIR = os.path.join(SCRIPT_DIR, "..", "splits")
 DEFAULT_VAL_RATIO = 0.2
 DEFAULT_SEED = 42
