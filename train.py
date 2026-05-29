@@ -164,6 +164,11 @@ def main():
     print("--- 2. Model Init ---")
     model, selected_model = build_active_model(args, n_channels)
     model = model.to(device)
+    if getattr(args, "compile", False) and device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+        model = model.to(memory_format=torch.channels_last)
+        model = torch.compile(model, mode="default")
+        print("torch.compile enabled (mode='default')")
     if args.data_parallel and device.type == "cuda" and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
     print(f"Using model: {selected_model} (input channels={n_channels})")

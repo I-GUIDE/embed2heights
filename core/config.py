@@ -167,6 +167,9 @@ def parse_args():
     p.add_argument("--prefetch-factor", type=int)
     p.add_argument("--seed", type=int)
     p.add_argument("--amp", action=argparse.BooleanOptionalAction)
+    p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
+                   help="Apply torch.compile(mode='default') + channels_last + high matmul "
+                        "precision for a balanced (~20-30%%) speedup. Requires PyTorch >= 2.0.")
     p.add_argument("--data-parallel", action=argparse.BooleanOptionalAction)
     p.add_argument("--freeze-except",
                    help="Freeze all params whose name does NOT contain this substring. "

@@ -334,6 +334,8 @@ def main():
     )
     model = model.to(device)
     sd = torch.load(model_path, map_location=device)
+    # Strip torch.compile's _orig_mod. prefix if the checkpoint was saved from a compiled model.
+    sd = {k.removeprefix("_orig_mod."): v for k, v in sd.items()}
     result = model.load_state_dict(sd, strict=False)
     if result.missing_keys:
         print(f"WARNING: missing keys in checkpoint: {result.missing_keys}")
