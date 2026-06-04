@@ -99,7 +99,7 @@ class TesseraTokenCrossLevelFusionLightUNet(nn.Module):
                  height_bin_max_m=80.0, token_fusion_kind="single",
                  fusion_points=("decoder64",), normalize_tokens=False,
                  presence_head_kind="split_all", presence_head_depth=2,
-                 presence_branch_ch=48, **unused):
+                 presence_branch_ch=48, height_norm_stats=None, **unused):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TesseraTokenCrossLevelFusionLightUNet assumes 4 output channels")
@@ -165,6 +165,7 @@ class TesseraTokenCrossLevelFusionLightUNet(nn.Module):
             presence_head_kind=presence_head_kind,
             presence_head_depth=presence_head_depth,
             presence_branch_ch=presence_branch_ch,
+            height_norm_stats=height_norm_stats,
         )
 
     def forward(self, x, return_aux=False):

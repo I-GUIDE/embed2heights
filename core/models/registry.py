@@ -43,7 +43,8 @@ def build_active_model(model_type, n_channels, n_classes, *,
                        modality_dropout=0.0,
                        presence_head_kind="shared",
                        presence_head_depth=1,
-                       presence_branch_ch=None):
+                       presence_branch_ch=None,
+                       height_norm_stats=None):
     selected = canonical_model_type(model_type)
     if selected not in ACTIVE_MODEL_TYPES:
         return None
@@ -55,6 +56,10 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 n_classes,
                 base_ch=lightunet_base_ch,
                 norm_kind=lightunet_norm_kind,
+                presence_head_kind=presence_head_kind,
+                presence_head_depth=presence_head_depth,
+                presence_branch_ch=presence_branch_ch,
+                height_norm_stats=height_norm_stats,
             ),
             selected,
         )
@@ -84,6 +89,7 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 presence_head_kind=presence_head_kind,
                 presence_head_depth=presence_head_depth,
                 presence_branch_ch=presence_branch_ch,
+                height_norm_stats=height_norm_stats,
             ),
             selected,
         )
@@ -116,6 +122,7 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 presence_head_kind="split_all",
                 presence_head_depth=2,
                 presence_branch_ch=48,
+                height_norm_stats=height_norm_stats,
             ),
             selected,
         )

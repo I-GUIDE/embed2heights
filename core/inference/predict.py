@@ -1,9 +1,9 @@
 """Model-forward helpers for inference and TTA."""
 
-import numpy as np
 import torch
 
 from core.data.datasets import HEIGHT_NORM_CONSTANT
+from core.data.height_stats import denormalize_height_numpy
 
 
 def input_channels(sample_img):
@@ -60,10 +60,13 @@ def predict_batch(model, img_batch, views):
     return torch.stack(preds, dim=0).mean(dim=0)
 
 
-def prediction_to_numpy(pred_tensor, *, thresholds=None):
+def prediction_to_numpy(pred_tensor, *, thresholds=None, height_norm_stats=None):
     """Convert a model output tensor to saved prediction layout."""
     pred = pred_tensor.cpu().numpy().astype(np.float32)
-    pred[3] = pred[3] * HEIGHT_NORM_CONSTANT
+    if height_norm_stats is not None:
+        pred[3] = denormalize_height_numpy(pred[3], height_norm_stats).astype(np.float32)
+    else:
+        pred[3] = pred[3] * HEIGHT_NORM_CONSTANT
 
     if thresholds is not None:
         for c, threshold in enumerate(thresholds):

@@ -19,7 +19,8 @@ def height_error(pred, target, *, kind, huber_delta):
     return torch.where(abs_diff <= delta, quadratic, linear)
 
 
-def height_bin_ce(logits, target_norm, mask, log_centers, sigma_bins):
+def height_bin_ce(logits, target_norm, mask, log_centers, sigma_bins, *,
+                  height_norm_stats=None):
     """Soft-target cross-entropy in log-height space."""
     if mask is None or torch.sum(mask) <= 0 or logits is None or log_centers is None:
         return torch.zeros(
@@ -28,7 +29,14 @@ def height_bin_ce(logits, target_norm, mask, log_centers, sigma_bins):
             dtype=logits.dtype if logits is not None else target_norm.dtype,
         )
 
-    log_target = torch.log1p(target_norm * 30.0)
+    from ..data.height_stats import denormalize_height_torch
+    from ..data.datasets import HEIGHT_NORM_CONSTANT
+
+    if height_norm_stats is not None:
+        meters = denormalize_height_torch(target_norm, height_norm_stats)
+    else:
+        meters = target_norm * HEIGHT_NORM_CONSTANT
+    log_target = torch.log1p(meters)
     centers = log_centers.to(logits.device, logits.dtype).view(1, -1, 1, 1)
     if log_centers.numel() >= 2:
         bin_width = float((log_centers[1] - log_centers[0]).item())

@@ -5,6 +5,8 @@ import rasterio
 import torch
 from torch.utils.data import Dataset
 
+from .height_stats import normalize_height_numpy
+
 
 HEIGHT_NORM_CONSTANT = 30.0
 
@@ -95,7 +97,7 @@ def pick_dataset_class(model_type, n_channels):
     return PixelEmbeddingDataset if is_pixel else LatentTokenDataset
 
 
-def _prepare_target(tar_path, image_shape, patch_size=None):
+def _prepare_target(tar_path, image_shape, patch_size=None, height_stats=None):
     if tar_path is not None:
         with rasterio.open(tar_path) as src:
             raw_target = clean_raster_array(src.read())
@@ -105,7 +107,11 @@ def _prepare_target(tar_path, image_shape, patch_size=None):
         height_valid = global_valid & ~ndsm_hole
         valid_mask = np.stack([global_valid, height_valid], axis=0).astype(np.float32)
         target = raw_target
-        target[3, :, :] = np.maximum(target[3, :, :], 0.0) / HEIGHT_NORM_CONSTANT
+        raw_h = np.maximum(target[3, :, :].astype(np.float64), 0.0)
+        if height_stats is not None:
+            target[3, :, :] = normalize_height_numpy(raw_h, height_stats).astype(np.float32)
+        else:
+            target[3, :, :] = (raw_h / HEIGHT_NORM_CONSTANT).astype(np.float32)
         return target, valid_mask
 
     h, w = image_shape if patch_size is None else (patch_size, patch_size)
@@ -119,9 +125,10 @@ class PixelEmbeddingDataset(Dataset):
     For pixel-level embeddings (AlphaEarth 64ch, Tessera 128ch).
     file_pairs: list of (emb_path, label_path) tuples, OR list of emb_path strings (label-free mode).
     """
-    def __init__(self, file_pairs, patch_size=128, is_train=True):
+    def __init__(self, file_pairs, patch_size=128, is_train=True, height_stats=None):
         self.patch_size = patch_size
         self.is_train = is_train
+        self.height_stats = height_stats
         if file_pairs and isinstance(file_pairs[0], str):
             self.file_pairs = [(p, None) for p in file_pairs]
         else:
@@ -135,7 +142,9 @@ class PixelEmbeddingDataset(Dataset):
 
         image = _read_raster(emb_path)
 
-        target, valid_mask = _prepare_target(tar_path, image.shape[1:])
+        target, valid_mask = _prepare_target(
+            tar_path, image.shape[1:], height_stats=self.height_stats
+        )
 
         image, target, valid_mask = _pad_pixel_training_tensors(
             image,
@@ -162,10 +171,11 @@ class MultiPixelEmbeddingDataset(Dataset):
       - (primary_emb_path, secondary_emb_path, label_path)
       - (primary_emb_path, secondary_emb_path) for label-free inference
     """
-    def __init__(self, file_pairs, patch_size=128, is_train=True):
+    def __init__(self, file_pairs, patch_size=128, is_train=True, height_stats=None):
         self.patch_size = patch_size
         self.is_train = is_train
         self.file_pairs = file_pairs
+        self.height_stats = height_stats
 
     def __len__(self):
         return len(self.file_pairs)
@@ -185,7 +195,9 @@ class MultiPixelEmbeddingDataset(Dataset):
 
         _assert_same_spatial(primary, secondary, primary_path, secondary_path, "Embedding")
         image = np.concatenate([primary, secondary], axis=0)
-        target, valid_mask = _prepare_target(tar_path, image.shape[1:])
+        target, valid_mask = _prepare_target(
+            tar_path, image.shape[1:], height_stats=self.height_stats
+        )
 
         image, target, valid_mask = _pad_pixel_training_tensors(
             image,
@@ -212,11 +224,13 @@ class MultiLatentTokenDataset(Dataset):
       - (primary_token_path, secondary_token_path, label_path)
       - (primary_token_path, secondary_token_path) for label-free inference
     """
-    def __init__(self, file_pairs, patch_size=256, scale_factor=16, is_train=True):
+    def __init__(self, file_pairs, patch_size=256, scale_factor=16, is_train=True,
+                 height_stats=None):
         self.patch_size = patch_size
         self.scale_factor = scale_factor
         self.is_train = is_train
         self.file_pairs = file_pairs
+        self.height_stats = height_stats
 
     def __len__(self):
         return len(self.file_pairs)
@@ -238,7 +252,10 @@ class MultiLatentTokenDataset(Dataset):
         image = np.concatenate([primary, secondary], axis=0)
         emb_patch_size = self.patch_size // self.scale_factor
 
-        target, valid_mask = _prepare_target(tar_path, image.shape[1:], patch_size=self.patch_size)
+        target, valid_mask = _prepare_target(
+            tar_path, image.shape[1:], patch_size=self.patch_size,
+            height_stats=self.height_stats,
+        )
 
         image = _pad_to_min_shape(image, (emb_patch_size, emb_patch_size), mode="reflect")
         target = _pad_to_min_shape(target, (self.patch_size, self.patch_size), mode="reflect")
@@ -279,11 +296,13 @@ class PixelTokenEmbeddingDataset(Dataset):
     AlphaEarth+Tessera concatenated at 256x256 and token_image is 768x16x16 for
     patch_size=256, scale_factor=16.
     """
-    def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True):
+    def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True,
+                 height_stats=None):
         self.patch_size = patch_size
         self.scale_factor = scale_factor
         self.is_train = is_train
         self.file_pairs = file_pairs
+        self.height_stats = height_stats
 
     def __len__(self):
         return len(self.file_pairs)
@@ -304,7 +323,10 @@ class PixelTokenEmbeddingDataset(Dataset):
 
         _assert_same_spatial(primary, secondary, primary_path, secondary_path, "Embedding")
         pixel = np.concatenate([primary, secondary], axis=0)
-        target, valid_mask = _prepare_target(tar_path, pixel.shape[1:], patch_size=self.patch_size)
+        target, valid_mask = _prepare_target(
+            tar_path, pixel.shape[1:], patch_size=self.patch_size,
+            height_stats=self.height_stats,
+        )
 
         emb_patch_size = self.patch_size // self.scale_factor
 
@@ -362,11 +384,13 @@ class PixelMultiTokenEmbeddingDataset(Dataset):
     is AlphaEarth+Tessera concatenated at 256x256 and token_image is
     [S1, S2] channel-concatenated at 16x16.
     """
-    def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True):
+    def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True,
+                 height_stats=None):
         self.patch_size = patch_size
         self.scale_factor = scale_factor
         self.is_train = is_train
         self.file_pairs = file_pairs
+        self.height_stats = height_stats
 
     def __len__(self):
         return len(self.file_pairs)
@@ -396,7 +420,10 @@ class PixelMultiTokenEmbeddingDataset(Dataset):
         )
         pixel = np.concatenate([primary, secondary], axis=0)
         token = np.concatenate([token_primary, token_secondary], axis=0)
-        target, valid_mask = _prepare_target(tar_path, pixel.shape[1:], patch_size=self.patch_size)
+        target, valid_mask = _prepare_target(
+            tar_path, pixel.shape[1:], patch_size=self.patch_size,
+            height_stats=self.height_stats,
+        )
 
         emb_patch_size = self.patch_size // self.scale_factor
 
@@ -444,10 +471,12 @@ class LatentTokenDataset(Dataset):
     For patch-level embeddings (TerraMind 768ch@16x16, THOR 768ch@16x16).
     file_pairs: list of (emb_path, label_path) tuples, OR list of emb_path strings (label-free mode).
     """
-    def __init__(self, file_pairs, patch_size=256, scale_factor=16, is_train=True):
+    def __init__(self, file_pairs, patch_size=256, scale_factor=16, is_train=True,
+                 height_stats=None):
         self.patch_size = patch_size
         self.scale_factor = scale_factor
         self.is_train = is_train
+        self.height_stats = height_stats
         if file_pairs and isinstance(file_pairs[0], str):
             self.file_pairs = [(p, None) for p in file_pairs]
         else:
@@ -462,7 +491,10 @@ class LatentTokenDataset(Dataset):
         image = _read_raster(emb_path)
 
         emb_patch_size = self.patch_size // self.scale_factor
-        target, valid_mask = _prepare_target(tar_path, image.shape[1:], patch_size=self.patch_size)
+        target, valid_mask = _prepare_target(
+            tar_path, image.shape[1:], patch_size=self.patch_size,
+            height_stats=self.height_stats,
+        )
 
         image = _pad_to_min_shape(image, (emb_patch_size, emb_patch_size), mode="reflect")
         target = _pad_to_min_shape(target, (self.patch_size, self.patch_size), mode="reflect")

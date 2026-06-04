@@ -1,9 +1,11 @@
 import math
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ..data.height_stats import normalize_height_numpy
 from .blocks import HEIGHT_NORM_CONSTANT, ConvGNAct, _group_count
 
 
@@ -45,7 +47,8 @@ class MultiTaskPredictionHead(nn.Module):
                  height_trunk_depth=2, height_independent_branches=False,
                  height_head_kind="linear", height_n_bins=64,
                  height_bin_max_m=80.0, presence_head_kind="shared",
-                 presence_head_depth=1, presence_branch_ch=None):
+                 presence_head_depth=1, presence_branch_ch=None,
+                 height_norm_stats=None):
         super().__init__()
         if out_channels != 4:
             raise ValueError("MultiTaskPredictionHead assumes 4 output channels")
@@ -63,6 +66,7 @@ class MultiTaskPredictionHead(nn.Module):
         presence_head_depth = max(1, int(presence_head_depth))
         presence_branch_ch = int(presence_branch_ch or hidden_ch)
         self._hidden_ch = hidden_ch
+        self.height_norm_stats = height_norm_stats
         self.presence_extra_ch = presence_extra_ch
         self.presence_head_kind = presence_head_kind
         self.presence_head_depth = presence_head_depth
@@ -211,15 +215,22 @@ class MultiTaskPredictionHead(nn.Module):
         self.height_vegetation_delta_proj = _specialist_head(self.height_specialist_depth)
 
         if self.height_head_kind == "softbin":
-            # Log-spaced bin centers, evenly partitioning log1p(meters) over
-            # [0, log1p(bin_max_m)]. expm1 brings them back to meters; dividing
-            # by HEIGHT_NORM_CONSTANT puts them in the model's normalized space
-            # so expectation matches the targets used by the loss.
+            # Log-spaced bin centers in meters; map to the same normalized
+            # height space as dataset targets (adaptive stats) or legacy m/30.
             log_max = math.log1p(self.height_bin_max_m)
             log_edges = torch.linspace(0.0, log_max, self.height_n_bins + 1)
             log_centers = 0.5 * (log_edges[:-1] + log_edges[1:])
             centers_m = torch.expm1(log_centers)
-            centers_norm = centers_m / HEIGHT_NORM_CONSTANT
+            if height_norm_stats is not None:
+                cnp = normalize_height_numpy(
+                    centers_m.detach().cpu().numpy().astype(np.float64),
+                    height_norm_stats,
+                )
+                centers_norm = torch.as_tensor(
+                    cnp, dtype=torch.float32, device=centers_m.device
+                )
+            else:
+                centers_norm = centers_m / HEIGHT_NORM_CONSTANT
             self.register_buffer("height_log_bin_centers", log_centers, persistent=False)
             self.register_buffer("height_bin_centers_norm", centers_norm, persistent=False)
         else:

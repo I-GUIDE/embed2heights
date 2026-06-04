@@ -24,7 +24,7 @@ class ImprovedCompositeLoss(nn.Module):
                  height_loss_kind="l1", huber_delta=1.0,
                  build_height_boost=5.0, veg_height_boost=0.0,
                  aux_veg_weight=1.0, height_bin_aux_weight=0.0,
-                 height_bin_sigma_bins=1.5):
+                 height_bin_sigma_bins=1.5, height_norm_stats=None):
         super().__init__()
         if loss_preset != "presence_centered":
             raise ValueError("loss_preset must be presence_centered")
@@ -52,6 +52,7 @@ class ImprovedCompositeLoss(nn.Module):
         self.aux_veg_weight = float(aux_veg_weight)
         self.height_bin_aux_weight = float(height_bin_aux_weight)
         self.height_bin_sigma_bins = float(height_bin_sigma_bins)
+        self.height_norm_stats = height_norm_stats
 
         self.task = "both"
         self.train_presence = True
@@ -75,6 +76,7 @@ class ImprovedCompositeLoss(nn.Module):
             mask,
             log_centers,
             sigma_bins=self.height_bin_sigma_bins,
+            height_norm_stats=self.height_norm_stats,
         )
 
     def forward(self, preds, targets, valid_mask=None):

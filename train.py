@@ -8,8 +8,12 @@ multi-baseline driver.
 """
 import os
 import json
+import glob
+import math
 import random
 import argparse
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import torch
 import torch.optim as optim
@@ -25,8 +29,17 @@ from core.data import (
     save_split, load_split,
 )
 from core.data.datasets import (
+    HEIGHT_NORM_CONSTANT,
     pick_dataset_class, MultiPixelEmbeddingDataset,
     MultiLatentTokenDataset, PixelTokenEmbeddingDataset, PixelMultiTokenEmbeddingDataset,
+)
+from core.data.height_stats import denormalize_height_numpy
+from core.metrics import (
+    append_patch_leaderboard_accumulators,
+    compute_weighted_score,
+    LABEL_THRESHOLD,
+    new_leaderboard_accumulator,
+    summarize_leaderboard_accumulator,
 )
 from core.losses import ImprovedCompositeLoss
 
@@ -359,6 +372,18 @@ def parse_args():
                    help="Use strict checkpoint loading for --init-from-pretrain. "
                         "Default is non-strict filtered loading, which ignores "
                         "pretraining-only reconstruction heads.")
+    p.add_argument("--legacy-height-norm", action="store_true",
+                   help="Use legacy target height = max(nDSM,0)/30 instead of adaptive "
+                        "train-split normalization (z-score / log1p).")
+    p.add_argument("--height-stats-max-pixels", type=int, default=None,
+                   help="Optional cap on train pixels when fitting height stats (memory/speed).")
+    p.add_argument("--leaderboard-topk", type=int, default=5,
+                   help="Keep this many checkpoints with highest val weighted_score under topk_pool/.")
+    p.add_argument("--val-pred-threshold", type=float, default=0.5,
+                   help="Prediction binarization for val leaderboard IoU metrics.")
+    p.add_argument("--val-thresholds", type=float, nargs=3, default=None,
+                   metavar=("BLD", "VEG", "WAT"),
+                   help="Per-class val pred thresholds for leaderboard IoU; overrides --val-pred-threshold.")
     return p.parse_args()
 
 
@@ -414,6 +439,10 @@ def resolve_loss_preset(args):
         "tessera_token_crosslevel_xattn_bottleneck",
         "tessera_token_crosslevel_xattn_decoder64",
         "tessera_token_crosslevel_xattn_bottleneck_decoder64",
+        "ae_only",
+        "ae_tessera_gated",
+        "xfusion_crosslevel",
+        "lightunet",
     }:
         return "presence_centered"
     return "current"
@@ -594,6 +623,37 @@ def make_dataloaders(args, device):
         if args.split_file:
             save_split(args.split_file, train_pairs, val_pairs)
 
+    height_stats = None
+    if not getattr(args, "legacy_height_norm", False):
+        from core.data.height_stats import (
+            collect_height_meters_from_label_pairs,
+            fit_height_regression_stats,
+            height_stats_path_for_exp,
+            save_height_stats,
+        )
+
+        exp_dir_pre = os.path.join(args.output_dir, args.experiment_name)
+        os.makedirs(exp_dir_pre, exist_ok=True)
+        stats_path = height_stats_path_for_exp(args.output_dir, args.experiment_name)
+        vals = collect_height_meters_from_label_pairs(
+            train_pairs,
+            max_pixels=getattr(args, "height_stats_max_pixels", None),
+            seed=args.seed,
+        )
+        if vals.size == 0:
+            print(
+                "WARN: No height pixels collected for stats; "
+                "falling back to legacy /30 normalization."
+            )
+        else:
+            height_stats = fit_height_regression_stats(vals)
+            save_height_stats(stats_path, height_stats)
+            print(
+                f"Height stats -> {stats_path} | transform={height_stats['transform']} "
+                f"mean={height_stats['mean']:.4f} std={height_stats['std']:.4f} "
+                f"(raw m: {height_stats['original_mean']:.2f} ± {height_stats['original_std']:.2f})"
+            )
+
     with rasterio.open(train_pairs[0][0]) as src:
         n_channels = src.count
     if args.secondary_token_train_embeddings_dir:
@@ -625,14 +685,32 @@ def make_dataloaders(args, device):
             DatasetCls = MultiPixelEmbeddingDataset if args.secondary_train_embeddings_dir else pick_dataset_class(args.model_type, n_channels)
 
     if DatasetCls.__name__ == "LatentTokenDataset":
-        train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, scale_factor=16, is_train=True)
-        val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, scale_factor=16, is_train=False)
+        train_ds = DatasetCls(
+            train_pairs, patch_size=args.patch_size, scale_factor=16, is_train=True,
+            height_stats=height_stats,
+        )
+        val_ds = DatasetCls(
+            val_pairs, patch_size=args.patch_size, scale_factor=16, is_train=False,
+            height_stats=height_stats,
+        )
     elif DatasetCls.__name__ in {"PixelTokenEmbeddingDataset", "PixelMultiTokenEmbeddingDataset", "MultiLatentTokenDataset"}:
-        train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, scale_factor=16, is_train=True)
-        val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, scale_factor=16, is_train=False)
+        train_ds = DatasetCls(
+            train_pairs, patch_size=args.patch_size, scale_factor=16, is_train=True,
+            height_stats=height_stats,
+        )
+        val_ds = DatasetCls(
+            val_pairs, patch_size=args.patch_size, scale_factor=16, is_train=False,
+            height_stats=height_stats,
+        )
     else:
-        train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, is_train=True)
-        val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, is_train=False)
+        train_ds = DatasetCls(
+            train_pairs, patch_size=args.patch_size, is_train=True,
+            height_stats=height_stats,
+        )
+        val_ds = DatasetCls(
+            val_pairs, patch_size=args.patch_size, is_train=False,
+            height_stats=height_stats,
+        )
 
     loader_kwargs = {
         "batch_size": args.batch_size,
@@ -657,7 +735,7 @@ def make_dataloaders(args, device):
     else:
         train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
     val_loader   = DataLoader(val_ds,   shuffle=False, **loader_kwargs)
-    return train_loader, val_loader, train_ds, val_ds, n_channels
+    return train_loader, val_loader, train_ds, val_ds, n_channels, height_stats
 
 
 def move_to_device(batch, device, non_blocking=False):
@@ -689,6 +767,103 @@ def state_dict_for_save(model):
     if isinstance(model, torch.nn.DataParallel):
         return model.module.state_dict()
     return model.state_dict()
+
+
+def val_leaderboard_pred_arg(args):
+    if getattr(args, "val_thresholds", None) is not None:
+        return tuple(args.val_thresholds)
+    return float(args.val_pred_threshold)
+
+
+def outputs_targets_to_numpy_meters(
+    outputs,
+    targets: torch.Tensor,
+    *,
+    height_norm_stats: Optional[Dict[str, Any]],
+) -> Tuple[np.ndarray, np.ndarray]:
+    if isinstance(outputs, dict):
+        t = outputs["out"]
+    else:
+        t = outputs
+    pred = t.detach().float().cpu().numpy()
+    lab = targets.detach().float().cpu().numpy()
+    b = pred.shape[0]
+    pred = pred.copy()
+    lab = lab.copy()
+    for i in range(b):
+        if height_norm_stats is not None:
+            pred[i, 3] = denormalize_height_numpy(pred[i, 3], height_norm_stats).astype(np.float32)
+            lab[i, 3] = denormalize_height_numpy(lab[i, 3], height_norm_stats).astype(np.float32)
+        else:
+            pred[i, 3] = (pred[i, 3] * HEIGHT_NORM_CONSTANT).astype(np.float32)
+            lab[i, 3] = (lab[i, 3] * HEIGHT_NORM_CONSTANT).astype(np.float32)
+    return pred, lab
+
+
+def _prune_topk_pool(topk_dir: str, keep_paths: List[str]) -> None:
+    keep_set = set(os.path.abspath(p) for p in keep_paths)
+    for path in glob.glob(os.path.join(topk_dir, "cand_*.pth")):
+        if os.path.abspath(path) not in keep_set:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def _append_topk_pool_checkpoint(
+    topk_dir: str,
+    all_pool_entries: List[Tuple[float, int, str]],
+    ws: float,
+    epoch: int,
+    state_dict,
+    k: int,
+) -> List[Tuple[float, int, str]]:
+    """Persist one candidate; retain only the global top-``k`` scores on disk."""
+    if k <= 0:
+        return all_pool_entries[:0]
+    os.makedirs(topk_dir, exist_ok=True)
+    ws_tag = f"{ws:.6f}".replace("-", "neg")
+    path = os.path.join(topk_dir, f"cand_e{epoch:04d}_ws{ws_tag}.pth")
+    torch.save(state_dict, path)
+    all_pool_entries.append((ws, epoch, path))
+    all_pool_entries.sort(key=lambda x: -x[0])
+    keep_paths = [p for _, _, p in all_pool_entries[:k]]
+    _prune_topk_pool(topk_dir, keep_paths)
+    all_pool_entries[:] = [(w, e, p) for w, e, p in all_pool_entries if os.path.isfile(p)]
+    all_pool_entries.sort(key=lambda x: -x[0])
+    return all_pool_entries[:k]
+
+
+def warn_if_missing_data_dirs(args) -> None:
+    """Warn when configured data directories are missing on this machine."""
+    checks = [
+        ("train_embeddings_dir", args.train_embeddings_dir),
+        ("train_targets_dir", args.train_targets_dir),
+    ]
+    if getattr(args, "secondary_train_embeddings_dir", None):
+        checks.append(("secondary_train_embeddings_dir", args.secondary_train_embeddings_dir))
+    if getattr(args, "token_train_embeddings_dir", None):
+        checks.append(("token_train_embeddings_dir", args.token_train_embeddings_dir))
+    if getattr(args, "secondary_token_train_embeddings_dir", None):
+        checks.append(
+            ("secondary_token_train_embeddings_dir", args.secondary_token_train_embeddings_dir)
+        )
+    for name, path in checks:
+        if path and not os.path.isdir(path):
+            print(f"WARN: {name} is missing or not a directory: {path}")
+    print(
+        f"Data roots: DATA_ROOT={DATA_ROOT} | "
+        f"default --train-embeddings-dir={DEFAULT_TRAIN_EMB} | "
+        f"default --train-targets-dir={DEFAULT_TRAIN_TAR}"
+    )
+    if os.path.isdir(DEFAULT_TRAIN_EMB):
+        print(f"  OK: default embeddings directory exists.")
+    else:
+        print(f"  WARN: default embeddings directory not found (override --train-embeddings-dir).")
+    if os.path.isdir(DEFAULT_TRAIN_TAR):
+        print(f"  OK: default labels directory exists.")
+    else:
+        print(f"  WARN: default labels directory not found (override --train-targets-dir).")
 
 
 def load_pretrain_weights(model, checkpoint_path, *, strict=False):
@@ -731,10 +906,13 @@ def load_pretrain_weights(model, checkpoint_path, *, strict=False):
     return result
 
 
-def save_experiment_config(exp_dir, args, device, use_amp):
+def save_experiment_config(exp_dir, args, device, use_amp, height_stats=None):
     os.makedirs(exp_dir, exist_ok=True)
     resolved_loss_preset = resolve_loss_preset(args)
     loss_lambdas = effective_loss_lambdas(args)
+    from core.data.height_stats import STATS_FILENAME
+
+    hstats_file = os.path.join(exp_dir, STATS_FILENAME) if height_stats else None
     cfg = {
         "experiment_name": args.experiment_name,
         "model_type":      args.model_type,
@@ -781,6 +959,10 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "building_smooth_erode_px": args.building_smooth_erode_px,
         "building_smooth_thr": args.building_smooth_thr,
         "task": args.task,
+        "legacy_height_norm": getattr(args, "legacy_height_norm", False),
+        "height_stats_max_pixels": getattr(args, "height_stats_max_pixels", None),
+        "height_regression_stats_file": hstats_file,
+        "height_norm_transform": height_stats["transform"] if height_stats else "legacy_divide_30",
         "lds_sampler": args.lds_sampler,
         "lds_bins":    args.lds_bins,
         "lds_sigma":   args.lds_sigma,
@@ -809,15 +991,38 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "optimizer":       "AdamW",
         "scheduler":       "ReduceLROnPlateau(factor=0.5, patience=2)",
         "grad_clip":       1.0,
+        "leaderboard_topk": getattr(args, "leaderboard_topk", 5),
+        "val_pred_threshold": getattr(args, "val_pred_threshold", 0.5),
+        "val_thresholds": (
+            list(getattr(args, "val_thresholds", None))
+            if getattr(args, "val_thresholds", None) is not None
+            else None
+        ),
     }
     with open(os.path.join(exp_dir, "training_params.json"), "w") as f:
         json.dump(cfg, f, indent=2)
     print(f"Created experiment folder: {exp_dir}")
 
 
-def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
-              grad_accum_steps=1, use_amp=False, desc=""):
+def run_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    scaler,
+    device,
+    *,
+    train,
+    grad_accum_steps=1,
+    use_amp=False,
+    desc="",
+    leaderboard_acc=None,
+    leaderboard_pred_thr=None,
+    leaderboard_label_thr: Optional[float] = None,
+    height_norm_stats=None,
+):
     """Train or eval one epoch. Returns (avg_loss, component_avgs)."""
+    label_thr = LABEL_THRESHOLD if leaderboard_label_thr is None else leaderboard_label_thr
     model.train(train)
     running_loss = 0.0
     component_sums = {}
@@ -867,6 +1072,19 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
             avg = running_loss / max(1, samples_seen)
             pbar.set_postfix(loss=f"{loss.item():.4f}", avg=f"{avg:.4f}")
 
+            if leaderboard_acc is not None and not train and leaderboard_pred_thr is not None:
+                pred_b, lab_b = outputs_targets_to_numpy_meters(
+                    outputs, targets, height_norm_stats=height_norm_stats
+                )
+                for ii in range(bs):
+                    append_patch_leaderboard_accumulators(
+                        pred_b[ii],
+                        lab_b[ii],
+                        pred_threshold=leaderboard_pred_thr,
+                        label_threshold=label_thr,
+                        acc=leaderboard_acc,
+                    )
+
     avg_loss = running_loss / max(1, samples_seen)
     comp_avg = {
         name: value / max(1, samples_seen)
@@ -906,6 +1124,7 @@ def plot_loss_curve(train_losses, val_losses, out_path, experiment_name):
 
 def main():
     args = parse_args()
+    warn_if_missing_data_dirs(args)
     device = select_device()
     seed_everything(args.seed)
     if device.type == "cuda":
@@ -913,17 +1132,23 @@ def main():
 
     exp_dir = os.path.join(args.output_dir, args.experiment_name)
     best_model_path = os.path.join(exp_dir, "model_best.pth")
+    best_model_ws_path = os.path.join(exp_dir, "model_best_ws.pth")
+    topk_dir = os.path.join(exp_dir, "topk_pool")
     last_model_path = os.path.join(exp_dir, "model_last.pth")
     loss_curve_path = os.path.join(exp_dir, "loss_curve.png")
     loss_history_path = os.path.join(exp_dir, "loss_history.jsonl")
 
+    os.makedirs(exp_dir, exist_ok=True)
+
     use_amp = args.amp and device.type == "cuda"
     grad_accum_steps = max(1, args.grad_accum_steps)
-    save_experiment_config(exp_dir, args, device, use_amp)
     open(loss_history_path, "w").close()
 
     print("--- 1. Data Setup ---")
-    train_loader, val_loader, train_ds, val_ds, n_channels = make_dataloaders(args, device)
+    train_loader, val_loader, train_ds, val_ds, n_channels, height_stats = make_dataloaders(
+        args, device
+    )
+    save_experiment_config(exp_dir, args, device, use_amp, height_stats=height_stats)
 
     print("--- 2. Model Init ---")
     model, selected_model = build_model(
@@ -947,6 +1172,7 @@ def main():
         gate_untied=args.gate_untied,
         gate_init_bias=args.gate_init_bias,
         modality_dropout=args.modality_dropout,
+        height_norm_stats=height_stats,
     )
     if args.init_from_pretrain:
         load_pretrain_weights(
@@ -990,6 +1216,7 @@ def main():
         aux_veg_weight=args.aux_veg_weight,
         height_bin_aux_weight=args.height_bin_aux_weight,
         height_bin_sigma_bins=args.height_bin_sigma_bins,
+        height_norm_stats=height_stats,
     ).to(device)
     print(
         "Using loss: "
@@ -1017,9 +1244,22 @@ def main():
         f"task={args.task}"
     )
 
+    val_lb_thr = val_leaderboard_pred_arg(args)
+    print(
+        f"Val leaderboard: pred_threshold={val_lb_thr} | GT label threshold={LABEL_THRESHOLD} | "
+        f"retain top {args.leaderboard_topk} checkpoints by val weighted_score in {topk_dir}/"
+    )
+    print(
+        "Checkpoints: lowest val loss -> model_best.pth | "
+        "highest val weighted_score -> model_best_ws.pth | "
+        f"top-{args.leaderboard_topk} weighted scores -> topk_pool/cand_*.pth"
+    )
+
     print(f"Starting training on {device}...")
     train_losses, val_losses = [], []
     best_val_loss = float("inf")
+    best_val_ws = float("-inf")
+    all_pool_entries: List[Tuple[float, int, str]] = []
 
     for epoch in range(args.epochs):
         tr_loss, tr_comp = run_epoch(
@@ -1027,11 +1267,19 @@ def main():
             train=True, grad_accum_steps=grad_accum_steps, use_amp=use_amp,
             desc=f"Epoch {epoch + 1}/{args.epochs} [train]",
         )
+        lb_acc = new_leaderboard_accumulator()
         val_loss, val_comp = run_epoch(
             model, val_loader, criterion, optimizer, scaler, device,
             train=False, use_amp=use_amp,
             desc=f"Epoch {epoch + 1}/{args.epochs} [val]",
+            leaderboard_acc=lb_acc,
+            leaderboard_pred_thr=val_lb_thr,
+            leaderboard_label_thr=LABEL_THRESHOLD,
+            height_norm_stats=height_stats,
         )
+        lb_metrics = summarize_leaderboard_accumulator(lb_acc)
+        val_ws, val_ws_parts = compute_weighted_score(lb_metrics)
+
         train_losses.append(tr_loss)
         val_losses.append(val_loss)
         scheduler.step(val_loss)
@@ -1039,6 +1287,19 @@ def main():
             "epoch": epoch + 1,
             "train_loss": tr_loss,
             "val_loss": val_loss,
+            "val_weighted_score": val_ws,
+            "val_score_parts": val_ws_parts,
+            "val_leaderboard_metrics": {
+                k: lb_metrics[k]
+                for k in (
+                    "iou_buildings",
+                    "iou_trees",
+                    "iou_water",
+                    "RMSE_building_height",
+                    "RMSE_vegetation_height",
+                    "n_samples",
+                )
+            },
             "train_components": tr_comp,
             "val_components": val_comp,
             "lr": optimizer.param_groups[0]["lr"],
@@ -1047,9 +1308,27 @@ def main():
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             torch.save(state_dict_for_save(model), best_model_path)
-            print(f"   >> New best val loss {best_val_loss:.4f} — saved.")
+            print(f"   >> New best val loss {best_val_loss:.4f} — saved model_best.pth")
 
-        print(f"Epoch {epoch + 1}/{args.epochs} | Train: {tr_loss:.4f} | Val: {val_loss:.4f}")
+        if math.isfinite(val_ws) and val_ws > best_val_ws:
+            best_val_ws = val_ws
+            torch.save(state_dict_for_save(model), best_model_ws_path)
+            print(f"   >> New best val weighted_score {best_val_ws:.4f} — saved model_best_ws.pth")
+
+        if math.isfinite(val_ws) and int(args.leaderboard_topk) > 0:
+            _append_topk_pool_checkpoint(
+                topk_dir,
+                all_pool_entries,
+                val_ws,
+                epoch + 1,
+                state_dict_for_save(model),
+                int(args.leaderboard_topk),
+            )
+
+        print(
+            f"Epoch {epoch + 1}/{args.epochs} | Train: {tr_loss:.4f} | "
+            f"Val loss: {val_loss:.4f} | Val weighted_score: {val_ws:.4f}"
+        )
         print(f"   >> Train raw: {format_components(tr_comp, RAW_COMPONENTS)}")
         print(f"   >> Train weighted: {format_components(tr_comp, WEIGHTED_COMPONENTS)}")
         print(f"   >> Val raw:   {format_components(val_comp, RAW_COMPONENTS)}")
@@ -1058,6 +1337,21 @@ def main():
     print("--- 3. Saving ---")
     torch.save(state_dict_for_save(model), last_model_path)
     plot_loss_curve(train_losses, val_losses, loss_curve_path, args.experiment_name)
+
+    k_final = min(int(args.leaderboard_topk), len(all_pool_entries))
+    manifest = [
+        {
+            "rank": i + 1,
+            "val_weighted_score": float(ws),
+            "epoch": int(ep),
+            "path": path,
+        }
+        for i, (ws, ep, path) in enumerate(all_pool_entries[:k_final])
+    ]
+    manifest_path = os.path.join(exp_dir, "topk_manifest.json")
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"Wrote top-{k_final} checkpoint manifest: {manifest_path}")
 
 
 if __name__ == "__main__":

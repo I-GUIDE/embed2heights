@@ -14,6 +14,7 @@ try:
 except ImportError:
     yaml = None
 
+from core.data.height_stats import load_height_stats
 from core.data.datasets import (
     MultiPixelEmbeddingDataset,
     PixelTokenEmbeddingDataset,
@@ -213,10 +214,18 @@ def infer_channels_and_dataset(args, inputs):
     return n_channels, pick_dataset_class(args.model_type or "auto", n_channels)
 
 
-def build_dataset(dataset_cls, inputs, patch_size):
+def build_dataset(dataset_cls, inputs, patch_size, *, height_stats=None):
     if dataset_cls.__name__ == "PixelTokenEmbeddingDataset":
-        return dataset_cls(inputs, patch_size=patch_size, scale_factor=16, is_train=False)
-    return dataset_cls(inputs, patch_size=patch_size, is_train=False)
+        return dataset_cls(
+            inputs,
+            patch_size=patch_size,
+            scale_factor=16,
+            is_train=False,
+            height_stats=height_stats,
+        )
+    return dataset_cls(
+        inputs, patch_size=patch_size, is_train=False, height_stats=height_stats
+    )
 
 
 def main():
@@ -231,19 +240,31 @@ def main():
     train_cfg, train_config_raw = load_training_config(exp_dir)
     model_type = args.model_type or train_cfg.get("model_type", "auto")
 
+    stats_path = train_cfg.get("height_regression_stats_file")
+    if stats_path and os.path.isfile(stats_path):
+        height_norm_stats = load_height_stats(stats_path)
+    else:
+        height_norm_stats = load_height_stats(
+            os.path.join(exp_dir, "height_regression_stats.pkl")
+        )
+    if train_cfg.get("legacy_height_norm"):
+        height_norm_stats = None
+
     inputs = resolve_inputs(args)
     if args.max_samples > 0:
         inputs = inputs[:args.max_samples]
 
     n_channels, dataset_cls = infer_channels_and_dataset(args, inputs)
-    test_ds = build_dataset(dataset_cls, inputs, args.patch_size)
+    test_ds = build_dataset(
+        dataset_cls, inputs, args.patch_size, height_stats=height_norm_stats
+    )
     sample_img, _, _ = test_ds[0]
 
     model, selected_model = build_model(
         model_type,
         n_channels=input_channels(sample_img),
         n_classes=4,
-        **model_kwargs_from_run_config(train_cfg),
+        **{**model_kwargs_from_run_config(train_cfg), "height_norm_stats": height_norm_stats},
     )
     model = model.to(device)
     raw_sd = torch.load(model_path, map_location=device)
@@ -282,6 +303,7 @@ def main():
             pred = prediction_to_numpy(
                 predict_batch(model, img_batch, views),
                 thresholds=args.thresholds,
+                height_norm_stats=height_norm_stats,
             )
 
             emb_path = test_ds.file_pairs[i][0]

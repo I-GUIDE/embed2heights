@@ -38,6 +38,7 @@ Thumbs.db
 
 # logs
 # logs/train/*
+slurm_logs/
 submission/
 .claude
 .codex
