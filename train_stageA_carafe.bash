@@ -1,29 +1,26 @@
 #!/bin/bash
-#SBATCH --job-name=emb2h_arch
+#SBATCH --job-name=emb2h_carafe
 #SBATCH --output=slurm_logs/%x_%A_%a.out
 #SBATCH --error=slurm_logs/%x_%A_%a.err
-#SBATCH --time=03:00:00
+#SBATCH --time=02:30:00
 #SBATCH --mem=64G
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --partition=gpu,gpu_a100
 #SBATCH --gres=gpu:1
-#SBATCH --array=0-4
+#SBATCH --array=0          # single fold for a cheap A/B check; set 0-4 for all folds
+
+# Stage-A ablation: uw_gated_F champion recipe with the ONLY change being the
+# decoder upsampler (bilinear -> CARAFE). Everything else is byte-identical to
+# train.bash, so any leaderboard movement is attributable to Stage A alone.
 #
-# SoTA-shortcut architecture experiment, layered on the uw_gated_F champion
-# (ae_tessera_gated, presence_centered, no-aug). Differences vs train.bash:
+#   Baseline : uw_gated_F_fold0        (train.bash, --upsample-kind bilinear default)
+#   This run : uw_gated_F_carafe_fold0 (only adds --upsample-kind carafe)
 #
-#   Stage A  --upsample-kind carafe            sharper decoder boundaries
-#                                              -> building IoU + edge height RMSE
-#   Stage C  --height-head-kind softbin        ordinal/binned height regression
-#            --height-bin-aux-weight 0.5        bin-CE aux forces bin commitment
-#            --height-loss-kind pinball         quantile height loss
-#            --pinball-tau 0.75                 penalize under-prediction (DSM)
-#   Stage B  --height-independent-branches      decouple base/build/veg heights
-#            --uncertainty-weighting            auto-balance presence vs height
+# Compare with: python evaluate.py over both runs' predictions, or the
+# in-training val leaderboard score (topk_pool / training logs).
 #
-# Ablate one stage at a time to attribute leaderboard movement. Start from
-# Stage A alone (lowest risk), then add C, then B.
+# To try DySample instead, change carafe -> dysample below (cheaper, ~0 params).
 
 SCRIPT_DIR="/projects/bcrm/akhot2/embed2heights_max"
 DATA_DIR="/projects/bcrm/emb2height/data/train"
@@ -33,8 +30,13 @@ cd "$SCRIPT_DIR"
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 FOLD=$SLURM_ARRAY_TASK_ID
+EXP="uw_gated_F_carafe_fold${FOLD}"
 SPLIT="${SPLITS_ROOT}/fold_${FOLD}/split.json"
-EXP="arch_carafe_softbin_pinball_fold${FOLD}"
+
+echo "========================================"
+echo "Stage-A ablation (CARAFE) | fold=$FOLD  exp=$EXP"
+echo "Node: $(hostname) | GPU: $CUDA_VISIBLE_DEVICES"
+echo "========================================"
 
 python train.py \
     --experiment-name "$EXP" \
@@ -59,17 +61,14 @@ python train.py \
     --lightunet-base-ch 48 \
     --gate-mode simple \
     --upsample-kind carafe \
-    --height-head-kind softbin \
-    --height-n-bins 64 \
-    --height-bin-max-m 80.0 \
-    --height-bin-aux-weight 0.5 \
-    --height-loss-kind pinball \
-    --pinball-tau 0.75 \
+    --height-loss-kind l1 \
+    --huber-delta 1.0 \
     --build-height-boost 5.0 \
     --veg-height-boost 1.5 \
     --aux-veg-weight 1.0 \
-    --height-independent-branches \
-    --uncertainty-weighting \
+    --iou-loss-kind tversky \
+    --focal-gamma 2.0 \
+    --focal-alpha 0.25 \
     --structure-weight 2.0 \
     --compile \
     --seed 42
