@@ -2,13 +2,13 @@
 #SBATCH --job-name=emb2h_arch
 #SBATCH --output=slurm_logs/%x_%A_%a.out
 #SBATCH --error=slurm_logs/%x_%A_%a.err
-#SBATCH --time=03:00:00
+#SBATCH --time=04:00:00
 #SBATCH --mem=64G
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --partition=gpu,gpu_a100
 #SBATCH --gres=gpu:1
-#SBATCH --array=0-4
+#SBATCH --array=0          # single fold for the 4-way comparison; set 0-4 for all folds
 #
 # SoTA-shortcut architecture experiment, layered on the uw_gated_F champion
 # (ae_tessera_gated, presence_centered, no-aug). Differences vs train.bash:
@@ -25,11 +25,13 @@
 # Ablate one stage at a time to attribute leaderboard movement. Start from
 # Stage A alone (lowest risk), then add C, then B.
 
-SCRIPT_DIR="/projects/bcrm/akhot2/embed2heights_max"
+SCRIPT_DIR="/u/wz53/emb2height_warehouse/embed2heights_max"
 DATA_DIR="/projects/bcrm/emb2height/data/train"
 SPLITS_ROOT="${SCRIPT_DIR}/splits/group_code_5fold_seed42"
 
 cd "$SCRIPT_DIR"
+source /u/wz53/miniconda3/etc/profile.d/conda.sh
+conda activate pytorch_env
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
 FOLD=$SLURM_ARRAY_TASK_ID
