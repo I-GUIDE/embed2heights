@@ -298,6 +298,11 @@ def parse_args():
     p.add_argument("--height-trunk-depth", type=int, default=2,
                    help="Number of ConvGNAct blocks in the height trunk. Default 2 "
                         "matches legacy behavior.")
+    p.add_argument("--building-boundary-weight", type=float, default=0.0,
+                   help="Stage D: weight on an auxiliary building-boundary head "
+                        "(BCE+Dice on the morphological-gradient ring of building "
+                        "footprints). >0 builds the head and adds the loss; 0 = off "
+                        "(no extra params, legacy behavior). Targets building IoU.")
     p.add_argument("--uncertainty-weighting", action="store_true",
                    help="Balance the presence/segmentation vs height loss groups "
                         "with learned homoscedastic uncertainty (Kendall & Gal) "
@@ -972,6 +977,8 @@ def save_experiment_config(exp_dir, args, device, use_amp, height_stats=None):
         "height_trunk_depth": args.height_trunk_depth,
         "height_independent_branches": args.height_independent_branches,
         "uncertainty_weighting": args.uncertainty_weighting,
+        "building_boundary_weight": args.building_boundary_weight,
+        "use_boundary_head": (args.building_boundary_weight > 0),
         "height_head_kind": args.height_head_kind,
         "height_n_bins": args.height_n_bins,
         "height_bin_max_m": args.height_bin_max_m,
@@ -1198,6 +1205,7 @@ def main():
         modality_dropout=args.modality_dropout,
         height_norm_stats=height_stats,
         upsample_kind=args.upsample_kind,
+        use_boundary_head=(args.building_boundary_weight > 0),
     )
     if args.init_from_pretrain:
         load_pretrain_weights(
@@ -1242,6 +1250,7 @@ def main():
         height_bin_sigma_bins=args.height_bin_sigma_bins,
         height_norm_stats=height_stats,
         use_uncertainty_weighting=args.uncertainty_weighting,
+        building_boundary_weight=args.building_boundary_weight,
     ).to(device)
     # Optimizer includes the criterion's learnable parameters (the uncertainty
     # log-variances) in a no-weight-decay group — decaying a log-variance would

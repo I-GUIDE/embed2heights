@@ -186,7 +186,7 @@ class LightUNet(nn.Module):
     def __init__(self, n_channels, n_classes, base_ch=32, norm_kind="bn",
                  presence_head_kind="shared", presence_head_depth=1,
                  presence_branch_ch=None, height_norm_stats=None,
-                 upsample_kind="bilinear"):
+                 upsample_kind="bilinear", use_boundary_head=False):
         super().__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
@@ -217,6 +217,7 @@ class LightUNet(nn.Module):
             presence_head_depth=presence_head_depth,
             presence_branch_ch=presence_branch_ch,
             height_norm_stats=height_norm_stats,
+            use_boundary_head=use_boundary_head,
         )
 
     def forward_features(self, x):

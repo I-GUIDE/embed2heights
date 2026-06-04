@@ -48,7 +48,7 @@ class MultiTaskPredictionHead(nn.Module):
                  height_head_kind="linear", height_n_bins=64,
                  height_bin_max_m=80.0, presence_head_kind="shared",
                  presence_head_depth=1, presence_branch_ch=None,
-                 height_norm_stats=None):
+                 height_norm_stats=None, use_boundary_head=False):
         super().__init__()
         if out_channels != 4:
             raise ValueError("MultiTaskPredictionHead assumes 4 output channels")
@@ -160,6 +160,20 @@ class MultiTaskPredictionHead(nn.Module):
                 })
         else:
             self.presence_delta_head = None
+
+        # --- Building boundary auxiliary head (Stage D) ---
+        # Predicts the 1-px ring around building footprints off the shared trunk.
+        # Auxiliary only (NOT submitted); supervised by a morphological-gradient
+        # target + BCE/Dice in core.losses. Sharpening building edges is the
+        # most direct lever on building IoU. Off by default -> no extra params.
+        self.use_boundary_head = bool(use_boundary_head)
+        if self.use_boundary_head:
+            self.boundary_head = nn.Sequential(
+                ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
+                nn.Conv2d(hidden_ch, 1, 1),
+            )
+        else:
+            self.boundary_head = None
 
         # --- FiLM conditioning: soft fractions modulate height features ---
         self.film_scale = nn.Conv2d(3, hidden_ch, 1)
@@ -386,6 +400,8 @@ class MultiTaskPredictionHead(nn.Module):
             "height_building": building_height,
             "height_vegetation": vegetation_height,
         }
+        if self.boundary_head is not None:
+            aux["building_boundary_logits"] = self.boundary_head(x)
         if self.height_head_kind == "softbin":
             aux["height_base_logits"] = base_logits
             aux["height_building_logits"] = building_logits

@@ -25,7 +25,8 @@ class ImprovedCompositeLoss(nn.Module):
                  build_height_boost=5.0, veg_height_boost=0.0,
                  aux_veg_weight=1.0, height_bin_aux_weight=0.0,
                  height_bin_sigma_bins=1.5, height_norm_stats=None,
-                 pinball_tau=0.5, use_uncertainty_weighting=False):
+                 pinball_tau=0.5, use_uncertainty_weighting=False,
+                 building_boundary_weight=0.0):
         super().__init__()
         if loss_preset != "presence_centered":
             raise ValueError("loss_preset must be presence_centered")
@@ -54,6 +55,7 @@ class ImprovedCompositeLoss(nn.Module):
         self.aux_veg_weight = float(aux_veg_weight)
         self.height_bin_aux_weight = float(height_bin_aux_weight)
         self.height_bin_sigma_bins = float(height_bin_sigma_bins)
+        self.building_boundary_weight = float(building_boundary_weight)
         self.height_norm_stats = height_norm_stats
 
         # Homoscedastic-uncertainty multi-task weighting (Kendall & Gal, CVPR'18).
@@ -97,6 +99,27 @@ class ImprovedCompositeLoss(nn.Module):
             sigma_bins=self.height_bin_sigma_bins,
             height_norm_stats=self.height_norm_stats,
         )
+
+    def _building_boundary_loss(self, logits, building_target, mask):
+        """BCE + soft-Dice on the 1-px ring around building footprints.
+
+        The target is the morphological gradient (dilation - erosion) of the
+        building presence mask, computed on the fly from the label. Dice
+        balances the heavy edge/non-edge class imbalance that would otherwise
+        collapse plain BCE to all-zero.
+        """
+        m = (building_target > 0).float()
+        dil = F.max_pool2d(m, 3, stride=1, padding=1)
+        ero = 1.0 - F.max_pool2d(1.0 - m, 3, stride=1, padding=1)
+        boundary = (dil - ero).clamp(0.0, 1.0)
+        valid = mask
+        bce = F.binary_cross_entropy_with_logits(logits, boundary, reduction="none")
+        bce = torch.sum(bce * valid) / (torch.sum(valid) + 1e-6)
+        prob = torch.sigmoid(logits) * valid
+        bt = boundary * valid
+        inter = torch.sum(prob * bt)
+        dice = 1.0 - (2.0 * inter + 1.0) / (torch.sum(prob) + torch.sum(bt) + 1.0)
+        return bce + dice
 
     def forward(self, preds, targets, valid_mask=None):
         """
@@ -311,6 +334,22 @@ class ImprovedCompositeLoss(nn.Module):
             if self.train_height:
                 height_group = height_group + self.height_bin_aux_weight * height_bin_ce_loss
 
+        # Building boundary auxiliary (Stage D): segmentation/IoU term.
+        building_boundary_loss = zero
+        if (self.building_boundary_weight > 0
+                and aux_outputs is not None
+                and "building_boundary_logits" in aux_outputs):
+            building_boundary_loss = self._building_boundary_loss(
+                aux_outputs["building_boundary_logits"],
+                targets[:, 0:1, :, :],
+                global_mask,
+            )
+            if self.train_presence:
+                presence_group = (
+                    presence_group
+                    + self.building_boundary_weight * building_boundary_loss
+                )
+
         # Combine task groups. Uncertainty weighting (Kendall & Gal): scale each
         # group by its learned precision exp(-s) and add a 0.5*s regularizer
         # (s = log variance). Off by default -> plain sum, identical to legacy.
@@ -355,6 +394,7 @@ class ImprovedCompositeLoss(nn.Module):
             "weighted_height_bin_ce": w_bince * height_bin_ce_loss,
             "presence_group": presence_group,
             "height_group": height_group,
+            "building_boundary": building_boundary_loss,
         }
         if self.use_uncertainty_weighting:
             components["uw_log_var_presence"] = self.log_var_presence.detach()
