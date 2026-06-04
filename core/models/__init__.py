@@ -24,7 +24,14 @@ from .blocks import (
     ConvNeXtBlock,
     _group_count,
 )
-from .backbones import DoubleConv, LightUNet, UpsampleBlock, _light_norm
+from .backbones import (
+    CARAFEUpsample,
+    DoubleConv,
+    DySampleUpsample,
+    LightUNet,
+    UpsampleBlock,
+    _light_norm,
+)
 from .heads import MultiTaskPredictionHead
 from .pixel_fusion import (
     TesseraCompressionStem,
@@ -44,10 +51,12 @@ __all__ = [
     "ACTIVE_MODEL_ALIASES",
     "ACTIVE_MODEL_TYPES",
     "ASPP",
+    "CARAFEUpsample",
     "ChannelCalibration",
     "ConvGNAct",
     "ConvNeXtBlock",
     "DoubleConv",
+    "DySampleUpsample",
     "GatedTokenScaleResidual",
     "HEIGHT_NORM_CONSTANT",
     "LightUNet",

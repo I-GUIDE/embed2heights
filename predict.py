@@ -128,6 +128,7 @@ def model_kwargs_from_run_config(cfg):
         ),
         "lightunet_base_ch": cfg.get("lightunet_base_ch", default_base_ch),
         "lightunet_norm_kind": cfg.get("lightunet_norm_kind", TRAIN_DEFAULTS["lightunet_norm_kind"]),
+        "upsample_kind": cfg.get("upsample_kind", TRAIN_DEFAULTS.get("upsample_kind", "bilinear")),
         "height_head_kind": cfg.get("height_head_kind", TRAIN_DEFAULTS["height_head_kind"]),
         "height_n_bins": cfg.get("height_n_bins", TRAIN_DEFAULTS["height_n_bins"]),
         "height_bin_max_m": cfg.get("height_bin_max_m", TRAIN_DEFAULTS["height_bin_max_m"]),

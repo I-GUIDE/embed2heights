@@ -20,7 +20,7 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 gate_mode="simple", gate_untied=False, gate_init_bias=4.0,
                 modality_dropout=0.0, presence_head_kind="shared",
                 presence_head_depth=1, presence_branch_ch=None,
-                height_norm_stats=None):
+                height_norm_stats=None, upsample_kind="bilinear"):
     selected = model_type.lower()
     if selected == "auto":
         selected = infer_model_type(n_channels)
@@ -50,6 +50,7 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
         presence_head_depth=presence_head_depth,
         presence_branch_ch=presence_branch_ch,
         height_norm_stats=height_norm_stats,
+        upsample_kind=upsample_kind,
     )
     if active is not None:
         return active
