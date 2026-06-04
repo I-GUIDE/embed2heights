@@ -275,6 +275,16 @@ def parse_args():
                         "an SSL pretrain checkpoint that was produced with GN — "
                         "BN running stats do not transfer cleanly from "
                         "label-free pretraining to the supervised regime.")
+    p.add_argument("--backbone-kind", default="lightunet",
+                   choices=["lightunet", "hrnet"],
+                   help="Stage E: pixel-stream feature extractor. 'lightunet' = "
+                        "legacy U-Net (default). 'hrnet' = compact HRNet that keeps "
+                        "a high-resolution branch throughout (better building IoU / "
+                        "spatial precision). Inference rebuilds from the recorded "
+                        "value in training_params.json.")
+    p.add_argument("--hrnet-width", type=int, default=18,
+                   help="Width of HRNet's highest-resolution branch (W); branches "
+                        "scale as W,2W,4W,8W. Only used with --backbone-kind hrnet.")
     p.add_argument("--upsample-kind", default="bilinear",
                    choices=["bilinear", "pixelshuffle", "carafe", "dysample"],
                    help="Decoder upsampler inside LightUNet. 'bilinear' = legacy "
@@ -1002,6 +1012,8 @@ def save_experiment_config(exp_dir, args, device, use_amp, height_stats=None):
         "init_pretrain_strict": args.init_pretrain_strict,
         "lightunet_base_ch":   args.lightunet_base_ch,
         "lightunet_norm_kind": args.lightunet_norm_kind,
+        "backbone_kind":       args.backbone_kind,
+        "hrnet_width":         args.hrnet_width,
         "upsample_kind":       args.upsample_kind,
         "gate_mode":           args.gate_mode,
         "gate_untied":         args.gate_untied,
@@ -1206,6 +1218,8 @@ def main():
         height_norm_stats=height_stats,
         upsample_kind=args.upsample_kind,
         use_boundary_head=(args.building_boundary_weight > 0),
+        backbone_kind=args.backbone_kind,
+        hrnet_width=args.hrnet_width,
     )
     if args.init_from_pretrain:
         load_pretrain_weights(

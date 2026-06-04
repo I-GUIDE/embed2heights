@@ -33,6 +33,7 @@ from .backbones import (
     _light_norm,
 )
 from .heads import MultiTaskPredictionHead
+from .hrnet import HRNetBackbone
 from .pixel_fusion import (
     TesseraCompressionStem,
     TesseraIoUFusionGatedLightUNet,
@@ -57,6 +58,7 @@ __all__ = [
     "ConvNeXtBlock",
     "DoubleConv",
     "DySampleUpsample",
+    "HRNetBackbone",
     "GatedTokenScaleResidual",
     "HEIGHT_NORM_CONSTANT",
     "LightUNet",

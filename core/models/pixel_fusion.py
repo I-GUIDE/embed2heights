@@ -89,7 +89,8 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
                  height_bin_max_m=80.0, norm_kind="bn",
                  presence_head_kind="shared", presence_head_depth=1,
                  presence_branch_ch=None, height_norm_stats=None,
-                 upsample_kind="bilinear", use_boundary_head=False):
+                 upsample_kind="bilinear", use_boundary_head=False,
+                 backbone_kind="lightunet", hrnet_width=18):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TesseraIoUFusionGatedLightUNet assumes 4 output channels")
@@ -104,10 +105,22 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
         self.modality_dropout = float(modality_dropout)
         tessera_channels = n_channels - alpha_channels
 
-        self.alpha_unet = LightUNet(
-            alpha_channels, n_classes, base_ch=base_ch, norm_kind=norm_kind,
-            upsample_kind=upsample_kind,
-        )
+        backbone_kind = (backbone_kind or "lightunet").lower()
+        if backbone_kind == "lightunet":
+            self.alpha_unet = LightUNet(
+                alpha_channels, n_classes, base_ch=base_ch, norm_kind=norm_kind,
+                upsample_kind=upsample_kind,
+            )
+        elif backbone_kind == "hrnet":
+            from .hrnet import HRNetBackbone
+            self.alpha_unet = HRNetBackbone(
+                alpha_channels, n_classes, base_ch=base_ch, width=hrnet_width,
+                upsample_kind=upsample_kind, norm_kind="gn",
+            )
+        else:
+            raise ValueError(
+                f"Unknown backbone_kind={backbone_kind!r}; expected 'lightunet' or 'hrnet'."
+            )
         self.alpha_unet.head = nn.Identity()
         self.tessera_feature_stem = TesseraCompressionStem(
             tessera_channels,

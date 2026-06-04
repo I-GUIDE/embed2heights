@@ -46,7 +46,9 @@ def build_active_model(model_type, n_channels, n_classes, *,
                        presence_branch_ch=None,
                        height_norm_stats=None,
                        upsample_kind="bilinear",
-                       use_boundary_head=False):
+                       use_boundary_head=False,
+                       backbone_kind="lightunet",
+                       hrnet_width=18):
     selected = canonical_model_type(model_type)
     if selected not in ACTIVE_MODEL_TYPES:
         return None
@@ -96,6 +98,8 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 height_norm_stats=height_norm_stats,
                 upsample_kind=upsample_kind,
                 use_boundary_head=use_boundary_head,
+                backbone_kind=backbone_kind,
+                hrnet_width=hrnet_width,
             ),
             selected,
         )
