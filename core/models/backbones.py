@@ -85,7 +85,10 @@ class DySampleUpsample(nn.Module):
         b, c, h, w = x.shape
         s = self.scale
         offset = self.offset(x)                                  # (B, 2*g*s^2, H, W)
-        offset = offset.view(b, self.groups, 2 * s * s, h, w)
+        # reshape (not view): under --compile the model runs in channels_last,
+        # whose strides are incompatible with view() when splitting the channel
+        # dim. reshape preserves logical NCHW order and copies only if needed.
+        offset = offset.reshape(b, self.groups, 2 * s * s, h, w)
         offset = offset + self.init_pos.view(1, 1, 2 * s * s, 1, 1)
         offset = offset.reshape(b * self.groups, 2 * s * s, h, w)
         offset = self.shuffle(offset)                            # (B*g, 2, sH, sW)
@@ -101,10 +104,10 @@ class DySampleUpsample(nn.Module):
         grid = base + offset * norm                              # (B*g, 2, oH, oW)
         grid = grid.permute(0, 2, 3, 1)
 
-        xg = x.view(b * self.groups, c // self.groups, h, w)
+        xg = x.reshape(b * self.groups, c // self.groups, h, w)
         out = F.grid_sample(xg, grid, mode="bilinear",
                             padding_mode="border", align_corners=False)
-        return out.view(b, c, oh, ow)
+        return out.reshape(b, c, oh, ow)
 
 
 def _light_norm(num_channels, kind="bn"):
