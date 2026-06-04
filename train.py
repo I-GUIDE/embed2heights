@@ -298,6 +298,13 @@ def parse_args():
     p.add_argument("--height-trunk-depth", type=int, default=2,
                    help="Number of ConvGNAct blocks in the height trunk. Default 2 "
                         "matches legacy behavior.")
+    p.add_argument("--uncertainty-weighting", action="store_true",
+                   help="Balance the presence/segmentation vs height loss groups "
+                        "with learned homoscedastic uncertainty (Kendall & Gal) "
+                        "instead of fixed hand-tuned weights. Adds 2 learnable "
+                        "log-variance scalars to the optimizer. Off = legacy "
+                        "fixed-weight sum. Pairs well with "
+                        "--height-independent-branches for decoupled height.")
     p.add_argument("--height-independent-branches", action="store_true",
                    help="Use separate base/building/vegetation height trunks instead "
                         "of one shared height_trunk feeding all projections.")
@@ -964,6 +971,7 @@ def save_experiment_config(exp_dir, args, device, use_amp, height_stats=None):
         "height_hidden_ch": args.height_hidden_ch,
         "height_trunk_depth": args.height_trunk_depth,
         "height_independent_branches": args.height_independent_branches,
+        "uncertainty_weighting": args.uncertainty_weighting,
         "height_head_kind": args.height_head_kind,
         "height_n_bins": args.height_n_bins,
         "height_bin_max_m": args.height_bin_max_m,
@@ -1214,9 +1222,7 @@ def main():
             print(f"Using DataParallel on {torch.cuda.device_count()} CUDA devices.")
     print(f"Using model: {selected_model} (input channels={n_channels})")
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
     resolved_loss_preset = resolve_loss_preset(args)
     loss_lambdas = effective_loss_lambdas(args)
     criterion = ImprovedCompositeLoss(
@@ -1235,7 +1241,20 @@ def main():
         height_bin_aux_weight=args.height_bin_aux_weight,
         height_bin_sigma_bins=args.height_bin_sigma_bins,
         height_norm_stats=height_stats,
+        use_uncertainty_weighting=args.uncertainty_weighting,
     ).to(device)
+    # Optimizer includes the criterion's learnable parameters (the uncertainty
+    # log-variances) in a no-weight-decay group — decaying a log-variance would
+    # bias it toward variance=1. No-op when --uncertainty-weighting is off,
+    # since the criterion then holds no parameters.
+    param_groups = [
+        {"params": list(model.parameters()), "weight_decay": args.weight_decay},
+    ]
+    criterion_params = list(criterion.parameters())
+    if criterion_params:
+        param_groups.append({"params": criterion_params, "weight_decay": 0.0})
+    optimizer = optim.AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
     print(
         "Using loss: "
         f"preset={resolved_loss_preset} (requested={args.loss_preset}), "

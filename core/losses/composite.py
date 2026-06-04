@@ -25,7 +25,7 @@ class ImprovedCompositeLoss(nn.Module):
                  build_height_boost=5.0, veg_height_boost=0.0,
                  aux_veg_weight=1.0, height_bin_aux_weight=0.0,
                  height_bin_sigma_bins=1.5, height_norm_stats=None,
-                 pinball_tau=0.5):
+                 pinball_tau=0.5, use_uncertainty_weighting=False):
         super().__init__()
         if loss_preset != "presence_centered":
             raise ValueError("loss_preset must be presence_centered")
@@ -55,6 +55,22 @@ class ImprovedCompositeLoss(nn.Module):
         self.height_bin_aux_weight = float(height_bin_aux_weight)
         self.height_bin_sigma_bins = float(height_bin_sigma_bins)
         self.height_norm_stats = height_norm_stats
+
+        # Homoscedastic-uncertainty multi-task weighting (Kendall & Gal, CVPR'18).
+        # Learns a log-variance per task group (presence/segmentation vs height)
+        # and weights each group by its precision exp(-s) plus a 0.5*s
+        # regularizer, replacing the hand-tuned trade-off between the
+        # presence and height objectives. Disabled by default -> the loss is
+        # bit-identical to the fixed-weight sum. Parameters live on the
+        # criterion module, so train.py must add criterion.parameters() to the
+        # optimizer (no-op when disabled, since none are created).
+        self.use_uncertainty_weighting = bool(use_uncertainty_weighting)
+        if self.use_uncertainty_weighting:
+            self.log_var_presence = nn.Parameter(torch.zeros(()))
+            self.log_var_height = nn.Parameter(torch.zeros(()))
+        else:
+            self.log_var_presence = None
+            self.log_var_height = None
 
         self.task = "both"
         self.train_presence = True
@@ -182,8 +198,13 @@ class ImprovedCompositeLoss(nn.Module):
         if not self.train_height:
             weighted_height_boost = zero
 
-        total_loss = weighted_mae + weighted_ssim + weighted_grad + \
-            weighted_tversky + weighted_height_boost
+        # Accumulate into two task groups so the optional uncertainty weighting
+        # can balance them. presence_group = segmentation/presence terms;
+        # height_group = all height-regression terms. When uncertainty weighting
+        # is off, total = presence_group + height_group is identical to the
+        # legacy fixed-weight sum.
+        presence_group = weighted_mae + weighted_ssim + weighted_grad + weighted_tversky
+        height_group = weighted_height_boost
 
         presence_loss = zero
         presence_tversky_loss = zero
@@ -256,10 +277,15 @@ class ImprovedCompositeLoss(nn.Module):
                 aux_height_vegetation_loss if self.train_height else zero
             )
 
-            total_loss = total_loss + self.aux_weight * (
-                presence_loss_active + aux_height_building_active
+            presence_group = (
+                presence_group
+                + self.aux_weight * presence_loss_active
+                + self.presence_tversky_weight * presence_tversky_active
+            )
+            height_group = height_group + self.aux_weight * (
+                aux_height_building_active
                 + self.aux_veg_weight * aux_height_vegetation_active
-            ) + self.presence_tversky_weight * presence_tversky_active
+            )
 
         height_bin_ce_loss = zero
         if (aux_outputs is not None
@@ -283,7 +309,20 @@ class ImprovedCompositeLoss(nn.Module):
             )
             height_bin_ce_loss = ce_base + ce_bld + self.aux_veg_weight * ce_veg
             if self.train_height:
-                total_loss = total_loss + self.height_bin_aux_weight * height_bin_ce_loss
+                height_group = height_group + self.height_bin_aux_weight * height_bin_ce_loss
+
+        # Combine task groups. Uncertainty weighting (Kendall & Gal): scale each
+        # group by its learned precision exp(-s) and add a 0.5*s regularizer
+        # (s = log variance). Off by default -> plain sum, identical to legacy.
+        if self.use_uncertainty_weighting:
+            s_p = self.log_var_presence
+            s_h = self.log_var_height
+            total_loss = (
+                torch.exp(-s_p) * presence_group + 0.5 * s_p
+                + 0.5 * torch.exp(-s_h) * height_group + 0.5 * s_h
+            )
+        else:
+            total_loss = presence_group + height_group
 
         aux_height_loss = (aux_height_building_loss
                            + self.aux_veg_weight * aux_height_vegetation_loss)
@@ -314,5 +353,10 @@ class ImprovedCompositeLoss(nn.Module):
             "weighted_presence_tversky": w_ptv * presence_tversky_loss,
             "weighted_aux_height": w_axh * aux_height_loss,
             "weighted_height_bin_ce": w_bince * height_bin_ce_loss,
+            "presence_group": presence_group,
+            "height_group": height_group,
         }
+        if self.use_uncertainty_weighting:
+            components["uw_log_var_presence"] = self.log_var_presence.detach()
+            components["uw_log_var_height"] = self.log_var_height.detach()
         return total_loss, components
