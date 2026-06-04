@@ -232,11 +232,17 @@ def parse_args():
                    default=DEFAULTS["fraction_mae_weight"],
                    help="Weak fraction MAE weight in --loss-preset presence_centered.")
     p.add_argument("--height-loss-kind", default="l1",
-                   choices=["l1", "huber", "mse"],
+                   choices=["l1", "huber", "mse", "pinball"],
                    help="Regression loss used for height_boost and aux class-height "
-                        "supervision. Default l1 matches legacy behavior.")
+                        "supervision. Default l1 matches legacy behavior. 'pinball' "
+                        "is the quantile loss: with --pinball-tau > 0.5 it penalizes "
+                        "under-prediction more, matching the DSM (max-surface) target.")
     p.add_argument("--huber-delta", type=float, default=1.0,
                    help="Transition point for --height-loss-kind huber.")
+    p.add_argument("--pinball-tau", type=float, default=0.5,
+                   help="Quantile for --height-loss-kind pinball. >0.5 penalizes "
+                        "height under-prediction more (DSM-aligned, e.g. 0.75). "
+                        "0.5 = symmetric (half-L1).")
     p.add_argument("--build-height-boost", type=float, default=5.0,
                    help="Extra per-pixel weight on building-positive pixels inside "
                         "the height_boost term. 5.0 = legacy (previously hardcoded).")
@@ -988,6 +994,7 @@ def save_experiment_config(exp_dir, args, device, use_amp, height_stats=None):
         "modality_dropout":    args.modality_dropout,
         "height_loss_kind":    args.height_loss_kind,
         "huber_delta":         args.huber_delta,
+        "pinball_tau":         args.pinball_tau,
         "build_height_boost":  args.build_height_boost,
         "veg_height_boost":    args.veg_height_boost,
         "aux_veg_weight":      args.aux_veg_weight,
@@ -1221,6 +1228,7 @@ def main():
         weight_fraction_mae=args.fraction_mae_weight,
         height_loss_kind=args.height_loss_kind,
         huber_delta=args.huber_delta,
+        pinball_tau=args.pinball_tau,
         build_height_boost=args.build_height_boost,
         veg_height_boost=args.veg_height_boost,
         aux_veg_weight=args.aux_veg_weight,
@@ -1237,6 +1245,7 @@ def main():
         f"fraction_mae_weight={args.fraction_mae_weight}, "
         f"height_loss_kind={args.height_loss_kind}, "
         f"huber_delta={args.huber_delta}, "
+        f"pinball_tau={args.pinball_tau}, "
         f"build_height_boost={args.build_height_boost}, "
         f"veg_height_boost={args.veg_height_boost}, "
         f"aux_veg_weight={args.aux_veg_weight}, "

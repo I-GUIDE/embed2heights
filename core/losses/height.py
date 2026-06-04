@@ -4,13 +4,24 @@ import torch
 import torch.nn.functional as F
 
 
-def height_error(pred, target, *, kind, huber_delta):
-    """Elementwise height error under the configured regression loss."""
+def height_error(pred, target, *, kind, huber_delta, pinball_tau=0.5):
+    """Elementwise height error under the configured regression loss.
+
+    'pinball' is the quantile (tilted-L1) loss. With diff = pred - target and
+    quantile tau, the loss is max(-tau * diff, (1 - tau) * diff): tau > 0.5
+    penalizes UNDER-prediction more than over-prediction. This matches the DSM
+    target (which records the highest surface point), where under-estimating
+    building/vegetation height is the costlier error. tau = 0.5 reduces to
+    0.5 * |diff|, i.e. half of L1.
+    """
     diff = pred - target
     if kind == "l1":
         return torch.abs(diff)
     if kind == "mse":
         return diff * diff
+    if kind == "pinball":
+        tau = float(pinball_tau)
+        return torch.maximum(-tau * diff, (1.0 - tau) * diff)
 
     abs_diff = torch.abs(diff)
     delta = float(huber_delta)
