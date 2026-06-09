@@ -103,7 +103,15 @@ def build_active_model(model_type, n_channels, n_classes, *,
                        use_aspp=False,
                        bottleneck_attn_depth=1,
                        use_modern=False,
-                       disable_head_film=False):
+                       disable_head_film=False,
+                       use_xsource_fusion=False,
+                       token_source_ch=768,
+                       token_ctx_ch=96,
+                       xsource_attn_heads=4,
+                       xsource_token_calibration=False,
+                       use_spatial_token_film=False,
+                       vit_drop_rate=0.0,
+                       vit_drop_path_rate=0.0):
     selected = canonical_model_type(model_type)
     if selected not in ACTIVE_MODEL_TYPES:
         return None
@@ -191,6 +199,12 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 use_aspp=use_aspp,
                 bottleneck_attn_depth=bottleneck_attn_depth,
                 use_modern=use_modern,
+                use_xsource_fusion=use_xsource_fusion,
+                token_source_ch=token_source_ch,
+                token_ctx_ch=token_ctx_ch,
+                xsource_attn_heads=xsource_attn_heads,
+                xsource_token_calibration=xsource_token_calibration,
+                use_spatial_token_film=use_spatial_token_film,
             ),
             selected,
         )
@@ -253,6 +267,8 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 height_blend_mode=height_blend_mode,
                 dual_presence=dual_presence,
                 disable_head_film=disable_head_film,
+                drop_rate=vit_drop_rate,
+                drop_path_rate=vit_drop_path_rate,
             ),
             selected,
         )

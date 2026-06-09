@@ -1,12 +1,14 @@
 """Training data discovery, Dataset selection, and DataLoader assembly."""
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, Type
 
 import rasterio
+import torch
 from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from .datasets import (
     MultiPixelEmbeddingDataset,
@@ -162,16 +164,57 @@ def loader_kwargs(args, device):
     return kwargs
 
 
-def build_data_loader(dataset, args, device, *, shuffle):
-    return DataLoader(
-        dataset,
-        shuffle=shuffle,
-        **loader_kwargs(args, device),
+def build_data_loader(dataset, args, device, *, shuffle, sampler=None):
+    kw = loader_kwargs(args, device)
+    if sampler is not None:
+        return DataLoader(dataset, sampler=sampler, **kw)
+    return DataLoader(dataset, shuffle=shuffle, **kw)
+
+
+_REGION_RE = re.compile(r"_([A-Z]+)(?:_\d{4})?(?:_embeddings?|_quantized)?\.(?:tif|npy)$")
+
+
+def _region_of_pair(pair):
+    """Extract 2-letter region code from the first path in a file_pair tuple."""
+    if isinstance(pair, (tuple, list)) and pair:
+        path = pair[0]
+    else:
+        path = pair
+    base = os.path.basename(str(path))
+    m = _REGION_RE.search(base)
+    if m:
+        return m.group(1)
+    return "UNK"
+
+
+def _build_region_balanced_sampler(dataset, seed=42):
+    """WeightedRandomSampler with weights = 1 / count_of_tiles_in_region.
+    Equalizes per-region gradient contribution regardless of regional tile counts."""
+    pairs = getattr(dataset, "file_pairs", None)
+    if pairs is None:
+        return None
+    regions = [_region_of_pair(p) for p in pairs]
+    counts = {}
+    for r in regions:
+        counts[r] = counts.get(r, 0) + 1
+    weights = torch.tensor([1.0 / counts[r] for r in regions], dtype=torch.double)
+    print(
+        f"  Region-balanced sampler: {len(counts)} regions, "
+        f"counts={dict(sorted(counts.items()))}"
     )
+    g = torch.Generator()
+    g.manual_seed(int(seed))
+    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True, generator=g)
 
 
 def build_train_val_loaders(train_ds, val_ds, args, device):
-    train_loader = build_data_loader(train_ds, args, device, shuffle=True)
+    sampler = None
+    if getattr(args, "region_balanced_sampler", False):
+        sampler = _build_region_balanced_sampler(train_ds, seed=args.seed)
+    if sampler is not None:
+        train_loader = build_data_loader(train_ds, args, device, shuffle=False, sampler=sampler)
+    else:
+        train_loader = build_data_loader(train_ds, args, device, shuffle=True)
     val_loader = build_data_loader(val_ds, args, device, shuffle=False)
     return train_loader, val_loader
 

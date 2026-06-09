@@ -239,6 +239,151 @@ class TesseraIoUFusionLightUNet(nn.Module):
         return self.head(alpha_feat, return_aux=return_aux, presence_extra=tessera_feat)
 
 
+def _make_token_proj(in_ch, out_ch, depth=1):
+    """1x1 projection MLP for per-token-source context."""
+    layers = []
+    cur = in_ch
+    for _ in range(max(int(depth) - 1, 0)):
+        layers += [nn.Conv2d(cur, out_ch, 1), nn.GELU()]
+        cur = out_ch
+    layers.append(nn.Conv2d(cur, out_ch, 1))
+    return nn.Sequential(*layers)
+
+
+class CrossSourceHybridFiLMFusion(nn.Module):
+    """Cross-source self-attention + per-source FiLM + additive + spatial gate.
+
+    Ported from origin/film (Dinghye, xf085). Takes N token sources concatenated
+    along channel dim, refines them via one self-attention layer with learned
+    modality embeddings + 2D positional encoding, then injects each refined
+    source into pixel features via zero-init (FiLM γ/β + additive A + spatial
+    gate σ(g)) residual.
+    """
+
+    _TOKEN_INPUT_CLAMP = 50.0
+    _CTX_CLAMP = 50.0
+    _FILM_PARAM_CLAMP = 4.0
+    _ADD_CLAMP = 4.0
+
+    def __init__(self, pixel_ch, token_channels, token_source_ch=768,
+                 ctx_ch=96, token_calibration=False, token_proj_depth=1,
+                 attn_heads=4, attn_dropout=0.05):
+        super().__init__()
+        if token_channels % token_source_ch != 0:
+            raise ValueError(
+                f"CrossSourceHybridFiLMFusion: token_channels={token_channels} must be "
+                f"divisible by token_source_ch={token_source_ch}"
+            )
+        if attn_heads < 1:
+            raise ValueError(
+                f"CrossSourceHybridFiLMFusion: attn_heads must be >= 1, got {attn_heads}"
+            )
+        self.token_source_ch = int(token_source_ch)
+        self.n_sources = token_channels // token_source_ch
+        self.ctx_ch = int(ctx_ch)
+        self.attn_heads = int(attn_heads)
+
+        self.token_calibs = (
+            nn.ModuleList(
+                ChannelCalibration(token_source_ch) for _ in range(self.n_sources)
+            )
+            if token_calibration else None
+        )
+        self.token_projs = nn.ModuleList([
+            _make_token_proj(token_source_ch, ctx_ch, depth=token_proj_depth)
+            for _ in range(self.n_sources)
+        ])
+
+        self.pos_mlp = nn.Sequential(
+            nn.Linear(2, ctx_ch),
+            nn.GELU(),
+            nn.Linear(ctx_ch, ctx_ch),
+        )
+        self.modality_embed = nn.Parameter(torch.zeros(self.n_sources, ctx_ch))
+        nn.init.normal_(self.modality_embed, std=0.02)
+        self.attn_norm = nn.LayerNorm(ctx_ch)
+        self.cross_source_attn = nn.MultiheadAttention(
+            ctx_ch, self.attn_heads,
+            dropout=attn_dropout, batch_first=True,
+        )
+        nn.init.zeros_(self.cross_source_attn.out_proj.weight)
+        nn.init.zeros_(self.cross_source_attn.out_proj.bias)
+
+        self.film_convs = nn.ModuleList([
+            nn.Conv2d(ctx_ch, pixel_ch * 2, 1) for _ in range(self.n_sources)
+        ])
+        self.add_convs = nn.ModuleList([
+            nn.Conv2d(ctx_ch, pixel_ch, 1) for _ in range(self.n_sources)
+        ])
+        self.gate_convs = nn.ModuleList([
+            nn.Conv2d(ctx_ch, 1, 1) for _ in range(self.n_sources)
+        ])
+        for module_list in (self.film_convs, self.add_convs, self.gate_convs):
+            for conv in module_list:
+                nn.init.zeros_(conv.weight)
+                nn.init.zeros_(conv.bias)
+
+    def _pos_tokens(self, h, w, device, dtype):
+        ys = torch.linspace(-1.0, 1.0, h, device=device, dtype=dtype)
+        xs = torch.linspace(-1.0, 1.0, w, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(ys, xs, indexing="ij")
+        coords = torch.stack([yy, xx], dim=-1).reshape(1, h * w, 2)
+        return self.pos_mlp(coords)
+
+    def _refine_sources(self, ctx_list):
+        b, _, h, w = ctx_list[0].shape
+        pos = self._pos_tokens(h, w, ctx_list[0].device, ctx_list[0].dtype)
+        seqs = []
+        for i, ctx in enumerate(ctx_list):
+            tokens = ctx.flatten(2).transpose(1, 2)
+            tokens = tokens + pos
+            tokens = tokens + self.modality_embed[i].view(1, 1, -1)
+            seqs.append(tokens)
+        x = torch.cat(seqs, dim=1)
+        x_norm = self.attn_norm(x)
+        with torch.amp.autocast("cuda", enabled=False):
+            attn_out, _ = self.cross_source_attn(
+                x_norm.float(), x_norm.float(), x_norm.float(),
+                need_weights=False,
+            )
+        chunks = attn_out.to(x.dtype).split(h * w, dim=1)
+        refined = []
+        for i, ck in enumerate(chunks):
+            delta = ck.transpose(1, 2).reshape(b, self.ctx_ch, h, w)
+            refined.append(ctx_list[i] + delta)
+        return refined
+
+    def forward(self, F_pixel, token):
+        H, W = F_pixel.shape[-2:]
+        parts = token.float().split(self.token_source_ch, dim=1)
+        with torch.amp.autocast("cuda", enabled=False):
+            ctx_list = []
+            for i, src in enumerate(parts):
+                if self.token_calibs is not None:
+                    src = self.token_calibs[i](src)
+                src = src.clamp(-self._TOKEN_INPUT_CLAMP, self._TOKEN_INPUT_CLAMP)
+                ctx = self.token_projs[i](src).clamp(-self._CTX_CLAMP, self._CTX_CLAMP)
+                ctx_list.append(ctx)
+
+            refined = self._refine_sources(ctx_list)
+            refined = [r.clamp(-self._CTX_CLAMP, self._CTX_CLAMP) for r in refined]
+
+            F_p_f = F_pixel.float()
+            delta = torch.zeros_like(F_p_f)
+            for i, ctx in enumerate(refined):
+                ctx_up = F.interpolate(
+                    ctx, size=(H, W), mode="bilinear", align_corners=False
+                )
+                gamma, beta = self.film_convs[i](ctx_up).chunk(2, dim=1)
+                gamma = gamma.clamp(-self._FILM_PARAM_CLAMP, self._FILM_PARAM_CLAMP)
+                beta = beta.clamp(-self._FILM_PARAM_CLAMP, self._FILM_PARAM_CLAMP)
+                add = self.add_convs[i](ctx_up).clamp(-self._ADD_CLAMP, self._ADD_CLAMP)
+                g = torch.sigmoid(self.gate_convs[i](ctx_up))
+                delta = delta + g * (gamma * F_p_f + beta + add)
+            out = (F_p_f + delta).clamp(-self._CTX_CLAMP, self._CTX_CLAMP)
+        return out.to(F_pixel.dtype)
+
+
 class TesseraIoUFusionGatedLightUNet(nn.Module):
     """Active AlphaEarth + Tessera model: gated trunk fusion plus optional
     presence residual.
@@ -262,7 +407,10 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
                  token_channels=0, use_se=False, use_coord_attn=False,
                  use_bottleneck_attn=False, use_mixstyle=False, disable_head_film=False,
                  use_attn_gates=False, use_aspp=False, bottleneck_attn_depth=1,
-                 use_modern=False):
+                 use_modern=False,
+                 use_xsource_fusion=False, token_source_ch=768, token_ctx_ch=96,
+                 xsource_attn_heads=4, xsource_token_calibration=False,
+                 use_spatial_token_film=False):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TesseraIoUFusionGatedLightUNet assumes 4 output channels")
@@ -345,7 +493,21 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
         # per-channel gate (sigmoid(-4) ≈ 0.018) so the path is near-identity
         # at training start and can only learn to help.
         self.token_channels = int(token_channels)
-        if self.token_channels > 0:
+        self.use_xsource_fusion = bool(use_xsource_fusion)
+        self.use_spatial_token_film = bool(use_spatial_token_film)
+        if self.token_channels > 0 and self.use_xsource_fusion:
+            self.xsource_fusion = CrossSourceHybridFiLMFusion(
+                pixel_ch=base_ch,
+                token_channels=self.token_channels,
+                token_source_ch=int(token_source_ch),
+                ctx_ch=int(token_ctx_ch),
+                token_calibration=bool(xsource_token_calibration),
+                attn_heads=int(xsource_attn_heads),
+            )
+            self.token_neck = None
+            self.token_residual_proj = None
+            self.token_residual_gate = None
+        elif self.token_channels > 0:
             from .token_fusion import TokenPyramidNeck  # lazy import: avoid circular
             self.token_neck = TokenPyramidNeck(
                 self.token_channels,
@@ -354,11 +516,34 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
             self.token_residual_proj = nn.Conv2d(base_ch, base_ch, 1)
             nn.init.zeros_(self.token_residual_proj.weight)
             nn.init.zeros_(self.token_residual_proj.bias)
-            self.token_residual_gate = nn.Parameter(torch.full((1, base_ch, 1, 1), -4.0))
+            if self.use_spatial_token_film:
+                # xf095-style spatial-gated FiLM: F_out = F + sigmoid(g(t)) · (gamma·F + beta + A)
+                # All zero-init: γ stays at 1 (identity), β=0, A=0, g=σ(-4)≈0.018 → near-identity at start.
+                self.token_film_gamma = nn.Conv2d(base_ch, base_ch, 1)
+                self.token_film_beta = nn.Conv2d(base_ch, base_ch, 1)
+                nn.init.zeros_(self.token_film_gamma.weight)
+                nn.init.zeros_(self.token_film_gamma.bias)
+                nn.init.zeros_(self.token_film_beta.weight)
+                nn.init.zeros_(self.token_film_beta.bias)
+                # Spatial gate: (B, 1, H, W) — one mask per pixel, broadcast to all channels.
+                self.token_spatial_gate = nn.Conv2d(base_ch, 1, 1)
+                nn.init.zeros_(self.token_spatial_gate.weight)
+                nn.init.constant_(self.token_spatial_gate.bias, -4.0)
+                self.token_residual_gate = None
+            else:
+                self.token_film_gamma = None
+                self.token_film_beta = None
+                self.token_spatial_gate = None
+                self.token_residual_gate = nn.Parameter(torch.full((1, base_ch, 1, 1), -4.0))
+            self.xsource_fusion = None
         else:
             self.token_neck = None
             self.token_residual_proj = None
             self.token_residual_gate = None
+            self.token_film_gamma = None
+            self.token_film_beta = None
+            self.token_spatial_gate = None
+            self.xsource_fusion = None
 
     def forward(self, x, return_aux=False):
         if isinstance(x, (tuple, list)):
@@ -378,11 +563,9 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
             untied=self.gate_untied, mode=self.gate_mode
         )
 
-        # Linear token-residual: project token-pyramid features (upsampled to
-        # AE resolution) through a 1x1 conv with a learned per-channel sigmoid
-        # gate that's zero-init biased to ~0.02. Adds zero contribution at
-        # step 0; gradient lets the model learn to incorporate token info.
-        if self.token_neck is not None and token is not None:
+        if self.xsource_fusion is not None and token is not None:
+            fused = self.xsource_fusion(fused, token)
+        elif self.token_neck is not None and token is not None:
             tpyr = self.token_neck(token)
             t_feat = tpyr[128]
             if t_feat.shape[-2:] != fused.shape[-2:]:
@@ -390,8 +573,15 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
                     t_feat, size=fused.shape[-2:],
                     mode="bilinear", align_corners=False,
                 )
-            t_res = self.token_residual_proj(t_feat)
-            fused = fused + torch.sigmoid(self.token_residual_gate) * t_res
+            if self.use_spatial_token_film:
+                gamma = self.token_film_gamma(t_feat).clamp(-4.0, 4.0)
+                beta = self.token_film_beta(t_feat).clamp(-4.0, 4.0)
+                a_res = self.token_residual_proj(t_feat).clamp(-4.0, 4.0)
+                g = torch.sigmoid(self.token_spatial_gate(t_feat))
+                fused = fused + g * (gamma * fused + beta + a_res)
+            else:
+                t_res = self.token_residual_proj(t_feat)
+                fused = fused + torch.sigmoid(self.token_residual_gate) * t_res
 
         presence_extra = (
             self.presence_extra_proj(tessera_feat)
@@ -1234,6 +1424,23 @@ class TesseraIoUFusionMultiLevelGatedLightUNet(nn.Module):
         return self.head(d1, return_aux=return_aux)
 
 
+class _DropPath(nn.Module):
+    """Stochastic depth: randomly drop the (residual) branch per sample during
+    training. Parameter-free and a no-op at eval, so it does not change the
+    checkpoint or inference outputs (predict-time compatible)."""
+    def __init__(self, drop_prob=0.0):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x):
+        if self.drop_prob <= 0.0 or not self.training:
+            return x
+        keep = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        mask = torch.empty(shape, dtype=x.dtype, device=x.device).bernoulli_(keep)
+        return x.div(keep) * mask
+
+
 class _EfficientSelfAttention(nn.Module):
     """SegFormer-style efficient self-attention with spatial reduction in K, V.
 
@@ -1242,7 +1449,7 @@ class _EfficientSelfAttention(nn.Module):
     attention tractable at high-resolution encoder stages where vanilla MSA
     would OOM (e.g. 16k tokens at 1/2 spatial).
     """
-    def __init__(self, dim, n_heads, sr_ratio=1):
+    def __init__(self, dim, n_heads, sr_ratio=1, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         if dim % n_heads != 0:
             raise ValueError(f"dim {dim} not divisible by n_heads {n_heads}")
@@ -1252,6 +1459,8 @@ class _EfficientSelfAttention(nn.Module):
         self.q = nn.Linear(dim, dim, bias=True)
         self.kv = nn.Linear(dim, dim * 2, bias=True)
         self.proj = nn.Linear(dim, dim, bias=True)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj_drop = nn.Dropout(proj_drop)
         self.sr_ratio = int(sr_ratio)
         if self.sr_ratio > 1:
             self.sr = nn.Conv2d(dim, dim, kernel_size=sr_ratio, stride=sr_ratio)
@@ -1274,23 +1483,28 @@ class _EfficientSelfAttention(nn.Module):
         k, v = kv[0], kv[1]
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
         out = (attn @ v).transpose(1, 2).reshape(b, n, c)
-        return self.proj(out)
+        return self.proj_drop(self.proj(out))
 
 
 class _SegFormerBlock(nn.Module):
     """Transformer block with efficient self-attention + Mix-FFN (depthwise
     conv inside the MLP, per SegFormer paper). Pre-norm."""
-    def __init__(self, dim, n_heads, sr_ratio=1, mlp_ratio=2.0):
+    def __init__(self, dim, n_heads, sr_ratio=1, mlp_ratio=2.0,
+                 drop=0.0, drop_path=0.0):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.attn = _EfficientSelfAttention(dim, n_heads, sr_ratio=sr_ratio)
+        self.attn = _EfficientSelfAttention(dim, n_heads, sr_ratio=sr_ratio,
+                                            attn_drop=drop, proj_drop=drop)
         self.norm2 = nn.LayerNorm(dim)
         hidden = int(dim * mlp_ratio)
         self.fc1 = nn.Linear(dim, hidden)
         self.dwconv = nn.Conv2d(hidden, hidden, kernel_size=3, padding=1, groups=hidden)
         self.act = nn.GELU()
         self.fc2 = nn.Linear(hidden, dim)
+        self.drop = nn.Dropout(drop)
+        self.drop_path = _DropPath(drop_path)
 
     def _mlp(self, x_seq, h, w):
         b, n, _ = x_seq.shape
@@ -1299,11 +1513,12 @@ class _SegFormerBlock(nn.Module):
         x_spatial = x.transpose(1, 2).reshape(b, -1, h, w)
         x = self.dwconv(x_spatial).flatten(2).transpose(1, 2)
         x = self.act(x)
-        return self.fc2(x)
+        x = self.drop(x)
+        return self.drop(self.fc2(x))
 
     def forward(self, x_seq, h, w):
-        x_seq = x_seq + self.attn(self.norm1(x_seq), h, w)
-        x_seq = x_seq + self._mlp(self.norm2(x_seq), h, w)
+        x_seq = x_seq + self.drop_path(self.attn(self.norm1(x_seq), h, w))
+        x_seq = x_seq + self.drop_path(self._mlp(self.norm2(x_seq), h, w))
         return x_seq
 
 
@@ -1337,9 +1552,15 @@ class SegFormerLiteEncoder(nn.Module):
     """
     def __init__(self, in_ch, base_ch=32, norm_kind="bn",
                  depths=(2, 2, 2), n_heads=(2, 4, 8), sr_ratios=(4, 2, 1),
-                 mlp_ratio=2.0):
+                 mlp_ratio=2.0, drop_rate=0.0, drop_path_rate=0.0):
         super().__init__()
         c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
+
+        # Linear stochastic-depth schedule: drop prob ramps 0 -> drop_path_rate
+        # across all transformer blocks (SegFormer / DeiT convention).
+        total_blocks = sum(depths)
+        dpr = [drop_path_rate * i / max(1, total_blocks - 1)
+               for i in range(total_blocks)]
 
         # Stem: pure conv at full resolution.
         self.stem = DoubleConv(in_ch, c1, norm_kind=norm_kind)
@@ -1348,8 +1569,8 @@ class SegFormerLiteEncoder(nn.Module):
         self.patch2 = _OverlapPatchEmbed(c1, c2, kernel=3, stride=2)
         self.stage2 = nn.ModuleList([
             _SegFormerBlock(c2, n_heads=n_heads[0], sr_ratio=sr_ratios[0],
-                            mlp_ratio=mlp_ratio)
-            for _ in range(depths[0])
+                            mlp_ratio=mlp_ratio, drop=drop_rate, drop_path=dpr[i])
+            for i in range(depths[0])
         ])
         self.norm2 = nn.LayerNorm(c2)
 
@@ -1357,8 +1578,9 @@ class SegFormerLiteEncoder(nn.Module):
         self.patch3 = _OverlapPatchEmbed(c2, c3, kernel=3, stride=2)
         self.stage3 = nn.ModuleList([
             _SegFormerBlock(c3, n_heads=n_heads[1], sr_ratio=sr_ratios[1],
-                            mlp_ratio=mlp_ratio)
-            for _ in range(depths[1])
+                            mlp_ratio=mlp_ratio, drop=drop_rate,
+                            drop_path=dpr[depths[0] + i])
+            for i in range(depths[1])
         ])
         self.norm3 = nn.LayerNorm(c3)
 
@@ -1366,8 +1588,9 @@ class SegFormerLiteEncoder(nn.Module):
         self.patch4 = _OverlapPatchEmbed(c3, c4, kernel=3, stride=2)
         self.stage4 = nn.ModuleList([
             _SegFormerBlock(c4, n_heads=n_heads[2], sr_ratio=sr_ratios[2],
-                            mlp_ratio=mlp_ratio)
-            for _ in range(depths[2])
+                            mlp_ratio=mlp_ratio, drop=drop_rate,
+                            drop_path=dpr[depths[0] + depths[1] + i])
+            for i in range(depths[2])
         ])
         self.norm4 = nn.LayerNorm(c4)
 
@@ -1417,10 +1640,14 @@ class TesseraIoUFusionSegFormerLite(nn.Module):
                  presence_head_kind="shared", presence_head_depth=1,
                  presence_branch_ch=None, bidirectional_ctask=False,
                  height_blend_mode="presence_gated",
-                 dual_presence=False, disable_head_film=False):
+                 dual_presence=False, disable_head_film=False,
+                 drop_rate=0.0, drop_path_rate=0.0):
         super().__init__()
         if n_classes != 4:
             raise ValueError("SegFormerLite expects 4 output channels")
+        if drop_rate > 0.0 or drop_path_rate > 0.0:
+            print(f"SegFormerLite AugReg: dropout={drop_rate}, "
+                  f"stochastic_depth={drop_path_rate}")
         if n_channels <= alpha_channels:
             raise ValueError("SegFormerLite expects concatenated AE+Tessera input")
         self.supports_aux_outputs = True
@@ -1429,7 +1656,9 @@ class TesseraIoUFusionSegFormerLite(nn.Module):
 
         # SegFormer-Lite encoder for AE
         self.ae_encoder = SegFormerLiteEncoder(alpha_channels, base_ch=base_ch,
-                                               norm_kind=norm_kind)
+                                               norm_kind=norm_kind,
+                                               drop_rate=drop_rate,
+                                               drop_path_rate=drop_path_rate)
 
         c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
         # Decoder mirrors LightUNet (BN-based, GeLU is fine too but stick to canon)

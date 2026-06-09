@@ -32,7 +32,15 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 use_aspp=False,
                 bottleneck_attn_depth=1,
                 use_modern=False,
-                disable_head_film=False):
+                disable_head_film=False,
+                use_xsource_fusion=False,
+                token_source_ch=768,
+                token_ctx_ch=96,
+                xsource_attn_heads=4,
+                xsource_token_calibration=False,
+                use_spatial_token_film=False,
+                vit_drop_rate=0.0,
+                vit_drop_path_rate=0.0):
     selected = model_type.lower()
     if selected == "auto":
         selected = infer_model_type(n_channels)
@@ -75,6 +83,14 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
         bottleneck_attn_depth=bottleneck_attn_depth,
         use_modern=use_modern,
         disable_head_film=disable_head_film,
+        use_xsource_fusion=use_xsource_fusion,
+        token_source_ch=token_source_ch,
+        token_ctx_ch=token_ctx_ch,
+        xsource_attn_heads=xsource_attn_heads,
+        xsource_token_calibration=xsource_token_calibration,
+        use_spatial_token_film=use_spatial_token_film,
+        vit_drop_rate=vit_drop_rate,
+        vit_drop_path_rate=vit_drop_path_rate,
     )
     if active is not None:
         return active
