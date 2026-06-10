@@ -29,7 +29,8 @@ class ImprovedCompositeLoss(nn.Module):
                  water_empty_topk=0, weight_water_empty_topk=0.0,
                  building_presence_pos_weight=1.0,
                  small_building_presence_weight=1.0,
-                 small_building_max_pixels=0):
+                 small_building_max_pixels=0,
+                 building_boundary_weight=0.0):
         super().__init__()
         if loss_preset != "presence_centered":
             raise ValueError("loss_preset must be presence_centered")
@@ -70,6 +71,7 @@ class ImprovedCompositeLoss(nn.Module):
         self.building_presence_pos_weight = float(building_presence_pos_weight)
         self.small_building_presence_weight = float(small_building_presence_weight)
         self.small_building_max_pixels = max(0, int(small_building_max_pixels))
+        self.building_boundary_weight = float(building_boundary_weight)
 
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
         self.fraction_mae_weights = torch.tensor([1.0, 1.0, 1.0]).float()
@@ -91,6 +93,41 @@ class ImprovedCompositeLoss(nn.Module):
             log_centers,
             sigma_bins=self.height_bin_sigma_bins,
         )
+
+    def _building_boundary_loss(self, logits, fractions, mask):
+        """Auxiliary edge supervision on the building boundary ring.
+
+        `fractions` is the (B, 3, H, W) GT coverage for {building, veg, water}.
+        The hard building mask matches the dataset's binarization convention:
+        each pixel is assigned to its single argmax class (and only where some
+        class is present), so a pixel counts as building iff building is the
+        dominant fraction — NOT merely `building_fraction > 0`. This is the
+        same rule used to build `presence_target`.
+
+        The boundary target is then derived on-the-fly: a morphological
+        dilation minus erosion (3x3) of that hard mask yields a ~1px-wide ring.
+        BCE handles per-pixel error; soft Dice counters the extreme class
+        imbalance (boundary pixels are a tiny fraction of the patch). Both
+        terms are restricted to valid (`mask`) pixels.
+        """
+        any_present = (fractions > 0).any(dim=1, keepdim=True).float()
+        argmax_idx = fractions.argmax(dim=1, keepdim=True)
+        # Building is channel 0; dominant-class assignment matches the labels.
+        m = (argmax_idx == 0).float() * any_present
+        dil = F.max_pool2d(m, 3, stride=1, padding=1)                 # dilation
+        ero = 1.0 - F.max_pool2d(1.0 - m, 3, stride=1, padding=1)     # erosion
+        boundary = (dil - ero).clamp(0.0, 1.0)                        # ring = dil - ero
+
+        bce_map = F.binary_cross_entropy_with_logits(
+            logits, boundary, reduction="none"
+        )
+        bce = torch.sum(bce_map * mask) / (torch.sum(mask) + 1e-6)
+
+        pred = torch.sigmoid(logits) * mask
+        tgt = boundary * mask
+        inter = torch.sum(pred * tgt)
+        dice = 1.0 - (2.0 * inter + 1.0) / (torch.sum(pred) + torch.sum(tgt) + 1.0)
+        return bce + dice
 
     def forward(self, preds, targets, valid_mask=None):
         """
@@ -319,6 +356,17 @@ class ImprovedCompositeLoss(nn.Module):
             height_bin_ce_loss = ce_base + ce_bld + self.aux_veg_weight * ce_veg
             total_loss = total_loss + self.height_bin_aux_weight * height_bin_ce_loss
 
+        building_boundary_loss = zero
+        if (aux_outputs is not None
+                and self.building_boundary_weight > 0
+                and "building_boundary_logits" in aux_outputs):
+            building_boundary_loss = self._building_boundary_loss(
+                aux_outputs["building_boundary_logits"],
+                targets[:, :3, :, :],   # land-cover fractions -> argmax building mask
+                global_mask,
+            )
+            total_loss = total_loss + self.building_boundary_weight * building_boundary_loss
+
         aux_height_loss = (aux_height_building_loss
                            + self.aux_veg_weight * aux_height_vegetation_loss)
         w_pres = self.aux_weight
@@ -326,6 +374,7 @@ class ImprovedCompositeLoss(nn.Module):
         w_axh = self.aux_weight
         w_bince = self.height_bin_aux_weight
         w_wetopk = self.weight_water_empty_topk
+        w_bbnd = self.building_boundary_weight
 
         components = {
             "mae": loss_mae,
@@ -341,6 +390,7 @@ class ImprovedCompositeLoss(nn.Module):
             "aux_height_vegetation": aux_height_vegetation_loss,
             "aux_height": aux_height_loss,
             "height_bin_ce": height_bin_ce_loss,
+            "building_boundary": building_boundary_loss,
             "weighted_mae": weighted_mae,
             "weighted_ssim": weighted_ssim,
             "weighted_grad": weighted_grad,
@@ -351,5 +401,6 @@ class ImprovedCompositeLoss(nn.Module):
             "weighted_water_empty_topk": w_wetopk * water_empty_topk_loss,
             "weighted_aux_height": w_axh * aux_height_loss,
             "weighted_height_bin_ce": w_bince * height_bin_ce_loss,
+            "weighted_building_boundary": w_bbnd * building_boundary_loss,
         }
         return total_loss, components

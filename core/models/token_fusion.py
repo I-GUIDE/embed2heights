@@ -316,6 +316,8 @@ class GatedPixelFusionPerSourceEnsembleLightUNet(nn.Module):
                  height_from_pixel=False,
                  feat_aggregation="mean",
                  pixel_noise_std=0.0,
+                 use_boundary_head=False,
+                 presence_tower_depth=0,
                  **unused):
         super().__init__()
         if n_classes != 4:
@@ -426,6 +428,8 @@ class GatedPixelFusionPerSourceEnsembleLightUNet(nn.Module):
             presence_head_kind=presence_head_kind,
             presence_head_depth=presence_head_depth,
             presence_branch_ch=presence_branch_ch,
+            use_boundary_head=use_boundary_head,
+            presence_tower_depth=presence_tower_depth,
         )
 
     def forward(self, x, return_aux=False):
@@ -545,6 +549,8 @@ class GatedPixelFusionHybridLightUNet(nn.Module):
                  symmetric_modality_dropout=0.0,
                  symmetric_modality_dropout_alpha_share=0.5,
                  pixel_backbone_kind="unet",
+                 use_boundary_head=False,
+                 presence_tower_depth=0,
                  **unused):
         super().__init__()
         if n_classes != 4:
@@ -628,6 +634,8 @@ class GatedPixelFusionHybridLightUNet(nn.Module):
                 presence_head_kind=presence_head_kind,
                 presence_head_depth=presence_head_depth,
                 presence_branch_ch=presence_branch_ch,
+                use_boundary_head=use_boundary_head,
+                presence_tower_depth=presence_tower_depth,
             )
 
         if self.n_head_replicas == 1:

@@ -63,7 +63,9 @@ def build_active_model(model_type, n_channels, n_classes, *,
                        height_from_pixel=False,
                        feat_aggregation="mean",
                        token_input_clamp=None,
-                       pixel_backbone_kind="unet"):
+                       pixel_backbone_kind="unet",
+                       use_boundary_head=False,
+                       presence_tower_depth=0):
     selected = canonical_model_type(model_type)
     if selected not in ACTIVE_MODEL_TYPES:
         return None
@@ -155,6 +157,8 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 symmetric_modality_dropout=symmetric_modality_dropout,
                 symmetric_modality_dropout_alpha_share=symmetric_modality_dropout_alpha_share,
                 pixel_backbone_kind=pixel_backbone_kind,
+                use_boundary_head=use_boundary_head,
+                presence_tower_depth=presence_tower_depth,
             ),
             selected,
         )
@@ -202,6 +206,8 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 height_from_pixel=height_from_pixel,
                 feat_aggregation=feat_aggregation,
                 pixel_noise_std=pixel_noise_std,
+                use_boundary_head=use_boundary_head,
+                presence_tower_depth=presence_tower_depth,
             ),
             selected,
         )

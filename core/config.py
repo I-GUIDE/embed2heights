@@ -35,6 +35,7 @@ RAW_COMPONENTS = (
     "aux_height_building",
     "aux_height_vegetation",
     "height_bin_ce",
+    "building_boundary",
     "building_smooth",
     "height_error_bce",
     "delta_sparsity",
@@ -58,6 +59,7 @@ WEIGHTED_COMPONENTS = (
     "weighted_water_empty_topk",
     "weighted_aux_height",
     "weighted_height_bin_ce",
+    "weighted_building_boundary",
     "weighted_building_smooth",
     "weighted_height_error_bce",
     "weighted_delta_sparsity",
@@ -223,10 +225,18 @@ def parse_args():
                    help="Additional BCE weight for positive building pixels on small-building tiles.")
     p.add_argument("--small-building-max-pixels", type=int,
                    help="Tile-level positive building pixel cutoff for small-building BCE weighting.")
+    p.add_argument("--building-boundary-weight", type=float,
+                   help="Stage D: weight for the building-boundary auxiliary head "
+                        "(BCE+Dice on the GT building edge ring). >0 activates the "
+                        "boundary head and its loss; 0 disables (default).")
+    p.add_argument("--presence-tower-depth", type=int,
+                   help="P3 head: number of ConvGNAct blocks in the presence-only tower.")
 
     p.set_defaults(**DEFAULTS)
     p.set_defaults(**config_defaults)
     args = p.parse_args()
+    if args.presence_tower_depth is None:
+        args.presence_tower_depth = 0
     args.presence_tversky_weight = args.weight_presence_tversky
     args.fraction_mae_weight = args.weight_fraction_mae
     return args
@@ -306,6 +316,8 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "feat_aggregation": getattr(args, "feat_aggregation", "mean"),
             "token_input_clamp": getattr(args, "token_input_clamp", None),
             "pixel_backbone_kind": getattr(args, "pixel_backbone_kind", "unet"),
+            "use_boundary_head": float(getattr(args, "building_boundary_weight", 0.0) or 0.0) > 0,
+            "presence_tower_depth": getattr(args, "presence_tower_depth", 0),
         },
         "training": {
             "batch_size": args.batch_size,
@@ -343,6 +355,7 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "building_presence_pos_weight": getattr(args, "building_presence_pos_weight", 1.0),
             "small_building_presence_weight": getattr(args, "small_building_presence_weight", 1.0),
             "small_building_max_pixels": getattr(args, "small_building_max_pixels", 0),
+            "building_boundary_weight": getattr(args, "building_boundary_weight", 0.0),
             "ema_decay": getattr(args, "ema_decay", 0.0),
             "lr_scheduler": getattr(args, "lr_scheduler", "plateau"),
             "lr_eta_min": getattr(args, "lr_eta_min", 1e-5),

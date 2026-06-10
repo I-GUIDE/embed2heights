@@ -46,7 +46,8 @@ class MultiTaskPredictionHead(nn.Module):
                  height_head_kind="linear", height_n_bins=64,
                  height_bin_max_m=80.0, use_fraction_film=True,
                  use_fraction_aux=None, presence_head_kind="shared",
-                 presence_head_depth=1, presence_branch_ch=None):
+                 presence_head_depth=1, presence_branch_ch=None,
+                 use_boundary_head=False, presence_tower_depth=0):
         super().__init__()
         if out_channels != 4:
             raise ValueError("MultiTaskPredictionHead assumes 4 output channels")
@@ -80,6 +81,8 @@ class MultiTaskPredictionHead(nn.Module):
         self.use_fraction_aux = (
             self.use_fraction_film if use_fraction_aux is None else bool(use_fraction_aux)
         )
+        self.use_boundary_head = bool(use_boundary_head)
+        self.presence_tower_depth = max(0, int(presence_tower_depth))
 
         # --- Deeper shared trunk: 2 layers + residual ---
         self.shared = nn.Sequential(
@@ -92,6 +95,32 @@ class MultiTaskPredictionHead(nn.Module):
             nn.GroupNorm(_group_count(hidden_ch), hidden_ch),
         )
         self.shared_act = nn.GELU()
+
+        def _task_tower(depth):
+            if depth <= 0:
+                return nn.Identity()
+            return nn.Sequential(*[
+                ConvGNAct(hidden_ch, hidden_ch, kernel_size=3)
+                for _ in range(depth)
+            ])
+
+        # P3 head: only the presence side gets an optional task tower. Height
+        # stays on the original shared/height path so RMSE gradients keep the
+        # same routing surface as the xf095 baseline.
+        self.presence_tower = _task_tower(self.presence_tower_depth)
+
+        # --- Building-boundary auxiliary head (Stage D) ---
+        # Activated when building_boundary_weight > 0. Reads the shared trunk
+        # feature and emits a single boundary logit channel. Used ONLY for
+        # auxiliary edge supervision during training; the submission output
+        # (channels 0-3) is unaffected.
+        if self.use_boundary_head:
+            self.boundary_head = nn.Sequential(
+                ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
+                nn.Conv2d(hidden_ch, 1, 1),
+            )
+        else:
+            self.boundary_head = None
 
         # --- Fraction head (auxiliary: soft coverage regression) ---
         self.fraction_head = (
@@ -292,6 +321,7 @@ class MultiTaskPredictionHead(nn.Module):
             x_height = self.shared_act(x_height + self.shared_res(x_height))
         else:
             x_height = x
+        x_presence = self.presence_tower(x)
 
         # Optional water-only bypass: run the same shared trunk weights on a
         # parallel feature that did not see the TerraMind cross-level adapter,
@@ -301,6 +331,7 @@ class MultiTaskPredictionHead(nn.Module):
         if water_bypass_x is not None and self.presence_head_kind == "split_all":
             bypass_h = self.shared(water_bypass_x)
             bypass_h = self.shared_act(bypass_h + self.shared_res(bypass_h))
+            bypass_h = self.presence_tower(bypass_h)
 
         # Optional soft fraction head. In 081 it remains an auxiliary target
         # but is no longer injected into the height branch.
@@ -316,12 +347,12 @@ class MultiTaskPredictionHead(nn.Module):
         # logit correction on top of the alpha-only logits.
         if bypass_h is not None:
             alpha_presence_logits = torch.cat([
-                self.presence_head["building"](x),
-                self.presence_head["tree"](x),
+                self.presence_head["building"](x_presence),
+                self.presence_head["tree"](x_presence),
                 self.presence_head["water"](bypass_h),
             ], dim=1)
         else:
-            alpha_presence_logits = self._forward_presence_head(x)
+            alpha_presence_logits = self._forward_presence_head(x_presence)
         if presence_extra is not None:
             if self.presence_delta_head is None:
                 raise ValueError("presence_extra was provided but this head has no residual branch")
@@ -410,6 +441,9 @@ class MultiTaskPredictionHead(nn.Module):
             "height_building": building_height,
             "height_vegetation": vegetation_height,
         }
+        if self.boundary_head is not None:
+            # Boundary supervision runs on the token-fused shared feature `x`.
+            aux["building_boundary_logits"] = self.boundary_head(x)
         if fractions is not None:
             aux["fraction_logits"] = fraction_logits
             aux["fractions"] = fractions

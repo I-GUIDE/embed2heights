@@ -77,6 +77,8 @@ def build_active_model(args, n_channels):
         feat_aggregation=getattr(args, "feat_aggregation", "mean"),
         token_input_clamp=getattr(args, "token_input_clamp", None),
         pixel_backbone_kind=getattr(args, "pixel_backbone_kind", "unet"),
+        use_boundary_head=float(getattr(args, "building_boundary_weight", 0.0) or 0.0) > 0,
+        presence_tower_depth=getattr(args, "presence_tower_depth", 0),
     )
 
 
@@ -103,6 +105,7 @@ def build_loss(args, device):
         building_presence_pos_weight=getattr(args, "building_presence_pos_weight", 1.0),
         small_building_presence_weight=getattr(args, "small_building_presence_weight", 1.0),
         small_building_max_pixels=getattr(args, "small_building_max_pixels", 0),
+        building_boundary_weight=getattr(args, "building_boundary_weight", 0.0),
     ).to(device)
     print(
         "Using loss: "
