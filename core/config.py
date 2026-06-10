@@ -231,6 +231,13 @@ def parse_args():
                         "boundary head and its loss; 0 disables (default).")
     p.add_argument("--presence-tower-depth", type=int,
                    help="P3 head: number of ConvGNAct blocks in the presence-only tower.")
+    p.add_argument("--building-ring-presence-alpha", type=float,
+                   help="Extra presence-BCE weight on the GT building boundary "
+                        "ring: building-channel BCE is scaled by (1 + alpha * ring). "
+                        "0 disables (default).")
+    p.add_argument("--building-ring-kernel", type=int,
+                   help="Odd kernel size of the dilation/erosion used to build the "
+                        "presence-BCE boundary ring (5 -> ~2px each side).")
 
     p.set_defaults(**DEFAULTS)
     p.set_defaults(**config_defaults)
@@ -356,6 +363,8 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "small_building_presence_weight": getattr(args, "small_building_presence_weight", 1.0),
             "small_building_max_pixels": getattr(args, "small_building_max_pixels", 0),
             "building_boundary_weight": getattr(args, "building_boundary_weight", 0.0),
+            "building_ring_presence_alpha": getattr(args, "building_ring_presence_alpha", 0.0),
+            "building_ring_kernel": getattr(args, "building_ring_kernel", 5),
             "ema_decay": getattr(args, "ema_decay", 0.0),
             "lr_scheduler": getattr(args, "lr_scheduler", "plateau"),
             "lr_eta_min": getattr(args, "lr_eta_min", 1e-5),

@@ -30,7 +30,9 @@ class ImprovedCompositeLoss(nn.Module):
                  building_presence_pos_weight=1.0,
                  small_building_presence_weight=1.0,
                  small_building_max_pixels=0,
-                 building_boundary_weight=0.0):
+                 building_boundary_weight=0.0,
+                 building_ring_presence_alpha=0.0,
+                 building_ring_kernel=5):
         super().__init__()
         if loss_preset != "presence_centered":
             raise ValueError("loss_preset must be presence_centered")
@@ -72,6 +74,11 @@ class ImprovedCompositeLoss(nn.Module):
         self.small_building_presence_weight = float(small_building_presence_weight)
         self.small_building_max_pixels = max(0, int(small_building_max_pixels))
         self.building_boundary_weight = float(building_boundary_weight)
+        self.building_ring_presence_alpha = float(building_ring_presence_alpha)
+        ring_kernel = int(building_ring_kernel)
+        if ring_kernel % 2 == 0:
+            raise ValueError("building_ring_kernel must be odd")
+        self.building_ring_kernel = ring_kernel
 
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
         self.fraction_mae_weights = torch.tensor([1.0, 1.0, 1.0]).float()
@@ -235,6 +242,21 @@ class ImprovedCompositeLoss(nn.Module):
             argmax_idx = fractions.argmax(dim=1, keepdim=True)
             presence_target = torch.zeros_like(fractions).scatter_(1, argmax_idx, 1.0) * any_present
 
+            # Building boundary ring for presence-BCE upweighting. Same hard
+            # mask convention as `_building_boundary_loss` (argmax building),
+            # but the ring here is wider (default 5x5 -> ~2px each side) to
+            # tolerate GT registration error, and it reweights the MAIN
+            # presence loss instead of supervising a separate aux head: the
+            # extra pressure lands directly on the logits that decide IoU.
+            building_ring = None
+            if self.building_ring_presence_alpha > 0:
+                m = presence_target[:, 0:1, :, :]
+                pad = self.building_ring_kernel // 2
+                dil = F.max_pool2d(m, self.building_ring_kernel, stride=1, padding=pad)
+                ero = 1.0 - F.max_pool2d(1.0 - m, self.building_ring_kernel,
+                                         stride=1, padding=pad)
+                building_ring = (dil - ero).clamp(0.0, 1.0)
+
             def masked_presence_bce(logits):
                 safe_logits = torch.where(
                     lc_mask.bool(),
@@ -276,6 +298,12 @@ class ImprovedCompositeLoss(nn.Module):
                             b_weight,
                         )
                     bce_weight[:, 0:1, :, :] = bce_weight[:, 0:1, :, :] * b_weight
+                if building_ring is not None:
+                    if bce_weight is lc_mask:
+                        bce_weight = lc_mask.clone()
+                    bce_weight[:, 0:1, :, :] = bce_weight[:, 0:1, :, :] * (
+                        1.0 + self.building_ring_presence_alpha * building_ring
+                    )
                 return torch.sum(loss * bce_weight) / (torch.sum(bce_weight) + 1e-6)
 
             presence_loss = masked_presence_bce(aux_outputs["presence_logits"])

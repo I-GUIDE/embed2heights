@@ -106,6 +106,8 @@ def build_loss(args, device):
         small_building_presence_weight=getattr(args, "small_building_presence_weight", 1.0),
         small_building_max_pixels=getattr(args, "small_building_max_pixels", 0),
         building_boundary_weight=getattr(args, "building_boundary_weight", 0.0),
+        building_ring_presence_alpha=getattr(args, "building_ring_presence_alpha", 0.0),
+        building_ring_kernel=getattr(args, "building_ring_kernel", 5),
     ).to(device)
     print(
         "Using loss: "
