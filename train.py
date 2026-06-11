@@ -171,6 +171,18 @@ def main():
 
     print("--- 2. Model Init ---")
     model, selected_model = build_active_model(args, n_channels)
+    init_ckpt = getattr(args, "init_checkpoint", None)
+    if init_ckpt:
+        # Fork-finetune entry: warm-start every matching weight from a prior
+        # run (e.g. purify a jointly-trained presence champion into a height
+        # specialist). strict=False tolerates arch-evolving extras; the
+        # _orig_mod prefix strip mirrors predict.py's --compile compat.
+        state = torch.load(init_ckpt, map_location="cpu")
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            print(f"init-checkpoint partial load: missing={missing} unexpected={unexpected}")
+        print(f"Initialized weights from {init_ckpt}")
     model = model.to(device)
     if getattr(args, "compile", False) and device.type == "cuda":
         torch.set_float32_matmul_precision("high")

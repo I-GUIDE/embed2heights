@@ -246,6 +246,10 @@ def parse_args():
                    help="Scale of presence-loss gradients allowed into the shared "
                         "trunk (soft one-way decouple). 1.0 = fully coupled, "
                         "0.0 = hard detach. Forward values are unchanged.")
+    p.add_argument("--init-checkpoint",
+                   help="Optional .pth to warm-start the model from (strict=False). "
+                        "Used for fork-finetune: e.g. purify a jointly-trained "
+                        "checkpoint into a height specialist.")
 
     p.set_defaults(**DEFAULTS)
     p.set_defaults(**config_defaults)
@@ -351,6 +355,7 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "freeze_except": args.freeze_except,
             "freeze_epochs": args.freeze_epochs,
             "stage2_lr": args.stage2_lr,
+            "init_checkpoint": getattr(args, "init_checkpoint", None),
             "loss_preset": "presence_centered",
             "weight_mae": args.weight_mae,
             "weight_presence_tversky": args.weight_presence_tversky,
