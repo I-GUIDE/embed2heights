@@ -1,0 +1,75 @@
+data:
+  fourth_token_train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/thor_s2_emb
+  patch_size: 256
+  secondary_token_train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/terramind_s2_emb
+  secondary_train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/tessera_emb
+  split_file: ${REPO_DIR}/splits/group_code_5fold_seed42/fold_0/split.json
+  third_token_train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/thor_s1_emb
+  token_train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/terramind_s1_emb
+  train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/alphaearth_emb
+  train_targets_dir: /u/dingqi2/workspace/esa/data/train/labels
+description: 'ringw ensemble member: seed=1 fold=0 epochs=70. Same recipe as xfusion_095_p3_ringw_fold0
+  (boundary-ring-weighted building presence BCE on the P3 baseline).'
+model:
+  gate_init_bias: 4.0
+  gate_mode: rich
+  gate_untied: false
+  height_bin_max_m: 80.0
+  height_gate_source: alpha
+  height_head_kind: linear
+  height_hidden_ch: 96
+  height_independent_branches: true
+  height_n_bins: 64
+  height_specialist_depth: 1
+  height_trunk_depth: 2
+  lightunet_base_ch: 48
+  lightunet_norm_kind: bn
+  modality_dropout: 0.0
+  model_type: xfusion_unet_hybrid_cross_source
+  presence_branch_ch: 48
+  presence_head_depth: 1
+  presence_head_kind: split_all
+  presence_tower_depth: 2
+  tessera_hidden_ch: 96
+  tessera_hidden_depth: 2
+  tessera_presence_ch: 0
+  token_calibration: true
+  token_calibration_source_indices:
+  - 0
+  - 1
+  use_fraction_aux: true
+  use_fraction_film: false
+name: xfusion_095_p3_ringw_ep70_s1_f0
+reference: xfusion_095_p3_ringw_fold0
+runtime:
+  amp: false
+  data_parallel: false
+  experiment_name: xfusion_095_p3_ringw_ep70_s1_f0
+  num_workers: 4
+  output_dir: ${REPO_DIR}/runs
+  prefetch_factor: 1
+training:
+  aux_veg_weight: 1.0
+  aux_weight: 1.0
+  batch_size: 16
+  build_height_boost: 5.0
+  building_boundary_weight: 0.25
+  building_ring_kernel: 5
+  building_ring_presence_alpha: 2.0
+  epochs: 70
+  grad_accum_steps: 1
+  height_bin_aux_weight: 0.0
+  height_bin_sigma_bins: 1.5
+  height_loss_kind: l1
+  huber_delta: 1.0
+  lr: 0.0002
+  seed: 1
+  tversky_water_alpha: 0.3
+  veg_height_boost: 1.5
+  water_empty_topk: 512
+  weight_decay: 0.0001
+  weight_fraction_mae: 0.1
+  weight_height_boost: 2.0
+  weight_mae: 1.0
+  weight_presence_tversky: 1.0
+  weight_water_empty_topk: 0.03
