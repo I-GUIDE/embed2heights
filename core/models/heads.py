@@ -48,7 +48,9 @@ class MultiTaskPredictionHead(nn.Module):
                  use_fraction_aux=None, presence_head_kind="shared",
                  presence_head_depth=1, presence_branch_ch=None,
                  use_boundary_head=False, presence_tower_depth=0,
-                 split_trunk=False):
+                 split_trunk=False,
+                 presence_detach_trunk=False,
+                 presence_trunk_grad_scale=1.0):
         super().__init__()
         if out_channels != 4:
             raise ValueError("MultiTaskPredictionHead assumes 4 output channels")
@@ -85,6 +87,12 @@ class MultiTaskPredictionHead(nn.Module):
         self.use_boundary_head = bool(use_boundary_head)
         self.presence_tower_depth = max(0, int(presence_tower_depth))
         self.split_trunk = bool(split_trunk)
+        self.presence_detach_trunk = bool(presence_detach_trunk)
+        # Soft one-way decouple: scale of presence-loss gradients allowed into
+        # the shared trunk. 1.0 = fully coupled (P3), 0.0 = hard detach
+        # (pdetach). presence_detach_trunk=True is the legacy alias for 0.0.
+        scale = 0.0 if self.presence_detach_trunk else float(presence_trunk_grad_scale)
+        self.presence_trunk_grad_scale = min(1.0, max(0.0, scale))
 
         # --- Deeper shared trunk: 2 layers + residual ---
         self.shared = nn.Sequential(
@@ -328,9 +336,25 @@ class MultiTaskPredictionHead(nn.Module):
                 water_bypass_x=None, height_feature_x=None,
                 head_modulation=None):
         head_input = x
+        # Soft one-way decouple via gradient scaling (forward identity:
+        # s*t + (1-s)*t.detach() == t). s=1 fully coupled, s=0 hard detach.
+        # In split_trunk mode the cut sits at the SEG-TRUNK INPUT, so the
+        # entire segmentation side (seg trunk, presence tower/heads,
+        # boundary, fraction) stops writing gradients into the shared
+        # backbone — the height trunk owns it. In single-trunk mode the cut
+        # stays at the presence-tower input (merged-grad-scale behavior).
+        s = self.presence_trunk_grad_scale
+
+        def _attenuate(t):
+            if s >= 1.0:
+                return t
+            if s <= 0.0:
+                return t.detach()
+            return s * t + (1.0 - s) * t.detach()
+
         # Segmentation trunk with residual (the original shared trunk; when
         # split_trunk=True only presence/fraction/boundary read from it)
-        x = self._run_seg_trunk(head_input)
+        x = self._run_seg_trunk(_attenuate(head_input) if self.split_trunk else head_input)
         if head_modulation is not None:
             gamma = head_modulation["gamma"]
             beta = head_modulation["beta"]
@@ -359,7 +383,10 @@ class MultiTaskPredictionHead(nn.Module):
             x_height = self._run_seg_trunk(height_feature_x)
         else:
             x_height = x
-        x_presence = self.presence_tower(x)
+        # In split_trunk mode `x` is already attenuated at the trunk input;
+        # otherwise apply the scale here (cuts only the presence route into
+        # the shared trunk, leaving fraction/boundary fully coupled).
+        x_presence = self.presence_tower(x if self.split_trunk else _attenuate(x))
 
         # Optional water-only bypass: run the same shared trunk weights on a
         # parallel feature that did not see the TerraMind cross-level adapter,
@@ -367,7 +394,13 @@ class MultiTaskPredictionHead(nn.Module):
         # height, fraction, FiLM, and Tessera-residual paths stay on `x`.
         bypass_h = None
         if water_bypass_x is not None and self.presence_head_kind == "split_all":
-            bypass_h = self.presence_tower(self._run_seg_trunk(water_bypass_x))
+            # Same attenuation policy as the main seg path: cut at the trunk
+            # input in split mode, after the trunk otherwise.
+            if self.split_trunk:
+                bypass_h = self._run_seg_trunk(_attenuate(water_bypass_x))
+            else:
+                bypass_h = _attenuate(self._run_seg_trunk(water_bypass_x))
+            bypass_h = self.presence_tower(bypass_h)
 
         # Optional soft fraction head. In 081 it remains an auxiliary target
         # but is no longer injected into the height branch.

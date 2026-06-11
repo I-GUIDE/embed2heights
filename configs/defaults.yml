@@ -36,6 +36,9 @@ model:
   token_in_source_attn: false
   presence_tower_depth: 0
 
+  presence_detach_trunk: false
+  presence_trunk_grad_scale: 1.0
+
 training:
   batch_size: 32
   epochs: 30

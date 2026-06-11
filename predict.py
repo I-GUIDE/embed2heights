@@ -168,6 +168,8 @@ def model_kwargs_from_run_config(cfg):
         "pixel_backbone_kind": cfg.get("pixel_backbone_kind", "unet"),
         "presence_tower_depth": cfg.get("presence_tower_depth", 0),
         "split_trunk": bool(cfg.get("split_trunk", False)),
+        "presence_detach_trunk": cfg.get("presence_detach_trunk", False),
+        "presence_trunk_grad_scale": cfg.get("presence_trunk_grad_scale", 1.0),
     }
 
 

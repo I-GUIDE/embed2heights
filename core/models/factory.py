@@ -37,7 +37,9 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 pixel_backbone_kind="unet",
                 use_boundary_head=False,
                 presence_tower_depth=0,
-                split_trunk=False):
+                split_trunk=False,
+                presence_detach_trunk=False,
+                presence_trunk_grad_scale=1.0):
     selected = model_type.lower()
     if selected == "auto":
         selected = infer_model_type(n_channels)
@@ -87,6 +89,8 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
         use_boundary_head=use_boundary_head,
         presence_tower_depth=presence_tower_depth,
         split_trunk=split_trunk,
+                presence_detach_trunk=presence_detach_trunk,
+                presence_trunk_grad_scale=presence_trunk_grad_scale,
     )
     if active is not None:
         return active

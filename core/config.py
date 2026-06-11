@@ -242,6 +242,10 @@ def parse_args():
     p.add_argument("--building-ring-kernel", type=int,
                    help="Odd kernel size of the dilation/erosion used to build the "
                         "presence-BCE boundary ring (5 -> ~2px each side).")
+    p.add_argument("--presence-trunk-grad-scale", type=float,
+                   help="Scale of presence-loss gradients allowed into the shared "
+                        "trunk (soft one-way decouple). 1.0 = fully coupled, "
+                        "0.0 = hard detach. Forward values are unchanged.")
 
     p.set_defaults(**DEFAULTS)
     p.set_defaults(**config_defaults)
@@ -332,6 +336,8 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "use_boundary_head": float(getattr(args, "building_boundary_weight", 0.0) or 0.0) > 0,
             "presence_tower_depth": getattr(args, "presence_tower_depth", 0),
             "split_trunk": bool(getattr(args, "split_trunk", False)),
+            "presence_detach_trunk": getattr(args, "presence_detach_trunk", False),
+            "presence_trunk_grad_scale": getattr(args, "presence_trunk_grad_scale", 1.0),
         },
         "training": {
             "batch_size": args.batch_size,
