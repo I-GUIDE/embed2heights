@@ -231,6 +231,10 @@ def parse_args():
                         "boundary head and its loss; 0 disables (default).")
     p.add_argument("--presence-tower-depth", type=int,
                    help="P3 head: number of ConvGNAct blocks in the presence-only tower.")
+    p.add_argument("--split-trunk", action=argparse.BooleanOptionalAction,
+                   help="Dual-trunk head: give the height path its own trunk "
+                        "weights so segmentation and height share NO head "
+                        "parameters (default: off).")
     p.add_argument("--building-ring-presence-alpha", type=float,
                    help="Extra presence-BCE weight on the GT building boundary "
                         "ring: building-channel BCE is scaled by (1 + alpha * ring). "
@@ -244,6 +248,8 @@ def parse_args():
     args = p.parse_args()
     if args.presence_tower_depth is None:
         args.presence_tower_depth = 0
+    if getattr(args, "split_trunk", None) is None:
+        args.split_trunk = False
     args.presence_tversky_weight = args.weight_presence_tversky
     args.fraction_mae_weight = args.weight_fraction_mae
     return args
@@ -325,6 +331,7 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "pixel_backbone_kind": getattr(args, "pixel_backbone_kind", "unet"),
             "use_boundary_head": float(getattr(args, "building_boundary_weight", 0.0) or 0.0) > 0,
             "presence_tower_depth": getattr(args, "presence_tower_depth", 0),
+            "split_trunk": bool(getattr(args, "split_trunk", False)),
         },
         "training": {
             "batch_size": args.batch_size,

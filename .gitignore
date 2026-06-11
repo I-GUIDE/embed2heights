@@ -72,6 +72,7 @@ configs/active/*.yml
 !configs/active/xfusion_095_p3_baseline_fold0.yml
 !configs/active/xfusion_107_per_source_ds05_fold0_ep60.yml
 !configs/active/xfusion_107_noisetok_fold0_seed0_ep100.yml
+!configs/active/xfusion_095_p3_split_trunk_fold0.yml
 !configs/legacy/
 !configs/legacy/*.yml
 !configs/legacy/README.md

@@ -79,6 +79,7 @@ def build_active_model(args, n_channels):
         pixel_backbone_kind=getattr(args, "pixel_backbone_kind", "unet"),
         use_boundary_head=float(getattr(args, "building_boundary_weight", 0.0) or 0.0) > 0,
         presence_tower_depth=getattr(args, "presence_tower_depth", 0),
+        split_trunk=bool(getattr(args, "split_trunk", False)),
     )
 
 

@@ -167,6 +167,7 @@ def model_kwargs_from_run_config(cfg):
         "token_input_clamp": cfg.get("token_input_clamp", None),
         "pixel_backbone_kind": cfg.get("pixel_backbone_kind", "unet"),
         "presence_tower_depth": cfg.get("presence_tower_depth", 0),
+        "split_trunk": bool(cfg.get("split_trunk", False)),
     }
 
 

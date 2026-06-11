@@ -47,7 +47,8 @@ class MultiTaskPredictionHead(nn.Module):
                  height_bin_max_m=80.0, use_fraction_film=True,
                  use_fraction_aux=None, presence_head_kind="shared",
                  presence_head_depth=1, presence_branch_ch=None,
-                 use_boundary_head=False, presence_tower_depth=0):
+                 use_boundary_head=False, presence_tower_depth=0,
+                 split_trunk=False):
         super().__init__()
         if out_channels != 4:
             raise ValueError("MultiTaskPredictionHead assumes 4 output channels")
@@ -83,6 +84,7 @@ class MultiTaskPredictionHead(nn.Module):
         )
         self.use_boundary_head = bool(use_boundary_head)
         self.presence_tower_depth = max(0, int(presence_tower_depth))
+        self.split_trunk = bool(split_trunk)
 
         # --- Deeper shared trunk: 2 layers + residual ---
         self.shared = nn.Sequential(
@@ -95,6 +97,27 @@ class MultiTaskPredictionHead(nn.Module):
             nn.GroupNorm(_group_count(hidden_ch), hidden_ch),
         )
         self.shared_act = nn.GELU()
+
+        # --- Split-trunk variant (dual-trunk experiment) ---
+        # When split_trunk=True, the height path gets its OWN trunk weights
+        # (same architecture as `shared`/`shared_res`) reading directly from
+        # the head input. Segmentation (presence/fraction/boundary) keeps the
+        # original trunk. This severs the only weight-sharing point between
+        # the two tasks so height RMSE gradients and presence BCE/Tversky
+        # gradients never touch the same head parameters.
+        if self.split_trunk:
+            self.height_shared = nn.Sequential(
+                ConvGNAct(in_ch, hidden_ch, kernel_size=3),
+                nn.Dropout2d(drop) if drop > 0 else nn.Identity(),
+            )
+            self.height_shared_res = nn.Sequential(
+                ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
+                nn.Conv2d(hidden_ch, hidden_ch, 3, padding=1, bias=False),
+                nn.GroupNorm(_group_count(hidden_ch), hidden_ch),
+            )
+        else:
+            self.height_shared = None
+            self.height_shared_res = None
 
         def _task_tower(depth):
             if depth <= 0:
@@ -293,12 +316,21 @@ class MultiTaskPredictionHead(nn.Module):
             self.presence_delta_head["water"](presence_extra),
         ], dim=1)
 
+    def _run_seg_trunk(self, feat):
+        h = self.shared(feat)
+        return self.shared_act(h + self.shared_res(h))
+
+    def _run_height_trunk(self, feat):
+        h = self.height_shared(feat)
+        return self.shared_act(h + self.height_shared_res(h))
+
     def forward(self, x, return_aux=False, presence_extra=None,
                 water_bypass_x=None, height_feature_x=None,
                 head_modulation=None):
-        # Shared trunk with residual
-        x = self.shared(x)
-        x = self.shared_act(x + self.shared_res(x))
+        head_input = x
+        # Segmentation trunk with residual (the original shared trunk; when
+        # split_trunk=True only presence/fraction/boundary read from it)
+        x = self._run_seg_trunk(head_input)
         if head_modulation is not None:
             gamma = head_modulation["gamma"]
             beta = head_modulation["beta"]
@@ -316,9 +348,15 @@ class MultiTaskPredictionHead(nn.Module):
         # the token-fused `x`. Motivated by xf107 height regression vs the
         # pixel-only (alpha+tessera) baseline: token additive/FiLM residuals
         # smooth high-frequency height detail while still boosting IoU.
-        if height_feature_x is not None:
-            x_height = self.shared(height_feature_x)
-            x_height = self.shared_act(x_height + self.shared_res(x_height))
+        if self.split_trunk:
+            # Dual-trunk: height reads the head input through its own trunk
+            # weights; no forward activation or backward gradient is shared
+            # with the segmentation trunk.
+            x_height = self._run_height_trunk(
+                height_feature_x if height_feature_x is not None else head_input
+            )
+        elif height_feature_x is not None:
+            x_height = self._run_seg_trunk(height_feature_x)
         else:
             x_height = x
         x_presence = self.presence_tower(x)
@@ -329,9 +367,7 @@ class MultiTaskPredictionHead(nn.Module):
         # height, fraction, FiLM, and Tessera-residual paths stay on `x`.
         bypass_h = None
         if water_bypass_x is not None and self.presence_head_kind == "split_all":
-            bypass_h = self.shared(water_bypass_x)
-            bypass_h = self.shared_act(bypass_h + self.shared_res(bypass_h))
-            bypass_h = self.presence_tower(bypass_h)
+            bypass_h = self.presence_tower(self._run_seg_trunk(water_bypass_x))
 
         # Optional soft fraction head. In 081 it remains an auxiliary target
         # but is no longer injected into the height branch.
