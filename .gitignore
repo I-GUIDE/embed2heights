@@ -50,6 +50,7 @@ tools/plot*
 # --- SLURM scripts and output ---
 *.sbatch
 !sample.sbatch
+!two_stage_train_eval.sbatch
 *.out
 slurm_logs/
 run_uw_gated_F_submit.bash
@@ -70,6 +71,7 @@ configs/active/*.yml
 !configs/active/xfusion_085_hybrid_tied_no_residual_ep60.yml
 !configs/active/xfusion_095_hybrid_tm_calib_only_ep60.yml
 !configs/active/xfusion_095_p3_baseline_fold0.yml
+!configs/active/xfusion_095_p3_dualtrunk_2stage.yml
 !configs/active/xfusion_107_per_source_ds05_fold0_ep60.yml
 !configs/active/xfusion_107_noisetok_fold0_seed0_ep100.yml
 !configs/active/xfusion_095_p3_split_trunk_fold0.yml
