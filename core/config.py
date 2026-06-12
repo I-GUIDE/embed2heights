@@ -340,7 +340,6 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "use_boundary_head": float(getattr(args, "building_boundary_weight", 0.0) or 0.0) > 0,
             "presence_tower_depth": getattr(args, "presence_tower_depth", 0),
             "split_trunk": bool(getattr(args, "split_trunk", False)),
-            "presence_detach_trunk": getattr(args, "presence_detach_trunk", False),
             "presence_trunk_grad_scale": getattr(args, "presence_trunk_grad_scale", 1.0),
         },
         "training": {

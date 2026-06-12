@@ -49,7 +49,6 @@ class MultiTaskPredictionHead(nn.Module):
                  presence_head_depth=1, presence_branch_ch=None,
                  use_boundary_head=False, presence_tower_depth=0,
                  split_trunk=False,
-                 presence_detach_trunk=False,
                  presence_trunk_grad_scale=1.0):
         super().__init__()
         if out_channels != 4:
@@ -87,12 +86,10 @@ class MultiTaskPredictionHead(nn.Module):
         self.use_boundary_head = bool(use_boundary_head)
         self.presence_tower_depth = max(0, int(presence_tower_depth))
         self.split_trunk = bool(split_trunk)
-        self.presence_detach_trunk = bool(presence_detach_trunk)
         # Soft one-way decouple: scale of presence-loss gradients allowed into
         # the shared trunk. 1.0 = fully coupled (P3), 0.0 = hard detach
-        # (pdetach). presence_detach_trunk=True is the legacy alias for 0.0.
-        scale = 0.0 if self.presence_detach_trunk else float(presence_trunk_grad_scale)
-        self.presence_trunk_grad_scale = min(1.0, max(0.0, scale))
+        # (pdetach).
+        self.presence_trunk_grad_scale = min(1.0, max(0.0, float(presence_trunk_grad_scale)))
 
         # --- Deeper shared trunk: 2 layers + residual ---
         self.shared = nn.Sequential(
