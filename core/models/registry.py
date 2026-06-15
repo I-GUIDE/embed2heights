@@ -67,7 +67,8 @@ def build_active_model(model_type, n_channels, n_classes, *,
                        use_boundary_head=False,
                        presence_tower_depth=0,
                        split_trunk=False,
-                presence_trunk_grad_scale=1.0):
+                presence_trunk_grad_scale=1.0,
+                height_trunk_grad_scale=1.0):
     selected = canonical_model_type(model_type)
     if selected not in ACTIVE_MODEL_TYPES:
         return None
@@ -163,6 +164,7 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 presence_tower_depth=presence_tower_depth,
                 split_trunk=split_trunk,
                 presence_trunk_grad_scale=presence_trunk_grad_scale,
+                height_trunk_grad_scale=height_trunk_grad_scale,
             ),
             selected,
         )
@@ -214,6 +216,7 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 presence_tower_depth=presence_tower_depth,
                 split_trunk=split_trunk,
                 presence_trunk_grad_scale=presence_trunk_grad_scale,
+                height_trunk_grad_scale=height_trunk_grad_scale,
             ),
             selected,
         )

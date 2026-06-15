@@ -49,7 +49,8 @@ class MultiTaskPredictionHead(nn.Module):
                  presence_head_depth=1, presence_branch_ch=None,
                  use_boundary_head=False, presence_tower_depth=0,
                  split_trunk=False,
-                 presence_trunk_grad_scale=1.0):
+                 presence_trunk_grad_scale=1.0,
+                 height_trunk_grad_scale=1.0):
         super().__init__()
         if out_channels != 4:
             raise ValueError("MultiTaskPredictionHead assumes 4 output channels")
@@ -90,6 +91,11 @@ class MultiTaskPredictionHead(nn.Module):
         # the shared trunk. 1.0 = fully coupled (P3), 0.0 = hard detach
         # (pdetach).
         self.presence_trunk_grad_scale = min(1.0, max(0.0, float(presence_trunk_grad_scale)))
+        # Symmetric knob (split_trunk only): scale of HEIGHT-loss gradients
+        # allowed into the shared backbone via the height-trunk input. 1.0 =
+        # coupled; 0.0 = height detached so presence/boundary/fraction own the
+        # backbone (stage-1 presence specialist). Mirror of the presence knob.
+        self.height_trunk_grad_scale = min(1.0, max(0.0, float(height_trunk_grad_scale)))
 
         # --- Deeper shared trunk: 2 layers + residual ---
         self.shared = nn.Sequential(
@@ -341,13 +347,17 @@ class MultiTaskPredictionHead(nn.Module):
         # backbone — the height trunk owns it. In single-trunk mode the cut
         # stays at the presence-tower input (merged-grad-scale behavior).
         s = self.presence_trunk_grad_scale
+        sh = self.height_trunk_grad_scale
+
+        def _scale_grad(t, g):
+            if g >= 1.0:
+                return t
+            if g <= 0.0:
+                return t.detach()
+            return g * t + (1.0 - g) * t.detach()
 
         def _attenuate(t):
-            if s >= 1.0:
-                return t
-            if s <= 0.0:
-                return t.detach()
-            return s * t + (1.0 - s) * t.detach()
+            return _scale_grad(t, s)
 
         # Segmentation trunk with residual (the original shared trunk; when
         # split_trunk=True only presence/fraction/boundary read from it)
@@ -373,9 +383,8 @@ class MultiTaskPredictionHead(nn.Module):
             # Dual-trunk: height reads the head input through its own trunk
             # weights; no forward activation or backward gradient is shared
             # with the segmentation trunk.
-            x_height = self._run_height_trunk(
-                height_feature_x if height_feature_x is not None else head_input
-            )
+            h_in = height_feature_x if height_feature_x is not None else head_input
+            x_height = self._run_height_trunk(_scale_grad(h_in, sh))
         elif height_feature_x is not None:
             x_height = self._run_seg_trunk(height_feature_x)
         else:

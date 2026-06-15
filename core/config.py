@@ -246,6 +246,11 @@ def parse_args():
                    help="Scale of presence-loss gradients allowed into the shared "
                         "trunk (soft one-way decouple). 1.0 = fully coupled, "
                         "0.0 = hard detach. Forward values are unchanged.")
+    p.add_argument("--height-trunk-grad-scale", type=float,
+                   help="split_trunk only: scale of height-loss gradients into the "
+                        "shared backbone via the height-trunk input. 1.0 = coupled, "
+                        "0.0 = height detached so presence owns the backbone "
+                        "(stage-1 presence specialist). Forward unchanged.")
     p.add_argument("--init-checkpoint",
                    help="Optional .pth to warm-start the model from (strict=False). "
                         "Used for fork-finetune: e.g. purify a jointly-trained "
@@ -341,6 +346,7 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "presence_tower_depth": getattr(args, "presence_tower_depth", 0),
             "split_trunk": bool(getattr(args, "split_trunk", False)),
             "presence_trunk_grad_scale": getattr(args, "presence_trunk_grad_scale", 1.0),
+            "height_trunk_grad_scale": getattr(args, "height_trunk_grad_scale", 1.0),
         },
         "training": {
             "batch_size": args.batch_size,

@@ -37,6 +37,7 @@ model:
   presence_tower_depth: 0
 
   presence_trunk_grad_scale: 1.0
+  height_trunk_grad_scale: 1.0
 
 training:
   batch_size: 32
