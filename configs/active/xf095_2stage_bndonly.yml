@@ -1,0 +1,81 @@
+name: xf095_2stage_bndonly
+description: 'Ablation of building-max: crank ONLY the boundary levers (ring presence
+  alpha 2.0->3.0 + building_boundary_weight 0.25->0.5), keep height at canonical weight_height_boost
+  2.0. Isolates whether the bldmax water drop (-0.0168) came from the boundary over-crank
+  or from the height demotion. If water recovers here -> height-demote caused it;
+  if water still drops -> boundary-crank caused it. Compare iou_bld/iou_wat vs canonical
+  0.5328/0.4952 and vs bldmax 0.5360/0.4784.'
+reference: xfusion_095_p3_split_trunk_fold0
+data:
+  train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/alphaearth_emb
+  secondary_train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/tessera_emb
+  token_train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/terramind_s1_emb
+  secondary_token_train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/terramind_s2_emb
+  third_token_train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/thor_s1_emb
+  fourth_token_train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/thor_s2_emb
+  train_targets_dir: /u/dingqi2/workspace/esa/data/train/labels
+  split_file: ${REPO_DIR}/splits/group_code_5fold_seed42/fold_0/split.json
+  patch_size: 256
+model:
+  model_type: xfusion_unet_hybrid_cross_source
+  lightunet_base_ch: 48
+  lightunet_norm_kind: bn
+  tessera_presence_ch: 0
+  tessera_hidden_ch: 96
+  tessera_hidden_depth: 2
+  height_specialist_depth: 1
+  height_gate_source: alpha
+  height_hidden_ch: 96
+  height_trunk_depth: 2
+  height_independent_branches: true
+  height_head_kind: linear
+  height_n_bins: 64
+  height_bin_max_m: 80.0
+  gate_mode: rich
+  gate_untied: false
+  gate_init_bias: 4.0
+  modality_dropout: 0.0
+  presence_head_kind: split_all
+  presence_head_depth: 1
+  presence_branch_ch: 48
+  use_fraction_aux: true
+  use_fraction_film: false
+  token_calibration: true
+  token_calibration_source_indices:
+  - 0
+  - 1
+  presence_tower_depth: 2
+  split_trunk: true
+  presence_trunk_grad_scale: 1.0
+training:
+  batch_size: 16
+  epochs: 80
+  lr: 0.0002
+  weight_decay: 0.0001
+  seed: 0
+  grad_accum_steps: 1
+  weight_mae: 1.0
+  weight_presence_tversky: 1.0
+  weight_fraction_mae: 0.1
+  weight_height_boost: 2.0
+  aux_weight: 1.0
+  height_loss_kind: l1
+  huber_delta: 1.0
+  build_height_boost: 5.0
+  veg_height_boost: 1.5
+  aux_veg_weight: 1.0
+  height_bin_aux_weight: 0.0
+  height_bin_sigma_bins: 1.5
+  tversky_water_alpha: 0.3
+  water_empty_topk: 512
+  weight_water_empty_topk: 0.03
+  building_boundary_weight: 0.5
+  building_ring_presence_alpha: 3.0
+  building_ring_kernel: 5
+runtime:
+  experiment_name: xf095_2stage_bndonly
+  output_dir: ${REPO_DIR}/runs
+  amp: false
+  data_parallel: false
+  num_workers: 4
+  prefetch_factor: 1
