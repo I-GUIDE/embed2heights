@@ -1641,7 +1641,8 @@ class TesseraIoUFusionSegFormerLite(nn.Module):
                  presence_branch_ch=None, bidirectional_ctask=False,
                  height_blend_mode="presence_gated",
                  dual_presence=False, disable_head_film=False,
-                 drop_rate=0.0, drop_path_rate=0.0):
+                 drop_rate=0.0, drop_path_rate=0.0,
+                 token_channels=0, token_n_heads=8):
         super().__init__()
         if n_classes != 4:
             raise ValueError("SegFormerLite expects 4 output channels")
@@ -1704,12 +1705,45 @@ class TesseraIoUFusionSegFormerLite(nn.Module):
             disable_head_film=disable_head_film,
         )
 
+        # Multi-source token fusion (e.g. TerraMind S1 — best building feature):
+        # cross-attention at the bottleneck. Queries = SegFormer bottleneck x4
+        # (c4 ch); Keys/Values = projected 16x16 token grid. Zero-init output proj
+        # + sigmoid(-4) gate => starts EXACTLY as the no-token model and only
+        # borrows token signal when it helps (the pattern that made TM_S2 work
+        # on the conv backbone).
+        self.token_channels = int(token_channels)
+        if self.token_channels > 0:
+            self.token_proj = nn.Conv2d(self.token_channels, c4, 1)
+            self.token_q_norm = nn.LayerNorm(c4)
+            self.token_kv_norm = nn.LayerNorm(c4)
+            self.token_xattn = nn.MultiheadAttention(c4, token_n_heads, batch_first=True)
+            self.token_out_proj = nn.Conv2d(c4, c4, 1)
+            nn.init.zeros_(self.token_out_proj.weight)
+            nn.init.zeros_(self.token_out_proj.bias)
+            self.token_gate = nn.Parameter(torch.full((1, c4, 1, 1), -4.0))
+        else:
+            self.token_proj = None
+
     def forward(self, x, return_aux=False):
-        alpha = x[:, :self.alpha_channels, :, :]
-        tessera = x[:, self.alpha_channels:, :, :]
+        if isinstance(x, (tuple, list)):
+            pixel_x, token = x
+        else:
+            pixel_x, token = x, None
+        alpha = pixel_x[:, :self.alpha_channels, :, :]
+        tessera = pixel_x[:, self.alpha_channels:, :, :]
 
         # Encode AE via SegFormer-Lite
         x4, (x1, x2, x3) = self.ae_encoder.forward_encoder(alpha)
+
+        # Multi-source token cross-attention at the bottleneck (zero-init gated).
+        if self.token_proj is not None and token is not None:
+            b, c, h4, w4 = x4.shape
+            t = self.token_proj(token)                                  # [B, c4, 16, 16]
+            t_seq = self.token_kv_norm(t.flatten(2).transpose(1, 2))    # [B, 256, c4]
+            q_seq = self.token_q_norm(x4.flatten(2).transpose(1, 2))    # [B, H4*W4, c4]
+            attn_out, _ = self.token_xattn(q_seq, t_seq, t_seq)
+            attn_map = attn_out.transpose(1, 2).reshape(b, c, h4, w4)
+            x4 = x4 + torch.sigmoid(self.token_gate) * self.token_out_proj(attn_map)
 
         # Decode (LightUNet-style)
         x = self.up1(x4)
@@ -1730,3 +1764,293 @@ class TesseraIoUFusionSegFormerLite(nn.Module):
         )
         return self.head(fused, return_aux=return_aux,
                          presence_extra=presence_extra)
+
+
+class MultiBackboneFusion(nn.Module):
+    """Fuse a from-scratch LightUNet (primary) with a PRETRAINED remote-sensing
+    backbone (timm ResNet50 body, Sentinel-2 DINO weights) via a zero-init gate.
+
+    The pretrained branch contributes ~0 at init (sigmoid(-4) ≈ 0.018 gate on a
+    zero-init 1x1 projection), so the model starts EXACTLY as the primary
+    LightUNet baseline and can only learn to borrow the pretrained features if
+    they help. The primary branch consumes the full AE+Tessera concat (n_channels
+    = 192); the pretrained branch also consumes all 192 channels (input stem is
+    re-initialized to accept 192 channels — the checkpoint stem is intentionally
+    dropped via strict=False).
+    """
+
+    def __init__(self, n_channels, n_classes=4, alpha_channels=64, base_ch=48,
+                 tessera_presence_ch=0, height_specialist_depth=0,
+                 norm_kind="bn", gate_init_bias=4.0,
+                 height_gate_source="alpha", height_hidden_ch=None,
+                 height_trunk_depth=2, height_independent_branches=False,
+                 height_head_kind="linear", height_n_bins=64,
+                 height_bin_max_m=80.0,
+                 presence_head_kind="shared", presence_head_depth=1,
+                 presence_branch_ch=None, bidirectional_ctask=False,
+                 height_blend_mode="presence_gated",
+                 dual_presence=False, disable_head_film=False,
+                 pretrained_backbone_path=None,
+                 backbone_input_proj_ch=None,
+                 backbone_input_norm=None,
+                 backbone_pretrained_source=None,
+                 freeze_backbone_stages=0,
+                 **head_kwargs):
+        super().__init__()
+        if n_classes != 4:
+            raise ValueError("MultiBackboneFusion assumes 4 output channels")
+        import timm  # local import: only needed for this model
+        self.supports_aux_outputs = True
+        self.n_channels = int(n_channels)
+
+        c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
+        dc_kw = dict(norm_kind=norm_kind)
+
+        # --- Best-shot pretrained transfer config. ---
+        # When backbone_input_proj_ch is set, an input adapter maps the full
+        # 192-ch input down to proj_ch channels, and the timm ResNet50 is built
+        # with in_chans=proj_ch so the PRETRAINED stem (conv1) is KEPT/loaded.
+        # backbone_pretrained_source takes precedence over the legacy
+        # pretrained_backbone_path arg when set.
+        self.backbone_input_proj_ch = (
+            int(backbone_input_proj_ch) if backbone_input_proj_ch is not None else None
+        )
+        self.backbone_input_norm_kind = backbone_input_norm
+        if backbone_pretrained_source is not None:
+            _bb_source = backbone_pretrained_source
+        elif pretrained_backbone_path is not None:
+            _bb_source = pretrained_backbone_path
+        else:
+            _bb_source = None
+        # in_chans the backbone is built with: proj_ch when adapter is used,
+        # else the full input width (current/default behavior, stem re-init).
+        bb_in_chans = (
+            self.backbone_input_proj_ch
+            if self.backbone_input_proj_ch is not None
+            else self.n_channels
+        )
+
+        # --- PRIMARY branch: compact LightUNet on the full 192-ch input. ---
+        # Encoder: DoubleConv + MaxPool downsamples; decoder: UpsampleBlock +
+        # DoubleConv with skip-cats (mirrors TesseraIoUFusionSegFormerLite).
+        self.p_inc = DoubleConv(self.n_channels, c1, **dc_kw)
+        self.p_down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c1, c2, **dc_kw))
+        self.p_down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c2, c3, **dc_kw))
+        self.p_down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c3, c4, **dc_kw))
+        self.p_up1 = UpsampleBlock(c4, c3, norm_kind=norm_kind)
+        self.p_conv1 = DoubleConv(c4, c3, **dc_kw)
+        self.p_up2 = UpsampleBlock(c3, c2, norm_kind=norm_kind)
+        self.p_conv2 = DoubleConv(c3, c2, **dc_kw)
+        self.p_up3 = UpsampleBlock(c2, c1, norm_kind=norm_kind)
+        self.p_conv3 = DoubleConv(c2, c1, **dc_kw)
+
+        # --- INPUT ADAPTER (optional): 192 -> proj_ch so the pretrained stem
+        # is KEPT. Conv(192,64,3) -> GroupNorm -> GELU -> Conv(64, proj_ch, 1). ---
+        if self.backbone_input_proj_ch is not None:
+            self.bb_input_adapter = nn.Sequential(
+                nn.Conv2d(self.n_channels, 64, kernel_size=3, padding=1),
+                nn.GroupNorm(_group_count(64), 64),
+                nn.GELU(),
+                nn.Conv2d(64, self.backbone_input_proj_ch, kernel_size=1),
+            )
+        else:
+            self.bb_input_adapter = None
+
+        # --- INPUT NORMALIZATION (optional): match pretrained input stats. ---
+        # "imagenet": subtract/divide fixed RGB mean/std (only valid proj_ch==3).
+        # "instance": per-sample InstanceNorm over proj_ch (valid any proj_ch).
+        self.bb_input_instancenorm = None
+        if backbone_input_norm == "imagenet":
+            if bb_in_chans != 3:
+                raise ValueError(
+                    "backbone_input_norm='imagenet' requires backbone_input_proj_ch==3, "
+                    f"got effective in_chans={bb_in_chans}"
+                )
+            self.register_buffer(
+                "bb_input_mean",
+                torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
+            )
+            self.register_buffer(
+                "bb_input_std",
+                torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
+            )
+        elif backbone_input_norm == "instance":
+            self.bb_input_instancenorm = nn.InstanceNorm2d(
+                bb_in_chans, affine=False, track_running_stats=False
+            )
+        elif backbone_input_norm is not None:
+            raise ValueError(
+                f"Unknown backbone_input_norm={backbone_input_norm!r}; "
+                "expected None, 'imagenet', or 'instance'."
+            )
+
+        # --- PRETRAINED branch: timm ResNet50 body (features_only). ---
+        # When the adapter is used, in_chans=proj_ch so the pretrained stem
+        # (conv1) is KEPT. With None, in_chans=n_channels re-inits the stem.
+        # source: "imagenet" -> timm pretrained=True; a path -> strict=False
+        # full state_dict load; None -> random init.
+        timm_pretrained = (_bb_source == "imagenet")
+        self.bb = timm.create_model(
+            "resnet50", in_chans=bb_in_chans, num_classes=0,
+            features_only=True, out_indices=(1, 2, 3, 4),
+            pretrained=timm_pretrained,
+        )
+        bb_chs = self.bb.feature_info.channels()  # [256, 512, 1024, 2048]
+        if timm_pretrained:
+            print(
+                f"MultiBackboneFusion: loaded ImageNet pretrained resnet50 stem "
+                f"(in_chans={bb_in_chans}, conv1 kept)."
+            )
+        elif _bb_source is not None:
+            sd = torch.load(_bb_source, map_location="cpu")
+            if isinstance(sd, dict) and "state_dict" in sd:
+                sd = sd["state_dict"]
+            result = self.bb.load_state_dict(sd, strict=False)
+            n_total = len(sd)
+            n_missing = len(result.missing_keys)
+            n_loaded = n_total - len(result.unexpected_keys)
+            bb_keys = set(self.bb.state_dict().keys())
+            missing_set = set(result.missing_keys)
+            conv1_keys = [k for k in bb_keys if "conv1.weight" in k and "layer" not in k]
+            conv1_loaded = bool(conv1_keys) and all(
+                k not in missing_set for k in conv1_keys
+            )
+            print(
+                f"MultiBackboneFusion: loaded pretrained backbone from "
+                f"{_bb_source}: {n_total} tensors in checkpoint, "
+                f"{n_loaded} matched into backbone, {n_missing} backbone keys "
+                f"missing. Stem conv1 loaded (kept): {conv1_loaded} "
+                f"(in_chans={bb_in_chans})."
+            )
+
+        # UNet-style decoder for the pretrained branch: upsample 2048-ch deepest
+        # map back toward full resolution, fusing the shallower stages, then
+        # project to base_ch. Feature strides are 4/8/16/32, so we upsample
+        # 32->16->8->4 with skip-fusion, then a final 4x upsample to full res.
+        self.bb_up1 = UpsampleBlock(bb_chs[3], bb_chs[2], norm_kind=norm_kind)  # /32 -> /16
+        self.bb_conv1 = DoubleConv(bb_chs[2] * 2, bb_chs[2], **dc_kw)
+        self.bb_up2 = UpsampleBlock(bb_chs[2], bb_chs[1], norm_kind=norm_kind)  # /16 -> /8
+        self.bb_conv2 = DoubleConv(bb_chs[1] * 2, bb_chs[1], **dc_kw)
+        self.bb_up3 = UpsampleBlock(bb_chs[1], bb_chs[0], norm_kind=norm_kind)  # /8 -> /4
+        self.bb_conv3 = DoubleConv(bb_chs[0] * 2, bb_chs[0], **dc_kw)
+        # /4 -> /2 -> /1, projecting down to base_ch.
+        self.bb_up4 = UpsampleBlock(bb_chs[0], base_ch * 2, norm_kind=norm_kind)
+        self.bb_up5 = UpsampleBlock(base_ch * 2, base_ch, norm_kind=norm_kind)
+        self.bb_out = DoubleConv(base_ch, base_ch, **dc_kw)
+
+        # --- FUSION: zero-init projection + sigmoid(-4) per-channel gate. ---
+        self.bb_proj = nn.Conv2d(base_ch, base_ch, 1)
+        nn.init.zeros_(self.bb_proj.weight)
+        nn.init.zeros_(self.bb_proj.bias)
+        self.bb_gate = nn.Parameter(torch.full((1, base_ch, 1, 1), -4.0))
+
+        # --- FREEZE early pretrained stages to PRESERVE spatial knowledge. ---
+        # Freeze in order: stem (conv1+bn1) + layer1 + layer2 + ... up to
+        # `freeze_backbone_stages` groups. Adapter / late layers / decoder /
+        # gate / head remain trainable.
+        self.freeze_backbone_stages = int(freeze_backbone_stages)
+        if self.freeze_backbone_stages > 0:
+            # timm features_only resnet exposes conv1/bn1/act1/maxpool + layer1..4
+            freeze_groups = ["__stem__", "layer1", "layer2", "layer3", "layer4"]
+            to_freeze = freeze_groups[: self.freeze_backbone_stages]
+            stem_attrs = ("conv1", "bn1", "act1", "maxpool")
+            for group in to_freeze:
+                if group == "__stem__":
+                    for attr in stem_attrs:
+                        mod = getattr(self.bb, attr, None)
+                        if mod is not None:
+                            for prm in mod.parameters():
+                                prm.requires_grad = False
+                else:
+                    mod = getattr(self.bb, group, None)
+                    if mod is not None:
+                        for prm in mod.parameters():
+                            prm.requires_grad = False
+            bb_frozen = sum(
+                p.numel() for p in self.bb.parameters() if not p.requires_grad
+            )
+            bb_trainable = sum(
+                p.numel() for p in self.bb.parameters() if p.requires_grad
+            )
+            print(
+                f"MultiBackboneFusion: froze {self.freeze_backbone_stages} backbone "
+                f"group(s) {to_freeze}: {bb_frozen} params frozen, "
+                f"{bb_trainable} backbone params trainable "
+                f"(adapter/decoder/gate/head stay trainable)."
+            )
+
+        # --- HEAD (identical contract to the SegFormer model). ---
+        self.tessera_presence_ch = int(tessera_presence_ch)
+        self.head = MultiTaskPredictionHead(
+            in_ch=base_ch, out_channels=n_classes,
+            presence_extra_ch=self.tessera_presence_ch,
+            height_specialist_depth=height_specialist_depth,
+            height_gate_source=height_gate_source,
+            height_hidden_ch=height_hidden_ch,
+            height_trunk_depth=height_trunk_depth,
+            height_independent_branches=height_independent_branches,
+            height_head_kind=height_head_kind,
+            height_n_bins=height_n_bins,
+            height_bin_max_m=height_bin_max_m,
+            presence_head_kind=presence_head_kind,
+            presence_head_depth=presence_head_depth,
+            presence_branch_ch=presence_branch_ch,
+            bidirectional_ctask=bidirectional_ctask,
+            height_blend_mode=height_blend_mode,
+            dual_presence=dual_presence,
+            disable_head_film=disable_head_film,
+        )
+
+    def _primary_features(self, x):
+        x1 = self.p_inc(x)
+        x2 = self.p_down1(x1)
+        x3 = self.p_down2(x2)
+        x4 = self.p_down3(x3)
+        u = self.p_up1(x4)
+        u = self.p_conv1(torch.cat([x3, u], dim=1))
+        u = self.p_up2(u)
+        u = self.p_conv2(torch.cat([x2, u], dim=1))
+        u = self.p_up3(u)
+        u = self.p_conv3(torch.cat([x1, u], dim=1))
+        return u  # (B, base_ch, H, W)
+
+    def _adapt_input(self, x):
+        """Map the 192-ch input to the backbone's expected in_chans, applying
+        the optional input adapter then optional per-channel normalization."""
+        if self.bb_input_adapter is not None:
+            x = self.bb_input_adapter(x)
+        if getattr(self, "bb_input_instancenorm", None) is not None:
+            x = self.bb_input_instancenorm(x)
+        elif hasattr(self, "bb_input_mean"):
+            x = (x - self.bb_input_mean) / self.bb_input_std
+        return x
+
+    def _backbone_features(self, x):
+        H, W = x.shape[-2:]
+        bb_in = self._adapt_input(x)
+        f1, f2, f3, f4 = self.bb(bb_in)  # strides 4, 8, 16, 32
+        u = self.bb_up1(f4)
+        if u.shape[-2:] != f3.shape[-2:]:
+            u = F.interpolate(u, size=f3.shape[-2:], mode="bilinear", align_corners=False)
+        u = self.bb_conv1(torch.cat([f3, u], dim=1))
+        u = self.bb_up2(u)
+        if u.shape[-2:] != f2.shape[-2:]:
+            u = F.interpolate(u, size=f2.shape[-2:], mode="bilinear", align_corners=False)
+        u = self.bb_conv2(torch.cat([f2, u], dim=1))
+        u = self.bb_up3(u)
+        if u.shape[-2:] != f1.shape[-2:]:
+            u = F.interpolate(u, size=f1.shape[-2:], mode="bilinear", align_corners=False)
+        u = self.bb_conv3(torch.cat([f1, u], dim=1))
+        u = self.bb_up4(u)
+        u = self.bb_up5(u)
+        if u.shape[-2:] != (H, W):
+            u = F.interpolate(u, size=(H, W), mode="bilinear", align_corners=False)
+        return self.bb_out(u)  # (B, base_ch, H, W)
+
+    def forward(self, x, return_aux=False):
+        if isinstance(x, (tuple, list)):
+            x = x[0]
+        primary_feat = self._primary_features(x)
+        bb_feat = self._backbone_features(x)
+        fused = primary_feat + torch.sigmoid(self.bb_gate) * self.bb_proj(bb_feat)
+        return self.head(fused, return_aux=return_aux, presence_extra=None)
