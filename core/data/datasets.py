@@ -1,5 +1,7 @@
 """PyTorch datasets for competition raster embeddings."""
 
+import os
+
 import numpy as np
 import rasterio
 import torch
@@ -7,6 +9,46 @@ from torch.utils.data import Dataset
 
 
 HEIGHT_NORM_CONSTANT = 30.0
+
+
+def _teacher_path_for(tar_path, teacher_dir):
+    """Map a label/embedding path to its teacher-prediction .npy path.
+
+    Teacher predictions are named by the normalized core id, e.g.
+    ``runs/.../predictions/0000_BE.npy`` for label ``label_0000_BE.tif``.
+    Returns None if no usable path can be derived.
+    """
+    if tar_path is None or teacher_dir is None:
+        return None
+    # Local import to avoid a module-level cycle; discovery imports nothing here.
+    from .discovery import normalize_core_id
+    core_id = normalize_core_id(tar_path)
+    return os.path.join(teacher_dir, f"{core_id}.npy")
+
+
+def _load_teacher_channels(teacher_dir, tar_path, target):
+    """Return a (4, H, W) teacher tensor aligned to the *uncropped* target.
+
+    Channels 0-2 are class-presence probabilities in [0,1]; channel 3 is height
+    in METERS, converted to the model's NORMALIZED output scale (divide by
+    HEIGHT_NORM_CONSTANT) so it matches the student output and the real target.
+    If the teacher file is missing/unreadable, falls back to the real target so
+    the distillation term contributes ~0 for that tile.
+    """
+    teacher = None
+    tpath = _teacher_path_for(tar_path, teacher_dir)
+    if tpath is not None and os.path.exists(tpath):
+        try:
+            arr = np.load(tpath)
+            teacher = clean_raster_array(arr)
+        except Exception:
+            teacher = None
+    if teacher is None or teacher.shape != target.shape:
+        # Fallback: copy the real target (already normalized) -> KD ~ 0.
+        return target.astype(np.float32, copy=True)
+    teacher = teacher.astype(np.float32, copy=True)
+    teacher[3, :, :] = teacher[3, :, :] / HEIGHT_NORM_CONSTANT
+    return teacher
 
 # Active model types all consume pixel-aligned embeddings; xfusion additionally
 # receives a token tensor through PixelTokenEmbeddingDataset.
@@ -142,10 +184,12 @@ class PixelEmbeddingDataset(Dataset):
     For pixel-level embeddings (AlphaEarth 64ch, Tessera 128ch).
     file_pairs: list of (emb_path, label_path) tuples, OR list of emb_path strings (label-free mode).
     """
-    def __init__(self, file_pairs, patch_size=128, is_train=True, geom_aug=False):
+    def __init__(self, file_pairs, patch_size=128, is_train=True, geom_aug=False,
+                 distill_teacher_dir=None):
         self.patch_size = patch_size
         self.is_train = is_train
         self.geom_aug = bool(geom_aug)
+        self.distill_teacher_dir = distill_teacher_dir
         if file_pairs and isinstance(file_pairs[0], str):
             self.file_pairs = [(p, None) for p in file_pairs]
         else:
@@ -160,6 +204,10 @@ class PixelEmbeddingDataset(Dataset):
         image = _read_raster(emb_path)
 
         target, valid_mask = _prepare_target(tar_path, image.shape[1:])
+
+        if self.distill_teacher_dir is not None:
+            teacher = _load_teacher_channels(self.distill_teacher_dir, tar_path, target)
+            target = np.concatenate([target, teacher], axis=0)
 
         image, target, valid_mask = _pad_pixel_training_tensors(
             image,
@@ -192,10 +240,12 @@ class MultiPixelEmbeddingDataset(Dataset):
     def __init__(self, file_pairs, patch_size=128, is_train=True, geom_aug=False,
                  cutmix_prob=0.0, cutmix_min_frac=0.15, cutmix_max_frac=0.5,
                  cutmix_density_aware=False, mixup_prob=0.0, mixup_alpha=0.2,
-                 bld_copypaste_prob=0.0, bld_copypaste_max_size_frac=0.25):
+                 bld_copypaste_prob=0.0, bld_copypaste_max_size_frac=0.25,
+                 distill_teacher_dir=None):
         self.patch_size = patch_size
         self.is_train = is_train
         self.geom_aug = bool(geom_aug)
+        self.distill_teacher_dir = distill_teacher_dir
         self.file_pairs = file_pairs
         self.cutmix_prob = float(cutmix_prob)
         self.cutmix_min_frac = float(cutmix_min_frac)
@@ -226,6 +276,9 @@ class MultiPixelEmbeddingDataset(Dataset):
         _assert_same_spatial(primary, secondary, primary_path, secondary_path, "Embedding")
         image = np.concatenate([primary, secondary], axis=0)
         target, valid_mask = _prepare_target(tar_path, image.shape[1:])
+        if self.distill_teacher_dir is not None:
+            teacher = _load_teacher_channels(self.distill_teacher_dir, tar_path, target)
+            target = np.concatenate([target, teacher], axis=0)
         image, target, valid_mask = _pad_pixel_training_tensors(
             image, target, valid_mask, self.patch_size,
         )
@@ -416,10 +469,12 @@ class PixelTokenEmbeddingDataset(Dataset):
     AlphaEarth+Tessera concatenated at 256x256 and token_image is 768x16x16 for
     patch_size=256, scale_factor=16.
     """
-    def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True):
+    def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True,
+                 distill_teacher_dir=None):
         self.patch_size = patch_size
         self.scale_factor = scale_factor
         self.is_train = is_train
+        self.distill_teacher_dir = distill_teacher_dir
         self.file_pairs = file_pairs
 
     def __len__(self):
@@ -442,6 +497,10 @@ class PixelTokenEmbeddingDataset(Dataset):
         _assert_same_spatial(primary, secondary, primary_path, secondary_path, "Embedding")
         pixel = np.concatenate([primary, secondary], axis=0)
         target, valid_mask = _prepare_target(tar_path, pixel.shape[1:], patch_size=self.patch_size)
+
+        if self.distill_teacher_dir is not None:
+            teacher = _load_teacher_channels(self.distill_teacher_dir, tar_path, target)
+            target = np.concatenate([target, teacher], axis=0)
 
         emb_patch_size = self.patch_size // self.scale_factor
 

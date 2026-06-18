@@ -126,6 +126,9 @@ def build_training_dataset(dataset_cls, pairs, args, *, is_train, extra_kwargs=N
         "patch_size": args.patch_size,
         "is_train": is_train,
     }
+    teacher_dir = getattr(args, "distill_teacher_dir", None)
+    if teacher_dir:
+        dataset_kwargs["distill_teacher_dir"] = teacher_dir
     if extra_kwargs:
         dataset_kwargs.update(extra_kwargs)
     return dataset_cls(pairs, **dataset_kwargs)
