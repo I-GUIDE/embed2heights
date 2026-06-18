@@ -40,7 +40,12 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
                 xsource_token_calibration=False,
                 use_spatial_token_film=False,
                 vit_drop_rate=0.0,
-                vit_drop_path_rate=0.0):
+                vit_drop_path_rate=0.0,
+                pretrained_backbone_path=None,
+                backbone_input_proj_ch=None,
+                backbone_input_norm=None,
+                backbone_pretrained_source=None,
+                freeze_backbone_stages=0):
     selected = model_type.lower()
     if selected == "auto":
         selected = infer_model_type(n_channels)
@@ -91,6 +96,11 @@ def build_model(model_type, n_channels, n_classes, tessera_presence_ch=16,
         use_spatial_token_film=use_spatial_token_film,
         vit_drop_rate=vit_drop_rate,
         vit_drop_path_rate=vit_drop_path_rate,
+        pretrained_backbone_path=pretrained_backbone_path,
+        backbone_input_proj_ch=backbone_input_proj_ch,
+        backbone_input_norm=backbone_input_norm,
+        backbone_pretrained_source=backbone_pretrained_source,
+        freeze_backbone_stages=freeze_backbone_stages,
     )
     if active is not None:
         return active

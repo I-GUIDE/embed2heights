@@ -8,6 +8,7 @@ from .backbones import LightUNet
 from .pixel_fusion import (
     AeTesseraMlpFusion,
     AeTesseraMoeFusion,
+    MultiBackboneFusion,
     SimpleConcatASPP,
     SimpleConcatConvNeXt,
     SimpleConcatFusion,
@@ -59,6 +60,13 @@ ACTIVE_MODEL_ALIASES = {
     # 4-stage hierarchical transformer (efficient self-attn + Mix-FFN), then
     # uses the canon LightUNet decoder + gated Tessera fusion at the head.
     "ae_tessera_segformer": "tessera_iou_fusion_segformer_lite",
+    # Multi-backbone fusion: from-scratch LightUNet (primary) + pretrained
+    # remote-sensing ResNet50 body, combined via zero-init gate so it starts
+    # as the proven primary baseline and only adds the pretrained branch if it
+    # helps. Pass --pretrained-backbone-path for the pretrained variant; omit
+    # it for the random-init control.
+    "multibackbone_fusion": "multi_backbone_fusion",
+    "multi_backbone_fusion": "multi_backbone_fusion",
 }
 
 ACTIVE_MODEL_TYPES = set(ACTIVE_MODEL_ALIASES) | set(ACTIVE_MODEL_ALIASES.values())
@@ -111,7 +119,12 @@ def build_active_model(model_type, n_channels, n_classes, *,
                        xsource_token_calibration=False,
                        use_spatial_token_film=False,
                        vit_drop_rate=0.0,
-                       vit_drop_path_rate=0.0):
+                       vit_drop_path_rate=0.0,
+                       pretrained_backbone_path=None,
+                       backbone_input_proj_ch=None,
+                       backbone_input_norm=None,
+                       backbone_pretrained_source=None,
+                       freeze_backbone_stages=0):
     selected = canonical_model_type(model_type)
     if selected not in ACTIVE_MODEL_TYPES:
         return None
@@ -242,9 +255,14 @@ def build_active_model(model_type, n_channels, n_classes, *,
         )
 
     if selected == "tessera_iou_fusion_segformer_lite":
+        if isinstance(n_channels, (tuple, list)):
+            _seg_pixel_ch, _seg_token_ch = n_channels
+        else:
+            _seg_pixel_ch, _seg_token_ch = n_channels, 0
         return (
             TesseraIoUFusionSegFormerLite(
-                n_channels=n_channels,
+                n_channels=_seg_pixel_ch,
+                token_channels=_seg_token_ch,
                 n_classes=n_classes,
                 tessera_presence_ch=tessera_presence_ch,
                 tessera_hidden_ch=tessera_hidden_ch,
@@ -269,6 +287,45 @@ def build_active_model(model_type, n_channels, n_classes, *,
                 disable_head_film=disable_head_film,
                 drop_rate=vit_drop_rate,
                 drop_path_rate=vit_drop_path_rate,
+            ),
+            selected,
+        )
+
+    if selected == "multi_backbone_fusion":
+        # n_channels may be int (pixel-only) or (pixel_channels, token_channels);
+        # this model uses only the pixel part.
+        if isinstance(n_channels, (tuple, list)):
+            _mb_pixel_ch = n_channels[0]
+        else:
+            _mb_pixel_ch = n_channels
+        return (
+            MultiBackboneFusion(
+                n_channels=_mb_pixel_ch,
+                n_classes=n_classes,
+                base_ch=lightunet_base_ch,
+                tessera_presence_ch=0,
+                height_specialist_depth=height_specialist_depth,
+                norm_kind=lightunet_norm_kind,
+                gate_init_bias=gate_init_bias,
+                height_gate_source=height_gate_source,
+                height_hidden_ch=height_hidden_ch,
+                height_trunk_depth=height_trunk_depth,
+                height_independent_branches=height_independent_branches,
+                height_head_kind=height_head_kind,
+                height_n_bins=height_n_bins,
+                height_bin_max_m=height_bin_max_m,
+                presence_head_kind=presence_head_kind,
+                presence_head_depth=presence_head_depth,
+                presence_branch_ch=presence_branch_ch,
+                bidirectional_ctask=bidirectional_ctask,
+                height_blend_mode=height_blend_mode,
+                dual_presence=dual_presence,
+                disable_head_film=disable_head_film,
+                pretrained_backbone_path=pretrained_backbone_path,
+                backbone_input_proj_ch=backbone_input_proj_ch,
+                backbone_input_norm=backbone_input_norm,
+                backbone_pretrained_source=backbone_pretrained_source,
+                freeze_backbone_stages=freeze_backbone_stages,
             ),
             selected,
         )
