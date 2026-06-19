@@ -157,6 +157,20 @@ def model_kwargs_from_run_config(cfg):
         "bottleneck_attn_depth": cfg.get("bottleneck_attn_depth", 1),
         "use_modern": cfg.get("use_modern", False),
         "disable_head_film": cfg.get("disable_head_film", False),
+        "use_xsource_fusion": cfg.get("use_xsource_fusion", False),
+        "token_source_ch": cfg.get("token_source_ch", 768),
+        "token_ctx_ch": cfg.get("token_ctx_ch", 96),
+        "xsource_attn_heads": cfg.get("xsource_attn_heads", 4),
+        "xsource_token_calibration": cfg.get("xsource_token_calibration", False),
+        "use_spatial_token_film": cfg.get("use_spatial_token_film", False),
+        # MultiBackboneFusion: needed to reconstruct the identical architecture
+        # (proj_ch drives the stem in_chans / adapter; input_norm changes the
+        # forward; source/freeze are inert at predict but kept for fidelity).
+        "pretrained_backbone_path": cfg.get("pretrained_backbone_path", None),
+        "backbone_input_proj_ch": cfg.get("backbone_input_proj_ch", None),
+        "backbone_input_norm": cfg.get("backbone_input_norm", None),
+        "backbone_pretrained_source": cfg.get("backbone_pretrained_source", None),
+        "freeze_backbone_stages": cfg.get("freeze_backbone_stages", 0),
     }
 
 

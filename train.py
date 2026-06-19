@@ -8,6 +8,7 @@ multi-baseline driver.
 """
 import os
 import json
+import math
 import random
 import argparse
 import numpy as np
@@ -84,6 +85,7 @@ MODEL_CHOICES = [
     "ae_tessera_moe", "ae_tessera_moe_fusion",
     "ae_tessera_multilevel", "tessera_iou_fusion_multilevel_gated",
     "ae_tessera_segformer", "tessera_iou_fusion_segformer_lite",
+    "multibackbone_fusion", "multi_backbone_fusion",
 ]
 LOSS_PRESET_CHOICES = ["auto", "current", "no_ssim_grad", "presence_centered"]
 
@@ -263,6 +265,32 @@ def parse_args():
                    help="Modernize LightUNet conv blocks: add residual skip connections "
                         "(ResU-Net style) inside each DoubleConv + swap ReLU for GELU. "
                         "Targets gradient flow + smoother activations on deeper stacks.")
+    p.add_argument("--use-xsource-fusion", action="store_true",
+                   help="Replace single-token zero-init residual with CrossSourceHybridFiLMFusion "
+                        "(ported from Dinghye xf085): N token sources self-attend, then each "
+                        "contributes a zero-init FiLM γ/β + additive A + spatial gate σ(g) "
+                        "residual to fused pixel features. Requires --token-train-embeddings-dir "
+                        "pointing at concatenated 4-source tokens (3072 ch at 16x16).")
+    p.add_argument("--token-source-ch", type=int, default=768,
+                   help="Channels per token source (default 768 = TerraMind/THOR). "
+                        "Total token channels must be divisible by this.")
+    p.add_argument("--token-ctx-ch", type=int, default=96,
+                   help="Per-source context channel width for xsource fusion (default 96).")
+    p.add_argument("--xsource-attn-heads", type=int, default=4,
+                   help="Multi-head attention heads in CrossSourceHybridFiLMFusion (default 4).")
+    p.add_argument("--xsource-token-calibration", action="store_true",
+                   help="Apply per-channel calibration to each token source before projection.")
+    p.add_argument("--use-spatial-token-film", action="store_true",
+                   help="Replace per-channel scalar token gate with xf095-style spatial-gated FiLM: "
+                        "F_out = F + sigmoid(g(t)) * (gamma·F + beta + A(t)), where g is a 1x1 conv "
+                        "to a single channel (spatial scalar gate per pixel). Single-source variant "
+                        "of the xf095 win — targets RMSE_bH/vH which her ablation showed depend on "
+                        "the spatial gate.")
+    p.add_argument("--region-balanced-sampler", action="store_true",
+                   help="WeightedRandomSampler with weights = 1 / count_of_tiles_in_region. "
+                        "Equalizes per-region gradient contribution — each region (parsed from "
+                        "filename suffix like _BE/_KE/_LL) gets equal effective batch share. "
+                        "Targets distribution-shift between train and test region mix.")
     p.add_argument("--argmax-presence-target", action="store_true",
                    help="Use argmax across class fractions for the presence supervision "
                         "target (each multi-class pixel is positive ONLY for its dominant "
@@ -284,6 +312,20 @@ def parse_args():
                    help="Mix Lovász-Hinge loss on building logits with weight "
                         "lovasz_weight (added to total loss). Directly optimizes "
                         "building IoU. Recommended 0.3-0.7. 0 disables.")
+    p.add_argument("--distill-teacher-dir", type=str, default=None,
+                   help="Directory of teacher predictions ({core_id}.npy, shape "
+                        "(4,H,W): ch0-2 presence probs, ch3 height in METERS). "
+                        "When set, enables DeiT-style knowledge distillation; "
+                        "the dataset concatenates teacher channels onto the "
+                        "target (-> 8-ch) and run_epoch adds a KD loss. Default "
+                        "None = OFF (behavior byte-identical to before).")
+    p.add_argument("--distill-weight", type=float, default=0.0,
+                   help="Overall weight on the distillation loss (class BCE + "
+                        "height SmoothL1 to the teacher). 0 disables KD even if "
+                        "--distill-teacher-dir is set.")
+    p.add_argument("--distill-height-weight", type=float, default=1.0,
+                   help="Relative weight of the height KD term vs the class KD "
+                        "term inside the distillation loss.")
     p.add_argument("--disable-head-film", action="store_true",
                    help="Disable FiLM-on-fractions inside the head. Labmate "
                         "found removing this improves height regression by "
@@ -328,6 +370,41 @@ def parse_args():
     p.add_argument("--epochs",         type=int,   default=DEFAULTS["epochs"])
     p.add_argument("--lr",             type=float, default=DEFAULTS["lr"])
     p.add_argument("--weight-decay",   type=float, default=DEFAULTS["weight_decay"])
+    p.add_argument("--lr-schedule", choices=["plateau", "cosine"], default="plateau",
+                   help="LR schedule. 'plateau' = ReduceLROnPlateau (conv default). "
+                        "'cosine' = linear warmup then cosine decay to 0 over --epochs "
+                        "(proper schedule for training transformers from scratch).")
+    p.add_argument("--warmup-epochs", type=int, default=0,
+                   help="Linear LR warmup epochs (only used with --lr-schedule cosine).")
+    p.add_argument("--no-wd-on-norm", action="store_true",
+                   help="Exclude LayerNorm/BatchNorm weights and biases from weight decay "
+                        "(standard transformer-from-scratch practice).")
+    p.add_argument("--vit-drop-rate", type=float, default=0.0,
+                   help="Dropout rate inside SegFormer attention + Mix-FFN (AugReg "
+                        "regularization for from-scratch ViT). Training-only, param-free.")
+    p.add_argument("--vit-drop-path-rate", type=float, default=0.0,
+                   help="Stochastic-depth (drop-path) max rate, linearly scheduled across "
+                        "SegFormer blocks. Training-only, param-free.")
+    p.add_argument("--pretrained-backbone-path", type=str, default=None,
+                   help="Path to a pretrained remote-sensing backbone body (.pth) for "
+                        "model-type multibackbone_fusion. Loaded with strict=False into a "
+                        "timm ResNet50 body; the input stem is re-init for 192 channels. "
+                        "Omit for the random-init control.")
+    p.add_argument("--backbone-input-proj-ch", type=int, default=None,
+                   help="If set (e.g. 3 or 13), build a 192->proj_ch input adapter so the "
+                        "pretrained ResNet50 stem (conv1) is KEPT/loaded instead of re-init. "
+                        "Default None = current behavior (in_chans=192, stem re-init).")
+    p.add_argument("--backbone-input-norm", type=str, default=None,
+                   choices=[None, "imagenet", "instance"],
+                   help="Per-channel normalization of the adapter output before the backbone. "
+                        "'imagenet' (proj_ch==3 only) or 'instance' (any proj_ch).")
+    p.add_argument("--backbone-pretrained-source", type=str, default=None,
+                   help="Pretrained source for the backbone: 'imagenet' (timm pretrained=True), "
+                        "a path to a full state_dict .pth, or None (random). Takes precedence "
+                        "over --pretrained-backbone-path when set.")
+    p.add_argument("--freeze-backbone-stages", type=int, default=0,
+                   help="Freeze early pretrained backbone groups to preserve spatial knowledge: "
+                        "0=none, 1=stem, 2=stem+layer1, 3=stem+layer1+layer2, etc.")
     p.add_argument("--compile", action=argparse.BooleanOptionalAction, default=False,
                    help="Apply torch.compile(mode='default') + channels_last + high matmul "
                         "precision. Balanced speedup (~20-30%%) without the long kernel search "
@@ -786,11 +863,23 @@ def make_dataloaders(args, device):
         else:
             DatasetCls = MultiPixelEmbeddingDataset if args.secondary_train_embeddings_dir else pick_dataset_class(args.model_type, n_channels)
 
+    teacher_dir = getattr(args, "distill_teacher_dir", None)
+    # Only datasets known to support KD accept the distill_teacher_dir kwarg.
+    distill_kwargs = (
+        {"distill_teacher_dir": teacher_dir}
+        if teacher_dir and DatasetCls.__name__ in {
+            "PixelEmbeddingDataset",
+            "MultiPixelEmbeddingDataset",
+            "PixelTokenEmbeddingDataset",
+        }
+        else {}
+    )
+
     if DatasetCls.__name__ == "LatentTokenDataset":
         train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, scale_factor=16, is_train=True)
         val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, scale_factor=16, is_train=False)
     elif DatasetCls.__name__ in {"PixelTokenEmbeddingDataset", "PixelMultiTokenEmbeddingDataset", "MultiLatentTokenDataset"}:
-        train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, scale_factor=16, is_train=True)
+        train_ds = DatasetCls(train_pairs, patch_size=args.patch_size, scale_factor=16, is_train=True, **distill_kwargs)
         val_ds   = DatasetCls(val_pairs,   patch_size=args.patch_size, scale_factor=16, is_train=False)
     else:
         ds_kwargs = dict(
@@ -798,6 +887,7 @@ def make_dataloaders(args, device):
             is_train=True,
             geom_aug=getattr(args, "geom_aug", False),
         )
+        ds_kwargs.update(distill_kwargs)
         # Only the multi-pixel dataset supports CutMix
         if DatasetCls.__name__ == "MultiPixelEmbeddingDataset":
             ds_kwargs.update(
@@ -1004,6 +1094,19 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "use_aspp":            getattr(args, "use_aspp", False),
         "bottleneck_attn_depth": getattr(args, "bottleneck_attn_depth", 1),
         "use_modern":          getattr(args, "use_modern", False),
+        "use_xsource_fusion":  getattr(args, "use_xsource_fusion", False),
+        "token_source_ch":     getattr(args, "token_source_ch", 768),
+        "token_ctx_ch":        getattr(args, "token_ctx_ch", 96),
+        "xsource_attn_heads":  getattr(args, "xsource_attn_heads", 4),
+        "xsource_token_calibration": getattr(args, "xsource_token_calibration", False),
+        "use_spatial_token_film": getattr(args, "use_spatial_token_film", False),
+        # MultiBackboneFusion architecture params — required to rebuild the
+        # identical model at predict time (proj_ch drives the stem in_chans).
+        "pretrained_backbone_path": getattr(args, "pretrained_backbone_path", None),
+        "backbone_input_proj_ch": getattr(args, "backbone_input_proj_ch", None),
+        "backbone_input_norm": getattr(args, "backbone_input_norm", None),
+        "backbone_pretrained_source": getattr(args, "backbone_pretrained_source", None),
+        "freeze_backbone_stages": getattr(args, "freeze_backbone_stages", 0),
         "argmax_presence_target": getattr(args, "argmax_presence_target", False),
         "argmax_bce_only":     getattr(args, "argmax_bce_only", False),
         "disable_head_film":   getattr(args, "disable_head_film", False),
@@ -1023,8 +1126,40 @@ def save_experiment_config(exp_dir, args, device, use_amp):
     print(f"Created experiment folder: {exp_dir}")
 
 
+def _distillation_loss(student_out, teacher, masks, height_weight):
+    """DeiT-style KD: class BCE + weighted height SmoothL1 to a teacher.
+
+    Args:
+        student_out: (B,4,H,W) student output; ch0-2 presence PROBABILITIES,
+                     ch3 height on the model's (normalized) output scale.
+        teacher:     (B,4,H,W) teacher; ch0-2 presence probabilities, ch3 height
+                     already converted to the same normalized scale by the dataset.
+        masks:       (B,2,H,W) validity; ch0 = global, ch1 = height validity.
+        height_weight: relative weight of the height term vs the class term.
+    """
+    global_mask = masks[:, 0:1, :, :]
+    height_mask = masks[:, 1:2, :, :]
+
+    # BCE computed manually in fp32: F.binary_cross_entropy is unsafe under AMP
+    # autocast (it takes probabilities, not logits) and raised RuntimeError.
+    student_probs = student_out[:, :3, :, :].clamp(1e-6, 1.0 - 1e-6).float()
+    teacher_probs = teacher[:, :3, :, :].clamp(0.0, 1.0).float()
+    cls_bce = -(teacher_probs * torch.log(student_probs)
+                + (1.0 - teacher_probs) * torch.log(1.0 - student_probs))
+    cls_mask = global_mask.expand(-1, 3, -1, -1)
+    cls_loss = (cls_bce * cls_mask).sum() / (cls_mask.sum() + 1e-6)
+
+    h_err = torch.nn.functional.smooth_l1_loss(
+        student_out[:, 3:4, :, :], teacher[:, 3:4, :, :], reduction="none"
+    )
+    h_loss = (h_err * height_mask).sum() / (height_mask.sum() + 1e-6)
+
+    return cls_loss + height_weight * h_loss
+
+
 def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
-              grad_accum_steps=1, use_amp=False, desc=""):
+              grad_accum_steps=1, use_amp=False, desc="",
+              distill_weight=0.0, distill_height_weight=1.0):
     """Train or eval one epoch. Returns (avg_loss, component_avgs)."""
     model.train(train)
     running_loss = 0.0
@@ -1043,9 +1178,32 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
             targets = targets.to(device, non_blocking=non_blocking)
             masks = masks.to(device, non_blocking=non_blocking)
 
+            # Knowledge distillation: when enabled, the dataset has concatenated
+            # 4 teacher channels onto the target (-> 8 channels). Split them off
+            # so the criterion sees a normal 4-channel target, and add a KD term.
+            do_distill = (
+                train
+                and distill_weight > 0
+                and targets.dim() == 4
+                and targets.shape[1] >= 8
+            )
+            if targets.dim() == 4 and targets.shape[1] >= 8:
+                teacher_t = targets[:, 4:8, :, :]
+                targets = targets[:, :4, :, :]
+            else:
+                teacher_t = None
+
             with torch.amp.autocast("cuda", enabled=use_amp):
                 outputs = forward_for_training(model, imgs)
                 loss, loss_components = criterion(outputs, targets, masks)
+                if do_distill and teacher_t is not None:
+                    student_out = outputs["out"] if isinstance(outputs, dict) else outputs
+                    distill_loss = _distillation_loss(
+                        student_out, teacher_t, masks, distill_height_weight
+                    )
+                    loss = loss + distill_weight * distill_loss
+                    loss_components = dict(loss_components)
+                    loss_components["distill"] = distill_weight * distill_loss
                 step_loss = loss / grad_accum_steps if train else loss
 
             if not torch.isfinite(loss):
@@ -1169,6 +1327,19 @@ def main():
         bottleneck_attn_depth=getattr(args, "bottleneck_attn_depth", 1),
         use_modern=getattr(args, "use_modern", False),
         disable_head_film=getattr(args, "disable_head_film", False),
+        use_xsource_fusion=getattr(args, "use_xsource_fusion", False),
+        token_source_ch=getattr(args, "token_source_ch", 768),
+        token_ctx_ch=getattr(args, "token_ctx_ch", 96),
+        xsource_attn_heads=getattr(args, "xsource_attn_heads", 4),
+        xsource_token_calibration=getattr(args, "xsource_token_calibration", False),
+        use_spatial_token_film=getattr(args, "use_spatial_token_film", False),
+        vit_drop_rate=getattr(args, "vit_drop_rate", 0.0),
+        vit_drop_path_rate=getattr(args, "vit_drop_path_rate", 0.0),
+        pretrained_backbone_path=getattr(args, "pretrained_backbone_path", None),
+        backbone_input_proj_ch=getattr(args, "backbone_input_proj_ch", None),
+        backbone_input_norm=getattr(args, "backbone_input_norm", None),
+        backbone_pretrained_source=getattr(args, "backbone_pretrained_source", None),
+        freeze_backbone_stages=getattr(args, "freeze_backbone_stages", 0),
     )
     if args.init_from_pretrain:
         load_pretrain_weights(
@@ -1193,9 +1364,49 @@ def main():
             print(f"Using DataParallel on {torch.cuda.device_count()} CUDA devices.")
     print(f"Using model: {selected_model} (input channels={n_channels})")
 
-    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.no_wd_on_norm:
+        # 1-D params (norm weights) and biases get no weight decay; standard
+        # transformer-from-scratch practice. Everything else decays as usual.
+        decay_params, no_decay_params = [], []
+        for p_name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim <= 1 or p_name.endswith(".bias"):
+                no_decay_params.append(p)
+            else:
+                decay_params.append(p)
+        optimizer = optim.AdamW(
+            [
+                {"params": decay_params, "weight_decay": args.weight_decay},
+                {"params": no_decay_params, "weight_decay": 0.0},
+            ],
+            lr=args.lr,
+        )
+        print(f"AdamW param groups: {len(decay_params)} decayed, "
+              f"{len(no_decay_params)} no-decay (norms/biases).")
+    else:
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
+
+    use_plateau = args.lr_schedule == "plateau"
+    if use_plateau:
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=2)
+    else:
+        # Linear warmup over --warmup-epochs, then cosine decay to ~0 over the
+        # remaining epochs. The plateau scheduler collapsed the ViT LR to ~1e-6
+        # by epoch ~50, effectively freezing it; cosine keeps the LR productive.
+        _warmup = max(0, args.warmup_epochs)
+        _total = max(1, args.epochs)
+
+        def _lr_lambda(ep):
+            if _warmup > 0 and ep < _warmup:
+                return float(ep + 1) / float(_warmup)
+            progress = (ep - _warmup) / max(1, _total - _warmup)
+            progress = min(1.0, max(0.0, progress))
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
+        print(f"LR schedule: cosine, warmup={_warmup} epochs, total={_total}.")
     resolved_loss_preset = resolve_loss_preset(args)
     loss_lambdas = effective_loss_lambdas(args)
     criterion = ImprovedCompositeLoss(
@@ -1267,6 +1478,8 @@ def main():
             model, train_loader, criterion, optimizer, scaler, device,
             train=True, grad_accum_steps=grad_accum_steps, use_amp=use_amp,
             desc=f"Epoch {epoch + 1}/{args.epochs} [train]",
+            distill_weight=getattr(args, "distill_weight", 0.0),
+            distill_height_weight=getattr(args, "distill_height_weight", 1.0),
         )
         val_loss, val_comp = run_epoch(
             model, val_loader, criterion, optimizer, scaler, device,
@@ -1275,7 +1488,10 @@ def main():
         )
         train_losses.append(tr_loss)
         val_losses.append(val_loss)
-        scheduler.step(val_loss)
+        if use_plateau:
+            scheduler.step(val_loss)
+        else:
+            scheduler.step()
         write_history_record(loss_history_path, {
             "epoch": epoch + 1,
             "train_loss": tr_loss,
