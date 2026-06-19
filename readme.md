@@ -56,11 +56,11 @@ python tools/generate_split.py   # writes splits/{train,val,split}.json  (80/20,
 
 ### 3. Train
 
-All new experiments fork one of the three active recipes and change only the field under test.
+All new experiments fork one of the three active P3 recipes and change only the field under test.
 
 ```bash
-# Champion recipe — 5-fold cross-validation
-sbatch run_uw_gated_F_5fold.bash      # trains folds 0-4 in parallel (SLURM array)
+# P3 two-stage pipeline — train + presence-purify + predict + evaluate, one fold
+sbatch two_stage_train_eval.sbatch 0      # FOLD=0 (repeat 1..4 for full 5-fold CV)
 ```
 
 Artifacts go to `runs/<experiment_name>/`: `model_best.pth`, `model_last.pth`, `loss_curve.png`, `loss_history.jsonl`, `training_params.json`.
@@ -132,12 +132,15 @@ cd runs && zip -r -q submission.zip ens/test_preds_bin/
 
 | Recipe | Purpose | Model type |
 |---|---|---|
-| `active/uw_gated_F.yml` | **Champion** — simple GMU, 5-fold mean 0.4999, LB ~0.48 | `ae_tessera_gated` |
-| `active/ae_tessera_gated.yml` | Two-modal AlphaEarth + Tessera base config | `ae_tessera_gated` |
-| `active/xfusion_crosslevel.yml` | Three-modal TerraMind-S2 + AlphaEarth + Tessera | `xfusion_crosslevel` |
-| `active/ae_only_baseline.yml` | Fallback / sanity check | `ae_only` |
+| `active/xfusion_095_p3_dualtrunk_2stage.yml` | **Current line** — two-stage train+purify, dual-trunk head splits seg/height | `xfusion_unet_hybrid_cross_source` |
+| `active/xfusion_095_p3_split_trunk_fold0.yml` | Single-stage split-trunk variant | `xfusion_unet_hybrid_cross_source` |
+| `active/xfusion_095_p3_baseline_fold0.yml` | P3 single-stage baseline | `xfusion_unet_hybrid_cross_source` |
 
 Rule: every run is a small edit to one of these recipes.
+
+Prior champion / baseline recipes (`uw_gated_F` — simple GMU, 5-fold mean 0.4999,
+LB ~0.48; `ae_tessera_gated`, `xfusion_crosslevel`, `ae_only_baseline`, and the
+older `xfusion_*` fold experiments) are archived under `configs/legacy/`.
 
 ## Loss (`ImprovedCompositeLoss`)
 

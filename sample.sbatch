@@ -34,7 +34,7 @@ DATA_DIR=/projects/bcrm/emb2height/data
 CONDA_ENV=emb2heights
 
 EXP_NAME=ae_tessera_gated_v001
-CONFIG=${PROJECT_DIR}/configs/active/ae_tessera_gated.yml
+CONFIG=${PROJECT_DIR}/configs/legacy/ae_tessera_gated.yml
 SPLIT_FILE=${PROJECT_DIR}/splits/split.json
 
 TRAIN_DIR=${DATA_DIR}/train
