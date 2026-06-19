@@ -77,6 +77,11 @@ def build_active_model(args, n_channels):
         feat_aggregation=getattr(args, "feat_aggregation", "mean"),
         token_input_clamp=getattr(args, "token_input_clamp", None),
         pixel_backbone_kind=getattr(args, "pixel_backbone_kind", "unet"),
+        use_boundary_head=float(getattr(args, "building_boundary_weight", 0.0) or 0.0) > 0,
+        presence_tower_depth=getattr(args, "presence_tower_depth", 0),
+        split_trunk=bool(getattr(args, "split_trunk", False)),
+        presence_trunk_grad_scale=getattr(args, "presence_trunk_grad_scale", 1.0),
+        height_trunk_grad_scale=getattr(args, "height_trunk_grad_scale", 1.0),
     )
 
 
@@ -103,6 +108,9 @@ def build_loss(args, device):
         building_presence_pos_weight=getattr(args, "building_presence_pos_weight", 1.0),
         small_building_presence_weight=getattr(args, "small_building_presence_weight", 1.0),
         small_building_max_pixels=getattr(args, "small_building_max_pixels", 0),
+        building_boundary_weight=getattr(args, "building_boundary_weight", 0.0),
+        building_ring_presence_alpha=getattr(args, "building_ring_presence_alpha", 0.0),
+        building_ring_kernel=getattr(args, "building_ring_kernel", 5),
     ).to(device)
     print(
         "Using loss: "
@@ -163,6 +171,28 @@ def main():
 
     print("--- 2. Model Init ---")
     model, selected_model = build_active_model(args, n_channels)
+    init_ckpt = getattr(args, "init_checkpoint", None)
+    if init_ckpt:
+        # Fork-finetune entry: warm-start every matching weight from a prior
+        # run (e.g. purify a jointly-trained presence champion into a height
+        # specialist). strict=False tolerates arch-evolving extras; the
+        # _orig_mod prefix strip mirrors predict.py's --compile compat.
+        state = torch.load(init_ckpt, map_location="cpu")
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+        # Drop shape-mismatched tensors so an arch-evolving warm start works
+        # (e.g. linear height head -> softbin: the K-bin height projections
+        # differ in shape and stay freshly initialized; everything else —
+        # backbone, fusion, seg trunk, presence heads, height trunk — loads).
+        model_sd = model.state_dict()
+        skipped = [k for k, v in state.items()
+                   if k in model_sd and v.shape != model_sd[k].shape]
+        state = {k: v for k, v in state.items() if k not in skipped}
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if skipped:
+            print(f"init-checkpoint shape-mismatch (kept fresh): {skipped}")
+        if missing or unexpected:
+            print(f"init-checkpoint partial load: missing={missing} unexpected={unexpected}")
+        print(f"Initialized weights from {init_ckpt}")
     model = model.to(device)
     if getattr(args, "compile", False) and device.type == "cuda":
         torch.set_float32_matmul_precision("high")

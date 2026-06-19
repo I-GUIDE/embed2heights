@@ -34,6 +34,10 @@ model:
   use_fraction_aux: true
   token_proj_depth: 1
   token_in_source_attn: false
+  presence_tower_depth: 0
+
+  presence_trunk_grad_scale: 1.0
+  height_trunk_grad_scale: 1.0
 
 training:
   batch_size: 32
@@ -62,6 +66,9 @@ training:
   building_presence_pos_weight: 1.0
   small_building_presence_weight: 1.0
   small_building_max_pixels: 0
+  building_boundary_weight: 0.0
+  building_ring_presence_alpha: 0.0
+  building_ring_kernel: 5
 
 runtime:
   experiment_name: run01

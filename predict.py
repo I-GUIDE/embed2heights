@@ -166,6 +166,10 @@ def model_kwargs_from_run_config(cfg):
         "feat_aggregation": cfg.get("feat_aggregation", "mean"),
         "token_input_clamp": cfg.get("token_input_clamp", None),
         "pixel_backbone_kind": cfg.get("pixel_backbone_kind", "unet"),
+        "presence_tower_depth": cfg.get("presence_tower_depth", 0),
+        "split_trunk": bool(cfg.get("split_trunk", False)),
+        "presence_trunk_grad_scale": cfg.get("presence_trunk_grad_scale", 1.0),
+        "height_trunk_grad_scale": cfg.get("height_trunk_grad_scale", 1.0),
     }
 
 

@@ -46,7 +46,11 @@ class MultiTaskPredictionHead(nn.Module):
                  height_head_kind="linear", height_n_bins=64,
                  height_bin_max_m=80.0, use_fraction_film=True,
                  use_fraction_aux=None, presence_head_kind="shared",
-                 presence_head_depth=1, presence_branch_ch=None):
+                 presence_head_depth=1, presence_branch_ch=None,
+                 use_boundary_head=False, presence_tower_depth=0,
+                 split_trunk=False,
+                 presence_trunk_grad_scale=1.0,
+                 height_trunk_grad_scale=1.0):
         super().__init__()
         if out_channels != 4:
             raise ValueError("MultiTaskPredictionHead assumes 4 output channels")
@@ -80,6 +84,18 @@ class MultiTaskPredictionHead(nn.Module):
         self.use_fraction_aux = (
             self.use_fraction_film if use_fraction_aux is None else bool(use_fraction_aux)
         )
+        self.use_boundary_head = bool(use_boundary_head)
+        self.presence_tower_depth = max(0, int(presence_tower_depth))
+        self.split_trunk = bool(split_trunk)
+        # Soft one-way decouple: scale of presence-loss gradients allowed into
+        # the shared trunk. 1.0 = fully coupled (P3), 0.0 = hard detach
+        # (pdetach).
+        self.presence_trunk_grad_scale = min(1.0, max(0.0, float(presence_trunk_grad_scale)))
+        # Symmetric knob (split_trunk only): scale of HEIGHT-loss gradients
+        # allowed into the shared backbone via the height-trunk input. 1.0 =
+        # coupled; 0.0 = height detached so presence/boundary/fraction own the
+        # backbone (stage-1 presence specialist). Mirror of the presence knob.
+        self.height_trunk_grad_scale = min(1.0, max(0.0, float(height_trunk_grad_scale)))
 
         # --- Deeper shared trunk: 2 layers + residual ---
         self.shared = nn.Sequential(
@@ -92,6 +108,53 @@ class MultiTaskPredictionHead(nn.Module):
             nn.GroupNorm(_group_count(hidden_ch), hidden_ch),
         )
         self.shared_act = nn.GELU()
+
+        # --- Split-trunk variant (dual-trunk experiment) ---
+        # When split_trunk=True, the height path gets its OWN trunk weights
+        # (same architecture as `shared`/`shared_res`) reading directly from
+        # the head input. Segmentation (presence/fraction/boundary) keeps the
+        # original trunk. This severs the only weight-sharing point between
+        # the two tasks so height RMSE gradients and presence BCE/Tversky
+        # gradients never touch the same head parameters.
+        if self.split_trunk:
+            self.height_shared = nn.Sequential(
+                ConvGNAct(in_ch, hidden_ch, kernel_size=3),
+                nn.Dropout2d(drop) if drop > 0 else nn.Identity(),
+            )
+            self.height_shared_res = nn.Sequential(
+                ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
+                nn.Conv2d(hidden_ch, hidden_ch, 3, padding=1, bias=False),
+                nn.GroupNorm(_group_count(hidden_ch), hidden_ch),
+            )
+        else:
+            self.height_shared = None
+            self.height_shared_res = None
+
+        def _task_tower(depth):
+            if depth <= 0:
+                return nn.Identity()
+            return nn.Sequential(*[
+                ConvGNAct(hidden_ch, hidden_ch, kernel_size=3)
+                for _ in range(depth)
+            ])
+
+        # P3 head: only the presence side gets an optional task tower. Height
+        # stays on the original shared/height path so RMSE gradients keep the
+        # same routing surface as the xf095 baseline.
+        self.presence_tower = _task_tower(self.presence_tower_depth)
+
+        # --- Building-boundary auxiliary head (Stage D) ---
+        # Activated when building_boundary_weight > 0. Reads the shared trunk
+        # feature and emits a single boundary logit channel. Used ONLY for
+        # auxiliary edge supervision during training; the submission output
+        # (channels 0-3) is unaffected.
+        if self.use_boundary_head:
+            self.boundary_head = nn.Sequential(
+                ConvGNAct(hidden_ch, hidden_ch, kernel_size=3),
+                nn.Conv2d(hidden_ch, 1, 1),
+            )
+        else:
+            self.boundary_head = None
 
         # --- Fraction head (auxiliary: soft coverage regression) ---
         self.fraction_head = (
@@ -264,12 +327,41 @@ class MultiTaskPredictionHead(nn.Module):
             self.presence_delta_head["water"](presence_extra),
         ], dim=1)
 
+    def _run_seg_trunk(self, feat):
+        h = self.shared(feat)
+        return self.shared_act(h + self.shared_res(h))
+
+    def _run_height_trunk(self, feat):
+        h = self.height_shared(feat)
+        return self.shared_act(h + self.height_shared_res(h))
+
     def forward(self, x, return_aux=False, presence_extra=None,
                 water_bypass_x=None, height_feature_x=None,
                 head_modulation=None):
-        # Shared trunk with residual
-        x = self.shared(x)
-        x = self.shared_act(x + self.shared_res(x))
+        head_input = x
+        # Soft one-way decouple via gradient scaling (forward identity:
+        # s*t + (1-s)*t.detach() == t). s=1 fully coupled, s=0 hard detach.
+        # In split_trunk mode the cut sits at the SEG-TRUNK INPUT, so the
+        # entire segmentation side (seg trunk, presence tower/heads,
+        # boundary, fraction) stops writing gradients into the shared
+        # backbone — the height trunk owns it. In single-trunk mode the cut
+        # stays at the presence-tower input (merged-grad-scale behavior).
+        s = self.presence_trunk_grad_scale
+        sh = self.height_trunk_grad_scale
+
+        def _scale_grad(t, g):
+            if g >= 1.0:
+                return t
+            if g <= 0.0:
+                return t.detach()
+            return g * t + (1.0 - g) * t.detach()
+
+        def _attenuate(t):
+            return _scale_grad(t, s)
+
+        # Segmentation trunk with residual (the original shared trunk; when
+        # split_trunk=True only presence/fraction/boundary read from it)
+        x = self._run_seg_trunk(_attenuate(head_input) if self.split_trunk else head_input)
         if head_modulation is not None:
             gamma = head_modulation["gamma"]
             beta = head_modulation["beta"]
@@ -287,11 +379,20 @@ class MultiTaskPredictionHead(nn.Module):
         # the token-fused `x`. Motivated by xf107 height regression vs the
         # pixel-only (alpha+tessera) baseline: token additive/FiLM residuals
         # smooth high-frequency height detail while still boosting IoU.
-        if height_feature_x is not None:
-            x_height = self.shared(height_feature_x)
-            x_height = self.shared_act(x_height + self.shared_res(x_height))
+        if self.split_trunk:
+            # Dual-trunk: height reads the head input through its own trunk
+            # weights; no forward activation or backward gradient is shared
+            # with the segmentation trunk.
+            h_in = height_feature_x if height_feature_x is not None else head_input
+            x_height = self._run_height_trunk(_scale_grad(h_in, sh))
+        elif height_feature_x is not None:
+            x_height = self._run_seg_trunk(height_feature_x)
         else:
             x_height = x
+        # In split_trunk mode `x` is already attenuated at the trunk input;
+        # otherwise apply the scale here (cuts only the presence route into
+        # the shared trunk, leaving fraction/boundary fully coupled).
+        x_presence = self.presence_tower(x if self.split_trunk else _attenuate(x))
 
         # Optional water-only bypass: run the same shared trunk weights on a
         # parallel feature that did not see the TerraMind cross-level adapter,
@@ -299,8 +400,13 @@ class MultiTaskPredictionHead(nn.Module):
         # height, fraction, FiLM, and Tessera-residual paths stay on `x`.
         bypass_h = None
         if water_bypass_x is not None and self.presence_head_kind == "split_all":
-            bypass_h = self.shared(water_bypass_x)
-            bypass_h = self.shared_act(bypass_h + self.shared_res(bypass_h))
+            # Same attenuation policy as the main seg path: cut at the trunk
+            # input in split mode, after the trunk otherwise.
+            if self.split_trunk:
+                bypass_h = self._run_seg_trunk(_attenuate(water_bypass_x))
+            else:
+                bypass_h = _attenuate(self._run_seg_trunk(water_bypass_x))
+            bypass_h = self.presence_tower(bypass_h)
 
         # Optional soft fraction head. In 081 it remains an auxiliary target
         # but is no longer injected into the height branch.
@@ -316,12 +422,12 @@ class MultiTaskPredictionHead(nn.Module):
         # logit correction on top of the alpha-only logits.
         if bypass_h is not None:
             alpha_presence_logits = torch.cat([
-                self.presence_head["building"](x),
-                self.presence_head["tree"](x),
+                self.presence_head["building"](x_presence),
+                self.presence_head["tree"](x_presence),
                 self.presence_head["water"](bypass_h),
             ], dim=1)
         else:
-            alpha_presence_logits = self._forward_presence_head(x)
+            alpha_presence_logits = self._forward_presence_head(x_presence)
         if presence_extra is not None:
             if self.presence_delta_head is None:
                 raise ValueError("presence_extra was provided but this head has no residual branch")
@@ -410,6 +516,9 @@ class MultiTaskPredictionHead(nn.Module):
             "height_building": building_height,
             "height_vegetation": vegetation_height,
         }
+        if self.boundary_head is not None:
+            # Boundary supervision runs on the token-fused shared feature `x`.
+            aux["building_boundary_logits"] = self.boundary_head(x)
         if fractions is not None:
             aux["fraction_logits"] = fraction_logits
             aux["fractions"] = fractions
