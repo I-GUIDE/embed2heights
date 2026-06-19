@@ -1949,6 +1949,7 @@ class MultiBackboneFusion(nn.Module):
         # `freeze_backbone_stages` groups. Adapter / late layers / decoder /
         # gate / head remain trainable.
         self.freeze_backbone_stages = int(freeze_backbone_stages)
+        self._frozen_bb_modules = []
         if self.freeze_backbone_stages > 0:
             # timm features_only resnet exposes conv1/bn1/act1/maxpool + layer1..4
             freeze_groups = ["__stem__", "layer1", "layer2", "layer3", "layer4"]
@@ -1961,11 +1962,19 @@ class MultiBackboneFusion(nn.Module):
                         if mod is not None:
                             for prm in mod.parameters():
                                 prm.requires_grad = False
+                            self._frozen_bb_modules.append(mod)
                 else:
                     mod = getattr(self.bb, group, None)
                     if mod is not None:
                         for prm in mod.parameters():
                             prm.requires_grad = False
+                        self._frozen_bb_modules.append(mod)
+            # Freezing requires_grad does NOT stop BN running-stat updates
+            # (they are buffers). Put frozen groups in eval() so their BN uses
+            # the pretrained running stats and never accumulates batch stats.
+            # train() is overridden below to keep them in eval permanently.
+            for mod in self._frozen_bb_modules:
+                mod.eval()
             bb_frozen = sum(
                 p.numel() for p in self.bb.parameters() if not p.requires_grad
             )
@@ -2001,6 +2010,14 @@ class MultiBackboneFusion(nn.Module):
             disable_head_film=disable_head_film,
         )
 
+    def train(self, mode=True):
+        super().train(mode)
+        # Keep frozen pretrained backbone groups in eval mode so their BN uses
+        # (and never updates/corrupts) the pretrained running statistics.
+        for mod in getattr(self, "_frozen_bb_modules", []):
+            mod.eval()
+        return self
+
     def _primary_features(self, x):
         x1 = self.p_inc(x)
         x2 = self.p_down1(x1)
@@ -2026,6 +2043,18 @@ class MultiBackboneFusion(nn.Module):
         return x
 
     def _backbone_features(self, x):
+        # The pretrained backbone branch is numerically fragile under fp16
+        # autocast: extreme embedding activations overflow its BatchNorm,
+        # corrupting running_mean/running_var (buffers, updated every forward
+        # regardless of requires_grad) -> nan features at eval time -> the
+        # additive gated fusion propagates nan everywhere (Val=0). Run the
+        # whole branch in fp32 so BN stats stay finite. The primary LightUNet
+        # path + head keep their fp16 speedup.
+        with torch.amp.autocast("cuda", enabled=False):
+            x = x.float()
+            return self._backbone_features_fp32(x)
+
+    def _backbone_features_fp32(self, x):
         H, W = x.shape[-2:]
         bb_in = self._adapt_input(x)
         f1, f2, f3, f4 = self.bb(bb_in)  # strides 4, 8, 16, 32
