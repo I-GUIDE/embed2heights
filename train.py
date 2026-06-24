@@ -111,6 +111,7 @@ def build_loss(args, device):
         building_boundary_weight=getattr(args, "building_boundary_weight", 0.0),
         building_ring_presence_alpha=getattr(args, "building_ring_presence_alpha", 0.0),
         building_ring_kernel=getattr(args, "building_ring_kernel", 5),
+        presence_coverage_threshold=getattr(args, "presence_coverage_threshold", 0.0),
     ).to(device)
     print(
         "Using loss: "

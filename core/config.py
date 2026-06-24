@@ -242,6 +242,12 @@ def parse_args():
     p.add_argument("--building-ring-kernel", type=int,
                    help="Odd kernel size of the dilation/erosion used to build the "
                         "presence-BCE boundary ring (5 -> ~2px each side).")
+    p.add_argument("--presence-coverage-threshold", type=float,
+                   help="Build the presence-head supervision target as "
+                        "(coverage > thr) per class instead of the legacy "
+                        "argmax+any-present one-hot. ~0.10 aligns with the "
+                        "official GT (reverse-engineered from the public board). "
+                        "0.0 = legacy behavior (default).")
     p.add_argument("--presence-trunk-grad-scale", type=float,
                    help="Scale of presence-loss gradients allowed into the shared "
                         "trunk (soft one-way decouple). 1.0 = fully coupled, "
@@ -388,6 +394,7 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "building_boundary_weight": getattr(args, "building_boundary_weight", 0.0),
             "building_ring_presence_alpha": getattr(args, "building_ring_presence_alpha", 0.0),
             "building_ring_kernel": getattr(args, "building_ring_kernel", 5),
+            "presence_coverage_threshold": getattr(args, "presence_coverage_threshold", 0.0),
             "ema_decay": getattr(args, "ema_decay", 0.0),
             "lr_scheduler": getattr(args, "lr_scheduler", "plateau"),
             "lr_eta_min": getattr(args, "lr_eta_min", 1e-5),

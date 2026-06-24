@@ -32,7 +32,8 @@ class ImprovedCompositeLoss(nn.Module):
                  small_building_max_pixels=0,
                  building_boundary_weight=0.0,
                  building_ring_presence_alpha=0.0,
-                 building_ring_kernel=5):
+                 building_ring_kernel=5,
+                 presence_coverage_threshold=0.0):
         super().__init__()
         if loss_preset != "presence_centered":
             raise ValueError("loss_preset must be presence_centered")
@@ -79,6 +80,10 @@ class ImprovedCompositeLoss(nn.Module):
         if ring_kernel % 2 == 0:
             raise ValueError("building_ring_kernel must be odd")
         self.building_ring_kernel = ring_kernel
+        # >0 aligns presence supervision with the official GT (coverage>thr,
+        # ~0.10 reverse-engineered from the public board). 0.0 keeps the legacy
+        # argmax+any-present target. See _build_presence_target in forward().
+        self.presence_coverage_threshold = float(presence_coverage_threshold)
 
         self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
         self.fraction_mae_weights = torch.tensor([1.0, 1.0, 1.0]).float()
@@ -238,9 +243,17 @@ class ImprovedCompositeLoss(nn.Module):
         aux_height_vegetation_loss = zero
         if aux_outputs is not None and "presence_logits" in aux_outputs:
             fractions = targets[:, :3, :, :]
-            any_present = (fractions > 0).any(dim=1, keepdim=True).float()
-            argmax_idx = fractions.argmax(dim=1, keepdim=True)
-            presence_target = torch.zeros_like(fractions).scatter_(1, argmax_idx, 1.0) * any_present
+            if self.presence_coverage_threshold > 0.0:
+                # Official GT marks a 10 m pixel positive for a class iff its
+                # coverage exceeds a low threshold (~0.10, reverse-engineered
+                # from the public board); the legacy argmax+any-present rule
+                # below over-counts building ~3x. Per-class (multi-label) is
+                # fine: the 3 coverages sum to <=1, so double-positives are rare.
+                presence_target = (fractions > self.presence_coverage_threshold).float()
+            else:
+                any_present = (fractions > 0).any(dim=1, keepdim=True).float()
+                argmax_idx = fractions.argmax(dim=1, keepdim=True)
+                presence_target = torch.zeros_like(fractions).scatter_(1, argmax_idx, 1.0) * any_present
 
             # Building boundary ring for presence-BCE upweighting. Same hard
             # mask convention as `_building_boundary_loss` (argmax building),
