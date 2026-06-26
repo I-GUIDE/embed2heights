@@ -1,5 +1,7 @@
 """PyTorch datasets for competition raster embeddings."""
 
+import os
+
 import numpy as np
 import rasterio
 import torch
@@ -99,6 +101,33 @@ def _sample_or_center_origin(height, width, crop_size, is_train):
 def pick_dataset_class(model_type, n_channels):
     """Single-source datasets only handle pixel rasters in the clean repo."""
     return PixelEmbeddingDataset
+
+
+def _tile_core_from_path(path):
+    """'.../label_1597_GD_2023.tif' -> '1597_GD' (matches missing-mask filenames)."""
+    import re
+    m = re.search(r"(\d{4}_[A-Z]{2})", os.path.basename(path))
+    return m.group(1) if m else None
+
+
+def _apply_missing_mask(valid_mask, tar_path, missing_mask_dir):
+    """Zero the GLOBAL (presence/seg) validity channel on flagged missing-building
+    pixels so the model is NOT penalized for predicting building where the footprint
+    label was deleted. Height validity (channel 1) is left intact — the nDSM there is
+    real building height and we keep supervising it (mirrors the ndsm_hole convention,
+    but for the presence label instead of the height label).
+    `valid_mask` is (2, H, W); edited in place and returned."""
+    core = _tile_core_from_path(tar_path)
+    if core is None:
+        return valid_mask
+    mpath = os.path.join(missing_mask_dir, f"{core}.npy")
+    if not os.path.exists(mpath):
+        return valid_mask
+    mm = np.load(mpath)
+    h = min(mm.shape[0], valid_mask.shape[1])
+    w = min(mm.shape[1], valid_mask.shape[2])
+    valid_mask[0, :h, :w] = valid_mask[0, :h, :w] * (1.0 - mm[:h, :w].astype(np.float32))
+    return valid_mask
 
 
 def _prepare_target(tar_path, image_shape, patch_size=None):
@@ -318,7 +347,7 @@ class PixelMultiTokenEmbeddingDataset(Dataset):
     channel-concatenated token sources at 16x16.
     """
     def __init__(self, file_pairs, patch_size=128, scale_factor=16, is_train=True,
-                 token_normalization=None, d4_aug=False):
+                 token_normalization=None, d4_aug=False, missing_mask_dir=None):
         self.patch_size = patch_size
         self.scale_factor = scale_factor
         self.is_train = is_train
@@ -328,6 +357,9 @@ class PixelMultiTokenEmbeddingDataset(Dataset):
         # Applied AFTER cropping; pixel + token + target share the same draw so
         # the 16:1 spatial correspondence is preserved. Training only.
         self.d4_aug = bool(d4_aug)
+        # Optional dir of per-tile missing-building masks; when set (training only)
+        # the presence/seg loss is dropped on flagged pixels (see _apply_missing_mask).
+        self.missing_mask_dir = missing_mask_dir
 
     def __len__(self):
         return len(self.file_pairs)
@@ -363,6 +395,8 @@ class PixelMultiTokenEmbeddingDataset(Dataset):
         pixel = np.concatenate([primary, secondary], axis=0)
         token = np.concatenate(token_arrays, axis=0)
         target, valid_mask = _prepare_target(tar_path, pixel.shape[1:], patch_size=self.patch_size)
+        if self.is_train and self.missing_mask_dir and tar_path is not None:
+            valid_mask = _apply_missing_mask(valid_mask, tar_path, self.missing_mask_dir)
 
         emb_patch_size = self.patch_size // self.scale_factor
 

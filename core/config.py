@@ -157,6 +157,11 @@ def parse_args():
     p.add_argument("--token-normalization-stats-path",
                    help="Path to token z-score stats .npz. Defaults to the run directory.")
     p.add_argument("--train-targets-dir")
+    p.add_argument("--missing-building-mask-dir",
+                   help="Optional dir of per-tile missing-building masks "
+                        "(<core>.npy uint8). When set, the presence/seg loss is "
+                        "dropped on flagged pixels (suspected human-deleted "
+                        "footprints) for the TRAIN split only. Default off.")
     p.add_argument("--split-file",
                    help="Path to a JSON split file. Loaded if present, else saved there.")
     p.add_argument("--batch-size", type=int)
@@ -304,6 +309,7 @@ def build_resolved_config(args, *, device=None, use_amp=None):
             "token_normalization_source_indices": args.token_normalization_source_indices,
             "token_normalization_stats_path": args.token_normalization_stats_path,
             "train_targets_dir": args.train_targets_dir,
+            "missing_building_mask_dir": getattr(args, "missing_building_mask_dir", None),
             "split_file": args.split_file,
             "patch_size": args.patch_size,
             "d4_aug": getattr(args, "d4_aug", False),
