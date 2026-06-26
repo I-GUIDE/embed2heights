@@ -284,6 +284,17 @@ def build_training_dataset(dataset_cls, pairs, args, *, is_train, extra_kwargs=N
                 dataset_kwargs["d4_aug"] = d4_aug
         except (TypeError, ValueError):
             pass
+    # Missing-building loss masking: drop the presence/seg loss on flagged
+    # (we believe human-deleted) building footprints. Training split only; the
+    # val split is scored against the real labels so it must stay unmasked.
+    missing_mask_dir = getattr(args, "missing_building_mask_dir", None)
+    if missing_mask_dir and is_train and "missing_mask_dir" not in dataset_kwargs:
+        try:
+            import inspect
+            if "missing_mask_dir" in inspect.signature(dataset_cls).parameters:
+                dataset_kwargs["missing_mask_dir"] = missing_mask_dir
+        except (TypeError, ValueError):
+            pass
     return dataset_cls(pairs, **dataset_kwargs)
 
 
