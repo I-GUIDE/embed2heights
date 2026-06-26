@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .heads import MultiTaskPredictionHead
 
@@ -47,22 +48,74 @@ class UpsampleBlock(nn.Module):
         return self.act(x)
 
 
+class WaveletDownsample(nn.Module):
+    """Haar-DWT downsample: a channel-preserving drop-in for ``nn.MaxPool2d(2)``.
+
+    MaxPool halves H,W and throws the high-frequency content away. The Haar DWT
+    also halves H,W but decomposes each channel into 4 subbands — LL (local
+    average) plus LH/HL/HH (vertical/horizontal/diagonal *edge* detail). We keep
+    all four (concat -> 4*C) and project back to C with a 1x1 conv, so the
+    encoder can *use* the boundary high-frequencies maxpool would have aliased
+    away (the WaveCNet anti-aliasing / shift-stability motivation). The proj is
+    initialised to copy LL only (== average pooling), so the network warm-starts
+    near the old behaviour and learns to read the edge subbands from there.
+    """
+
+    def __init__(self, channels):
+        super().__init__()
+        self.channels = channels
+        self.proj = nn.Conv2d(4 * channels, channels, kernel_size=1)
+        # Warm start: output = LL subband (≈ average pool); edge subbands off.
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+        with torch.no_grad():
+            for i in range(channels):
+                self.proj.weight[i, i, 0, 0] = 1.0
+
+    @staticmethod
+    def _haar(x):
+        # Pad odd spatial dims so the 2x2 decimation is exact.
+        if x.shape[-1] % 2:
+            x = F.pad(x, (0, 1))
+        if x.shape[-2] % 2:
+            x = F.pad(x, (0, 0, 0, 1))
+        xe, xo = x[:, :, 0::2, :], x[:, :, 1::2, :]
+        ee, eo = xe[:, :, :, 0::2], xe[:, :, :, 1::2]
+        oe, oo = xo[:, :, :, 0::2], xo[:, :, :, 1::2]
+        ll = (ee + eo + oe + oo) * 0.5
+        lh = (ee + eo - oe - oo) * 0.5
+        hl = (ee - eo + oe - oo) * 0.5
+        hh = (ee - eo - oe + oo) * 0.5
+        return torch.cat([ll, lh, hl, hh], dim=1)
+
+    def forward(self, x):
+        return self.proj(self._haar(x))
+
+
+def _make_downsample(kind, in_ch):
+    """'maxpool' (default LightUNet) or 'wavelet' (Haar-DWT, edge-preserving)."""
+    if (kind or "maxpool").lower() == "wavelet":
+        return WaveletDownsample(in_ch)
+    return nn.MaxPool2d(2)
+
+
 class LightUNet(nn.Module):
     def __init__(self, n_channels, n_classes, base_ch=32, norm_kind="bn",
                  presence_head_kind="shared", presence_head_depth=1,
-                 presence_branch_ch=None):
+                 presence_branch_ch=None, down_kind="maxpool"):
         super().__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.base_ch = base_ch
         self.norm_kind = norm_kind
+        self.down_kind = down_kind
         self.supports_aux_outputs = True
 
         c1, c2, c3, c4 = base_ch, base_ch * 2, base_ch * 4, base_ch * 8
         self.inc = DoubleConv(n_channels, c1, norm_kind=norm_kind)
-        self.down1 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c1, c2, norm_kind=norm_kind))
-        self.down2 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c2, c3, norm_kind=norm_kind))
-        self.down3 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c3, c4, norm_kind=norm_kind))
+        self.down1 = nn.Sequential(_make_downsample(down_kind, c1), DoubleConv(c1, c2, norm_kind=norm_kind))
+        self.down2 = nn.Sequential(_make_downsample(down_kind, c2), DoubleConv(c2, c3, norm_kind=norm_kind))
+        self.down3 = nn.Sequential(_make_downsample(down_kind, c3), DoubleConv(c3, c4, norm_kind=norm_kind))
 
         self.up1 = UpsampleBlock(c4, c3, norm_kind=norm_kind)
         self.conv1 = DoubleConv(c4, c3, norm_kind=norm_kind)

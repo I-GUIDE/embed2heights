@@ -13,7 +13,15 @@ def _build_pixel_backbone(kind, in_channels, n_classes, base_ch, norm_kind):
         return LightUNet(in_channels, n_classes, base_ch=base_ch, norm_kind=norm_kind)
     if k in ("unetpp", "unet++", "lightunetpp"):
         return LightUNetPP(in_channels, n_classes, base_ch=base_ch, norm_kind=norm_kind)
-    raise ValueError(f"Unknown pixel_backbone_kind={kind!r}; expected 'unet' or 'unetpp'.")
+    if k in ("wavelet", "wavelet_unet", "dwt"):
+        # LightUNet topology unchanged except MaxPool2d->Haar-DWT downsampling,
+        # which keeps the building-edge high-frequency subbands instead of
+        # aliasing them away. Channel-preserving, so it is a drop-in.
+        return LightUNet(in_channels, n_classes, base_ch=base_ch,
+                         norm_kind=norm_kind, down_kind="wavelet")
+    raise ValueError(
+        f"Unknown pixel_backbone_kind={kind!r}; expected 'unet', 'unetpp' or 'wavelet'."
+    )
 from .heads import MultiTaskPredictionHead
 from .pixel_fusion import (
     _apply_fusion_gate,
