@@ -1,0 +1,101 @@
+name: xfusion_095_p3_2stage_softbin_covgt10_delmask_wavelet_unetpp
+description: >
+  COMBINED delmask + wavelet. delmask = drop presence/seg loss on suspected
+  human-deleted building footprints (missing_building_mask_dir, runs/missing_masks);
+  fold0 fair A/B (flagged excluded) bld IoU +0.0102. wavelet = Haar-DWT edge-preserving
+  downsampling; fold0 bld IoU +0.0074. Orthogonal levers stacked for the 3seed x 5fold
+  ensemble. ORIG: VARIANT 2 (wavelet downsampling) of the covgt10 lineage. Differs from its
+  paired control xfusion_095_p3_2stage_softbin_covgt10 by ONLY
+  pixel_backbone_kind (unet -> wavelet): the 3 MaxPool2d(2) downsamplers in both
+  pixel LightUNet branches are replaced by Haar-DWT wavelet pooling that keeps
+  the LH/HL/HH building-edge high-frequency subbands (1x1-conv projected back to
+  the same channel count, warm-started as LL/avg-pool) instead of aliasing them
+  away. Anti-aliased, shift-stable downsampling (WaveCNet motivation) so edge
+  detail survives the encoder bottleneck. Channel-preserving => stage-1 ckpt
+  still warm-starts stage-2 strict-clean. NOTE adjacency to detail-branch-refuted
+  (resolution alone was not the bottleneck); this tests aliasing, not resolution.
+  Run via two_stage_train_eval.sbatch CONFIG=this EXP=...; purify by the template.
+reference: xfusion_095_p3_2stage_softbin_covgt10
+
+data:
+  train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/alphaearth_emb
+  secondary_train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/tessera_emb
+  token_train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/terramind_s1_emb
+  secondary_token_train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/terramind_s2_emb
+  third_token_train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/thor_s1_emb
+  fourth_token_train_embeddings_dir: /u/dingqi2/workspace/esa/data/train/thor_s2_emb
+  train_targets_dir: /u/dingqi2/workspace/esa/data/train/labels
+  missing_building_mask_dir: ${REPO_DIR}/runs/missing_masks
+  split_file: ${REPO_DIR}/splits/group_code_5fold_seed42/fold_0/split.json
+  patch_size: 256
+
+model:
+  model_type: xfusion_unet_hybrid_cross_source
+  lightunet_base_ch: 48
+  lightunet_norm_kind: bn
+  tessera_presence_ch: 0
+  tessera_hidden_ch: 96
+  tessera_hidden_depth: 2
+  height_specialist_depth: 1
+  height_gate_source: alpha
+  height_hidden_ch: 96
+  height_trunk_depth: 2
+  height_independent_branches: true
+  height_head_kind: softbin
+  height_n_bins: 64
+  height_bin_max_m: 80.0
+  height_bin_max_m_building:
+  height_bin_max_m_veg:
+  height_bin_spacing_building: log
+  height_bin_spacing_veg: log
+  gate_mode: rich
+  gate_untied: false
+  gate_init_bias: 4.0
+  modality_dropout: 0.0
+  presence_head_kind: split_all
+  presence_head_depth: 1
+  presence_branch_ch: 48
+  use_fraction_aux: true
+  use_fraction_film: false
+  token_calibration: true
+  token_calibration_source_indices: [0, 1]
+  presence_tower_depth: 2
+  split_trunk: true
+  presence_trunk_grad_scale: 1.0
+  pixel_backbone_kind: unetpp_wavelet
+
+training:
+  batch_size: 16
+  epochs: 80
+  lr: 0.0002
+  weight_decay: 0.0001
+  seed: 0
+  grad_accum_steps: 1
+  weight_mae: 1.0
+  weight_presence_tversky: 1.0
+  weight_fraction_mae: 0.1
+  weight_height_boost: 2.0
+  aux_weight: 1.0
+  height_loss_kind: l1
+  huber_delta: 1.0
+  build_height_boost: 5.0
+  veg_height_boost: 1.5
+  aux_veg_weight: 1.0
+  height_bin_aux_weight: 0.5
+  height_bin_sigma_bins: 1.5
+  tversky_water_alpha: 0.3
+  water_empty_topk: 512
+  weight_water_empty_topk: 0.03
+  building_boundary_weight: 0.25
+  building_ring_presence_alpha: 2.0
+  building_ring_kernel: 5
+  presence_coverage_threshold: 0.1
+  freq_loss_weight: 0.0
+
+runtime:
+  experiment_name: xfusion_095_p3_2stage_softbin_covgt10_delmask_wavelet_unetpp
+  output_dir: ${REPO_DIR}/runs
+  amp: false
+  data_parallel: false
+  num_workers: 4
+  prefetch_factor: 1

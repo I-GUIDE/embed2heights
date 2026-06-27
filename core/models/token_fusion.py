@@ -19,8 +19,14 @@ def _build_pixel_backbone(kind, in_channels, n_classes, base_ch, norm_kind):
         # aliasing them away. Channel-preserving, so it is a drop-in.
         return LightUNet(in_channels, n_classes, base_ch=base_ch,
                          norm_kind=norm_kind, down_kind="wavelet")
+    if k in ("unetpp_wavelet", "unetpp+wavelet", "wavelet_unetpp", "dwt_unetpp"):
+        # COMBO: U-Net++ nested decoder (height-generalization) + Haar-DWT
+        # edge-preserving downsampling (building boundary). Both axes stacked.
+        return LightUNetPP(in_channels, n_classes, base_ch=base_ch,
+                           norm_kind=norm_kind, down_kind="wavelet")
     raise ValueError(
-        f"Unknown pixel_backbone_kind={kind!r}; expected 'unet', 'unetpp' or 'wavelet'."
+        f"Unknown pixel_backbone_kind={kind!r}; expected 'unet', 'unetpp', "
+        "'wavelet', or 'unetpp_wavelet'."
     )
 from .heads import MultiTaskPredictionHead
 from .pixel_fusion import (

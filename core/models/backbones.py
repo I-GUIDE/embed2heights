@@ -170,21 +170,24 @@ class LightUNetPP(nn.Module):
 
     def __init__(self, n_channels, n_classes, base_ch=32, norm_kind="bn",
                  presence_head_kind="shared", presence_head_depth=1,
-                 presence_branch_ch=None):
+                 presence_branch_ch=None, down_kind="maxpool"):
         super().__init__()
         self.n_channels = n_channels
         self.n_classes = n_classes
         self.base_ch = base_ch
         self.norm_kind = norm_kind
+        self.down_kind = down_kind
         self.supports_aux_outputs = True
 
         c = [base_ch, base_ch * 2, base_ch * 4, base_ch * 8]
 
-        # Column 0 = encoder.
+        # Column 0 = encoder. The 3 spatial downsamplers use the shared factory
+        # so U-Net++ can ALSO take the Haar-DWT edge-preserving pooling (combo
+        # with wavelet); down_kind="maxpool" keeps the original behaviour.
         self.x0_0 = DoubleConv(n_channels, c[0], norm_kind=norm_kind)
-        self.x1_0 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c[0], c[1], norm_kind=norm_kind))
-        self.x2_0 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c[1], c[2], norm_kind=norm_kind))
-        self.x3_0 = nn.Sequential(nn.MaxPool2d(2), DoubleConv(c[2], c[3], norm_kind=norm_kind))
+        self.x1_0 = nn.Sequential(_make_downsample(down_kind, c[0]), DoubleConv(c[0], c[1], norm_kind=norm_kind))
+        self.x2_0 = nn.Sequential(_make_downsample(down_kind, c[1]), DoubleConv(c[1], c[2], norm_kind=norm_kind))
+        self.x3_0 = nn.Sequential(_make_downsample(down_kind, c[2]), DoubleConv(c[2], c[3], norm_kind=norm_kind))
 
         # Up-projections feeding each X^i_j (j>=1): X^(i+1)_(j-1) -> c[i].
         self.up0_1 = UpsampleBlock(c[1], c[0], norm_kind=norm_kind)
