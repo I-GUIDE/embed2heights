@@ -407,10 +407,12 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
                  token_channels=0, use_se=False, use_coord_attn=False,
                  use_bottleneck_attn=False, use_mixstyle=False, disable_head_film=False,
                  use_attn_gates=False, use_aspp=False, bottleneck_attn_depth=1,
-                 use_modern=False,
+                 use_modern=False, detail_bypass=False, sharp_upsample=False,
+                 scene_film=False, encoder_arch="unet",
                  use_xsource_fusion=False, token_source_ch=768, token_ctx_ch=96,
                  xsource_attn_heads=4, xsource_token_calibration=False,
-                 use_spatial_token_film=False):
+                 use_spatial_token_film=False, height_dropout=0.0,
+                 use_shape_queries=False, shape_n_queries=32, shape_depth=2):
         super().__init__()
         if n_classes != 4:
             raise ValueError("TesseraIoUFusionGatedLightUNet assumes 4 output channels")
@@ -435,6 +437,10 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
             use_aspp=bool(use_aspp),
             bottleneck_attn_depth=int(bottleneck_attn_depth),
             use_modern=bool(use_modern),
+            detail_bypass=bool(detail_bypass),
+            sharp_upsample=bool(sharp_upsample),
+            scene_film=bool(scene_film),
+            encoder_arch=str(encoder_arch),
         )
         self.alpha_unet.head = nn.Identity()
         self.tessera_feature_stem = TesseraCompressionStem(
@@ -475,6 +481,10 @@ class TesseraIoUFusionGatedLightUNet(nn.Module):
             height_blend_mode=height_blend_mode,
             dual_presence=dual_presence,
             disable_head_film=disable_head_film,
+            height_dropout=height_dropout,
+            use_shape_queries=use_shape_queries,
+            shape_n_queries=shape_n_queries,
+            shape_depth=shape_depth,
         )
 
         # CMGFNet-style deep supervision: parallel light prediction head from

@@ -1,5 +1,7 @@
 """Label-free AlphaEarth/Tessera data helpers for pretraining."""
 
+import os
+
 import numpy as np
 import rasterio
 import torch
@@ -11,24 +13,37 @@ from core.data.discovery import normalize_core_id
 
 
 def find_pixel_pretrain_pairs(train_alpha_dir, train_tessera_dir,
-                              test_alpha_dir=None, test_tessera_dir=None):
-    """Return label-free AlphaEarth/Tessera pairs from train and optional test dirs."""
+                              test_alpha_dir=None, test_tessera_dir=None,
+                              train_token_dir=None, test_token_dir=None):
+    """Return label-free AlphaEarth/Tessera (+optional token) pairs.
+
+    When a token dir is given, the matching 4-source token file
+    (tokens_<core_id>.tif) is attached for 6-source SSL; tiles without a token
+    file are skipped (with a count) so the set stays consistent.
+    """
     pairs = []
-    for split, alpha_dir, tessera_dir in (
-        ("train", train_alpha_dir, train_tessera_dir),
-        ("test", test_alpha_dir, test_tessera_dir),
+    skipped_no_token = 0
+    for split, alpha_dir, tessera_dir, token_dir in (
+        ("train", train_alpha_dir, train_tessera_dir, train_token_dir),
+        ("test", test_alpha_dir, test_tessera_dir, test_token_dir),
     ):
         if not alpha_dir and not tessera_dir:
             continue
         if not alpha_dir or not tessera_dir:
             raise ValueError(f"{split} pretrain source requires both alpha and tessera dirs")
         for alpha_path, tessera_path in find_multisource_embedding_files(alpha_dir, tessera_dir):
-            pairs.append({
-                "alpha": alpha_path,
-                "tessera": tessera_path,
-                "split": split,
-                "core_id": normalize_core_id(alpha_path),
-            })
+            core_id = normalize_core_id(alpha_path)
+            rec = {"alpha": alpha_path, "tessera": tessera_path,
+                   "split": split, "core_id": core_id}
+            if token_dir:
+                token_path = os.path.join(token_dir, f"tokens_{core_id}.tif")
+                if not os.path.exists(token_path):
+                    skipped_no_token += 1
+                    continue
+                rec["token"] = token_path
+            pairs.append(rec)
+    if skipped_no_token:
+        print(f"[pretrain] skipped {skipped_no_token} tiles with no matching token file")
     return pairs
 
 
@@ -76,4 +91,9 @@ class PixelFusionPretrainDataset(Dataset):
 
         alpha = alpha[:, top:top + self.patch_size, left:left + self.patch_size]
         tessera = tessera[:, top:top + self.patch_size, left:left + self.patch_size]
+        if "token" in rec:
+            # Tokens are coarse (16x16) global per-tile features — returned whole.
+            # Requires full-tile patches (patch_size == tile size); no spatial crop.
+            token = self._read(rec["token"])
+            return torch.from_numpy(alpha), torch.from_numpy(tessera), torch.from_numpy(token)
         return torch.from_numpy(alpha), torch.from_numpy(tessera)

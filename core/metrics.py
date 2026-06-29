@@ -30,9 +30,12 @@ WEIGHTS = {
     "RMSE_vegetation_height": 0.20,
 }
 
-# Label binarization threshold used by the server (any nonzero fraction is
-# positive). See METRIC_PROBE_REPORT.md.
-LABEL_THRESHOLD = 0.0
+# Label binarization threshold used by the OFFICIAL server: GT is positive only
+# where class coverage > 0.10 (reverse-engineered from the public board and
+# confirmed 2026-06-28). The old 0.0 ("any nonzero") was WRONG — it scored
+# against a more-inclusive GT than the LB, inflating local IoU (esp. building)
+# and causing the local→public gap. All sweeps/IoU now use the true threshold.
+LABEL_THRESHOLD = 0.10
 
 # Per-class RMSE normalization for `max(0, 1 - RMSE / X)`.
 RMSE_NORMALIZATION = {

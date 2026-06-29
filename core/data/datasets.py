@@ -160,15 +160,42 @@ def pick_dataset_class(model_type, n_channels):
     return PixelEmbeddingDataset if is_pixel else LatentTokenDataset
 
 
+# --- Classification-mask handling (set once by train.py before DataLoaders fork) ---
+# The organizers redact LANDCOVER labels in blocks while leaving the embedding (and
+# often the height) intact, in DIFFERENT locations from the height redactions. A
+# "cls-hole" = a pixel with NO landcover label but a real tall structure
+# (height > thr) — a classification-masked spot, symmetric to ndsm_hole (height
+# masked where landcover present). Modes:
+#   "off"     : legacy (no special handling)
+#   "exclude" : drop cls-holes from the CLASSIFICATION loss (model neither penalized
+#               for predicting nor taught to suppress there) — height stays supervised.
+#   "impute"  : height-derived FAKE label — set building=1 in cls-holes (tall+no-class)
+#               and keep supervising, to teach the model the masked content back.
+_CLS_HOLE_MODE = "off"
+_CLS_HOLE_H_THR = 2.0
+
+
+def set_cls_hole_config(mode="off", h_thr=2.0):
+    global _CLS_HOLE_MODE, _CLS_HOLE_H_THR
+    _CLS_HOLE_MODE = str(mode); _CLS_HOLE_H_THR = float(h_thr)
+
+
 def _prepare_target(tar_path, image_shape, patch_size=None):
     if tar_path is not None:
         with rasterio.open(tar_path) as src:
             raw_target = clean_raster_array(src.read())
-        global_valid = ~np.all(raw_target == 0, axis=0)
+        raw_global = ~np.all(raw_target == 0, axis=0)
         has_landcover = (raw_target[0] > 0) | (raw_target[1] > 0) | (raw_target[2] > 0)
         ndsm_hole = (raw_target[3] == 0) & has_landcover
-        height_valid = global_valid & ~ndsm_hole
-        valid_mask = np.stack([global_valid, height_valid], axis=0).astype(np.float32)
+        height_valid = raw_global & ~ndsm_hole         # height: unchanged (keeps cls-holes)
+        cls_valid = raw_global                          # classification mask (ch0 of valid_mask)
+        if _CLS_HOLE_MODE != "off":
+            cls_hole = (~has_landcover) & (raw_target[3] > _CLS_HOLE_H_THR)
+            if _CLS_HOLE_MODE == "exclude":
+                cls_valid = raw_global & ~cls_hole      # drop cls-holes from classification loss
+            elif _CLS_HOLE_MODE == "impute":
+                raw_target[0] = np.where(cls_hole, 1.0, raw_target[0])  # fake building label
+        valid_mask = np.stack([cls_valid, height_valid], axis=0).astype(np.float32)
         target = raw_target
         target[3, :, :] = np.maximum(target[3, :, :], 0.0) / HEIGHT_NORM_CONSTANT
         return target, valid_mask

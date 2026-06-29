@@ -13,6 +13,7 @@ import random
 import argparse
 import numpy as np
 import torch
+import torch.nn as nn
 import torch.optim as optim
 import rasterio
 from torch.utils.data import DataLoader, WeightedRandomSampler
@@ -28,6 +29,7 @@ from core.data import (
 from core.data.datasets import (
     pick_dataset_class, MultiPixelEmbeddingDataset,
     MultiLatentTokenDataset, PixelTokenEmbeddingDataset, PixelMultiTokenEmbeddingDataset,
+    set_cls_hole_config,
 )
 from core.losses import ImprovedCompositeLoss
 
@@ -301,6 +303,40 @@ def parse_args():
                         "ONLY to the BCE presence loss; Tversky + height masks keep the "
                         "fraction>0 convention. Matches the narrower description of Ye "
                         "Dingqi's fix and avoids over-restricting height supervision.")
+    p.add_argument("--argmax-include-bg", action="store_true",
+                   help="With --argmax-presence-target: include BACKGROUND (1-sum(frac)) in "
+                        "the argmax, so a pixel is positive for class c only if c beats the "
+                        "other classes AND background. Fixes the labmate's noted bug (a "
+                        "10%%-building/85%%-background pixel is now BACKGROUND, not building) "
+                        "— directly kills the measured building↔background FP flooding.")
+    p.add_argument("--building-presence-thr", type=float, default=0.0,
+                   help="Per-class building presence threshold: building is a positive "
+                        "presence/BCE target only where its fraction > thr (veg/water stay "
+                        "frac>0). Default 0.0 == frac>0 (no-op). Gentle, tunable alternative "
+                        "to --argmax-include-bg for cleaning building's 71%%-noisy frac>0 "
+                        "label (label-noise audit 2026-06-24). Ignored if argmax targets on.")
+    p.add_argument("--presence-coverage-thr", type=float, default=0.0,
+                   help="Coverage threshold for the presence TARGET of ALL classes, aligned "
+                        "to the official metric's GT binarization (coverage > 0.10, confirmed "
+                        "2026-06-28). Default 0.0 = legacy frac>0 (misaligned). Set 0.10 to "
+                        "train on the same positive set the leaderboard scores. Building may "
+                        "override via --building-presence-thr.")
+    p.add_argument("--cls-hole-mode", default="off", choices=["off", "exclude", "impute"],
+                   help="Handle organizer CLASSIFICATION-mask blocks (landcover redacted "
+                        "where a tall structure exists; symmetric to ndsm_hole). 'exclude' "
+                        "drops cls-holes (no-landcover & height>thr) from the classification "
+                        "loss; 'impute' sets a height-derived FAKE building label there. "
+                        "Height stays supervised either way. 'off' = legacy.")
+    p.add_argument("--cls-hole-h-thr", type=float, default=2.0,
+                   help="Min height (m) for a cls-hole (no-landcover but a real structure).")
+    p.add_argument("--water-argmax-bg", action="store_true",
+                   help="Per-class WATER label: water presence/BCE target is positive "
+                        "only where water beats {building, veg, background=1-sum(frac)} "
+                        "(argmax-include-bg, water channel only). Building+veg stay frac>0 "
+                        "(or building uses --building-presence-thr). Tests the labmate's "
+                        "'argmax helps water' finding per-class (water 19%% frac>0 noise) "
+                        "WITHOUT the global argmax-bg that guts building. Ignored if "
+                        "--argmax-presence-target is on.")
     p.add_argument("--boundary-weight", type=float, default=0.0,
                    help="Enable boundary-aware loss. Upweights BCE on the building "
                         "channel near GT boundaries. >0 enables, e.g. 1.0 to turn on.")
@@ -312,6 +348,37 @@ def parse_args():
                    help="Mix Lovász-Hinge loss on building logits with weight "
                         "lovasz_weight (added to total loss). Directly optimizes "
                         "building IoU. Recommended 0.3-0.7. 0 disables.")
+    p.add_argument("--boundary-weight-vegwater", type=float, default=0.0,
+                   help="Like --boundary-weight but upweights BCE on the VEG and "
+                        "WATER channels near their GT boundaries. Targets the "
+                        "veg/water boundary-recall leak. Reuses --boundary-sigma-px "
+                        "and --boundary-amp. 0 disables.")
+    p.add_argument("--lovasz-vegwater-weight", type=float, default=0.0,
+                   help="Mix Lovász-Hinge (IoU surrogate) on veg+water logits with "
+                        "this weight. Boundary-sensitive. 0 disables.")
+    p.add_argument("--detail-bypass", action="store_true",
+                   help="Add a full-res zero-init detail branch to the LightUNet "
+                        "(bypasses the encoder/bottleneck) to retain fine spatial "
+                        "detail. Starts as identity (== baseline).")
+    p.add_argument("--encoder-arch", default="unet",
+                   choices=["unet", "shallow", "dilated", "hrnet",
+                            "unetpp", "unet_wave", "unetpp_wave"],
+                   help="LightUNet encoder topology. 'unet' (default) = 3x "
+                        "downsampling (unchanged baseline). 'shallow' = 2 "
+                        "downsample stages (keeps more small-object detail). "
+                        "'dilated' = NO downsampling, atrous convs grow the "
+                        "receptive field at full res (directly preserves 1-4px "
+                        "buildings the pooling erases). 'hrnet' = a full-res "
+                        "stream maintained throughout with cross-res fusion. "
+                        "Evidence: D1/D2 diagnosis — building loss is small "
+                        "objects erased by 8x downsampling.")
+    p.add_argument("--sharp-upsample", action="store_true",
+                   help="Use PixelShuffle sub-pixel upsampling in the decoder "
+                        "instead of bilinear, for sharper class boundaries.")
+    p.add_argument("--scene-film", action="store_true",
+                   help="Scene-conditioning FiLM: derive a global scene/region "
+                        "descriptor from the LightUNet bottleneck and FiLM-modulate "
+                        "the decoder output. Zero-init (starts == baseline).")
     p.add_argument("--distill-teacher-dir", type=str, default=None,
                    help="Directory of teacher predictions ({core_id}.npy, shape "
                         "(4,H,W): ch0-2 presence probs, ch3 height in METERS). "
@@ -479,6 +546,11 @@ def parse_args():
                    help="Extra ConvGNAct layers prepended to the per-class height "
                         "specialist projections (building/vegetation). 0 = legacy 1x1 "
                         "projection only.")
+    p.add_argument("--height-dropout", type=float, default=0.0,
+                   help="Dropout2d on the height-trunk input only (presence path "
+                        "untouched). Regularizes the height path so it can't memorize "
+                        "local-region height stats → better test/LB height generalization "
+                        "(heights are the biggest local→public leak). 0.0 = off. Try 0.1.")
     p.add_argument("--height-gate-source", default="alpha",
                    choices=["alpha", "fused"],
                    help="Presence logits used to route the submitted height. alpha = "
@@ -587,6 +659,23 @@ def parse_args():
                         "under the 'current' preset). Defaults to DEFAULTS['lambdas'][3] "
                         "when unset. Useful when switching height loss kind (e.g. MSE "
                         "changes the magnitude/gradient profile of height_boost).")
+    p.add_argument("--use-shape-queries", action="store_true",
+                   help="Add the zero-init QueryShapeRefiner (MaskFormer-lite semantic "
+                        "mask-classification) as a residual on the presence logits — "
+                        "injects object-shape priors; starts as identity (== base model).")
+    p.add_argument("--shape-n-queries", type=int, default=32,
+                   help="Number of learned object queries for --use-shape-queries.")
+    p.add_argument("--shape-depth", type=int, default=2,
+                   help="Transformer decoder layers for the shape-query refiner.")
+    p.add_argument("--swa", action="store_true",
+                   help="Stochastic Weight Averaging: from --swa-start-frac of epochs, "
+                        "average weights at a constant --swa-lr; recompute BN at the end "
+                        "and save the averaged model as model_best.pth. Flat-minima / "
+                        "domain-generalization regularizer. Auto-disables torch.compile.")
+    p.add_argument("--swa-start-frac", type=float, default=0.7,
+                   help="Fraction of total epochs after which SWA averaging begins.")
+    p.add_argument("--swa-lr", type=float, default=1e-4,
+                   help="Constant LR held during the SWA averaging phase.")
     p.add_argument("--seed",           type=int, default=DEFAULTS["seed"])
     p.add_argument("--split-file",     default=None,
                    help="Path to a JSON split file. Loaded if present, else a new split is saved there.")
@@ -598,6 +687,38 @@ def parse_args():
                    help="Use strict checkpoint loading for --init-from-pretrain. "
                         "Default is non-strict filtered loading, which ignores "
                         "pretraining-only reconstruction heads.")
+    p.add_argument("--presence-grad-scale", type=float, default=1.0,
+                   help="Two-stage 'purify' knob. 1.0 (default) = fully coupled "
+                        "seg+height training (Stage 1, no behavior change). 0.0 = "
+                        "seg/presence losses no longer update the shared backbone, "
+                        "so only the height path re-tunes it (Stage 2). Combine "
+                        "with --select-on height and --init-from-pretrain <stage1>.")
+    p.add_argument("--height-grad-scale", type=float, default=1.0,
+                   help="Mirror of --presence-grad-scale for the Stage-3 'seg-purify' "
+                        "(labmate's +5th-place lever). 0.0 = height/fraction losses no "
+                        "longer update the backbone, so only segmentation re-tunes it. "
+                        "Combine with --select-on loss + --init-from-pretrain <stage2>.")
+    p.add_argument("--select-on", choices=("loss", "height"), default="loss",
+                   help="Which validation metric selects model_best.pth. 'loss' "
+                        "(default) = total composite val loss. 'height' = weighted "
+                        "height terms only (height_boost + aux_height + bin_ce); "
+                        "use for the Stage-2 height-purify checkpoint.")
+    p.add_argument("--freeze-backbone-epochs", type=int, default=0,
+                   help="Warm-start gentle integration: freeze the transferred "
+                        "backbone modules (alpha_unet/tessera_feature_stem/"
+                        "gate_conv/xsource_fusion) for the first N epochs so the "
+                        "fresh heads adapt to the pretrained features before the "
+                        "backbone moves. Frozen modules' BatchNorm is set to eval "
+                        "(AMP-safe — avoids fp16 corrupting frozen BN). 0 = off.")
+    p.add_argument("--unfreeze-warmup-epochs", type=int, default=3,
+                   help="After the backbone unfreezes, linearly ramp the LR from "
+                        "0 to the scheduled value over this many epochs to avoid an "
+                        "unfreeze shock. Used with --freeze-backbone-epochs.")
+    p.add_argument("--amp-dtype", choices=("fp16", "bf16"), default="fp16",
+                   help="Autocast precision. 'fp16' (default, legacy, needs GradScaler "
+                        "and can corrupt BatchNorm). 'bf16' = bfloat16: same speed on "
+                        "A100, numerically stable (no GradScaler, no BN corruption, no "
+                        "NaN-skip batches). Recommended for these BN models.")
     return p.parse_args()
 
 
@@ -863,6 +984,10 @@ def make_dataloaders(args, device):
         else:
             DatasetCls = MultiPixelEmbeddingDataset if args.secondary_train_embeddings_dir else pick_dataset_class(args.model_type, n_channels)
 
+    # Configure classification-mask handling BEFORE datasets/DataLoader workers fork.
+    set_cls_hole_config(getattr(args, "cls_hole_mode", "off"),
+                        getattr(args, "cls_hole_h_thr", 2.0))
+
     teacher_dir = getattr(args, "distill_teacher_dir", None)
     # Only datasets known to support KD accept the distill_teacher_dir kwarg.
     distill_kwargs = (
@@ -1041,6 +1166,7 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "tessera_hidden_ch":   args.tessera_hidden_ch,
         "tessera_hidden_depth": args.tessera_hidden_depth,
         "height_specialist_depth": args.height_specialist_depth,
+        "height_dropout": getattr(args, "height_dropout", 0.0),
         "height_gate_source": args.height_gate_source,
         "height_hidden_ch": args.height_hidden_ch,
         "height_trunk_depth": args.height_trunk_depth,
@@ -1107,16 +1233,31 @@ def save_experiment_config(exp_dir, args, device, use_amp):
         "backbone_input_norm": getattr(args, "backbone_input_norm", None),
         "backbone_pretrained_source": getattr(args, "backbone_pretrained_source", None),
         "freeze_backbone_stages": getattr(args, "freeze_backbone_stages", 0),
+        "use_shape_queries": getattr(args, "use_shape_queries", False),
+        "shape_n_queries": getattr(args, "shape_n_queries", 32),
+        "shape_depth": getattr(args, "shape_depth", 2),
         "distill_teacher_dir": getattr(args, "distill_teacher_dir", None),
         "distill_weight":      getattr(args, "distill_weight", 0.0),
         "distill_height_weight": getattr(args, "distill_height_weight", 1.0),
         "argmax_presence_target": getattr(args, "argmax_presence_target", False),
+        "argmax_include_bg": getattr(args, "argmax_include_bg", False),
         "argmax_bce_only":     getattr(args, "argmax_bce_only", False),
+        "building_presence_thr": getattr(args, "building_presence_thr", 0.0),
+        "presence_coverage_thr": getattr(args, "presence_coverage_thr", 0.0),
+        "water_argmax_bg":       getattr(args, "water_argmax_bg", False),
+        "cls_hole_mode":         getattr(args, "cls_hole_mode", "off"),
+        "cls_hole_h_thr":        getattr(args, "cls_hole_h_thr", 2.0),
         "disable_head_film":   getattr(args, "disable_head_film", False),
         "lovasz_weight":       getattr(args, "lovasz_weight", 0.0),
         "boundary_weight":     getattr(args, "boundary_weight", 0.0),
         "boundary_sigma_px":   getattr(args, "boundary_sigma_px", 2.0),
         "boundary_amp":        getattr(args, "boundary_amp", 4.0),
+        "boundary_weight_vegwater": getattr(args, "boundary_weight_vegwater", 0.0),
+        "lovasz_vegwater_weight": getattr(args, "lovasz_vegwater_weight", 0.0),
+        "detail_bypass":       getattr(args, "detail_bypass", False),
+        "sharp_upsample":      getattr(args, "sharp_upsample", False),
+        "scene_film":          getattr(args, "scene_film", False),
+        "encoder_arch":        getattr(args, "encoder_arch", "unet"),
         "train_targets_dir":    args.train_targets_dir,
         "val_split":       DEFAULTS["val_split"],
         "device":          str(device),
@@ -1162,7 +1303,8 @@ def _distillation_loss(student_out, teacher, masks, height_weight):
 
 def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
               grad_accum_steps=1, use_amp=False, desc="",
-              distill_weight=0.0, distill_height_weight=1.0):
+              distill_weight=0.0, distill_height_weight=1.0,
+              amp_dtype=torch.float16):
     """Train or eval one epoch. Returns (avg_loss, component_avgs)."""
     model.train(train)
     running_loss = 0.0
@@ -1196,7 +1338,7 @@ def run_epoch(model, loader, criterion, optimizer, scaler, device, *, train,
             else:
                 teacher_t = None
 
-            with torch.amp.autocast("cuda", enabled=use_amp):
+            with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
                 outputs = forward_for_training(model, imgs)
                 loss, loss_components = criterion(outputs, targets, masks)
                 if do_distill and teacher_t is not None:
@@ -1303,6 +1445,7 @@ def main():
         tessera_hidden_ch=args.tessera_hidden_ch,
         tessera_hidden_depth=args.tessera_hidden_depth,
         height_specialist_depth=args.height_specialist_depth,
+        height_dropout=getattr(args, "height_dropout", 0.0),
         lightunet_base_ch=args.lightunet_base_ch,
         height_gate_source=args.height_gate_source,
         height_hidden_ch=args.height_hidden_ch,
@@ -1329,6 +1472,10 @@ def main():
         use_aspp=getattr(args, "use_aspp", False),
         bottleneck_attn_depth=getattr(args, "bottleneck_attn_depth", 1),
         use_modern=getattr(args, "use_modern", False),
+        detail_bypass=getattr(args, "detail_bypass", False),
+        sharp_upsample=getattr(args, "sharp_upsample", False),
+        scene_film=getattr(args, "scene_film", False),
+        encoder_arch=getattr(args, "encoder_arch", "unet"),
         disable_head_film=getattr(args, "disable_head_film", False),
         use_xsource_fusion=getattr(args, "use_xsource_fusion", False),
         token_source_ch=getattr(args, "token_source_ch", 768),
@@ -1343,6 +1490,9 @@ def main():
         backbone_input_norm=getattr(args, "backbone_input_norm", None),
         backbone_pretrained_source=getattr(args, "backbone_pretrained_source", None),
         freeze_backbone_stages=getattr(args, "freeze_backbone_stages", 0),
+        use_shape_queries=getattr(args, "use_shape_queries", False),
+        shape_n_queries=getattr(args, "shape_n_queries", 32),
+        shape_depth=getattr(args, "shape_depth", 2),
     )
     if args.init_from_pretrain:
         load_pretrain_weights(
@@ -1350,12 +1500,31 @@ def main():
             args.init_from_pretrain,
             strict=args.init_pretrain_strict,
         )
+    # Two-stage purify: scale the gradient that seg/presence losses send to the
+    # shared backbone (set on every head exposing the knob). 1.0 = no-op.
+    pg_scale = getattr(args, "presence_grad_scale", 1.0)
+    if pg_scale != 1.0:
+        n_set = sum(
+            (setattr(m, "presence_grad_scale", float(pg_scale)) or 1)
+            for m in model.modules() if hasattr(m, "presence_grad_scale")
+        )
+        print(f"Two-stage purify: presence_grad_scale={pg_scale} set on {n_set} head(s).")
+    hg_scale = getattr(args, "height_grad_scale", 1.0)
+    if hg_scale != 1.0:
+        n_set = sum(
+            (setattr(m, "height_grad_scale", float(hg_scale)) or 1)
+            for m in model.modules() if hasattr(m, "height_grad_scale")
+        )
+        print(f"Seg-purify: height_grad_scale={hg_scale} set on {n_set} head(s).")
     model = model.to(device)
-    if getattr(args, "compile", False) and device.type == "cuda":
+    if getattr(args, "compile", False) and device.type == "cuda" and not getattr(args, "swa", False):
         torch.set_float32_matmul_precision("high")
         model = model.to(memory_format=torch.channels_last)
         model = torch.compile(model, mode="default")
         print("torch.compile enabled (mode='default')")
+    elif getattr(args, "compile", False) and getattr(args, "swa", False):
+        print("torch.compile DISABLED because --swa is set (AveragedModel deep-copy "
+              "is incompatible with compiled modules).")
     if args.data_parallel:
         if device.type != "cuda" or torch.cuda.device_count() < 2:
             print(
@@ -1389,7 +1558,12 @@ def main():
               f"{len(no_decay_params)} no-decay (norms/biases).")
     else:
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    amp_dtype = torch.bfloat16 if getattr(args, "amp_dtype", "fp16") == "bf16" else torch.float16
+    # GradScaler is only needed/valid for fp16; bf16 has fp32 dynamic range.
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and amp_dtype == torch.float16)
+    if use_amp:
+        print(f"AMP autocast dtype: {('bfloat16' if amp_dtype==torch.bfloat16 else 'float16')} "
+              f"(GradScaler {'on' if amp_dtype==torch.float16 else 'off'})")
 
     use_plateau = args.lr_schedule == "plateau"
     if use_plateau:
@@ -1410,6 +1584,33 @@ def main():
 
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
         print(f"LR schedule: cosine, warmup={_warmup} epochs, total={_total}.")
+
+    # --- Warm-start gentle integration: freeze the transferred backbone for the
+    # first N epochs (BN→eval so AMP can't corrupt frozen stats), then unfreeze
+    # with an LR warmup. The optimizer above already holds ALL params, so toggling
+    # requires_grad gates updates without rebuilding it. No-op when N==0. ---
+    _FREEZE_PREFIXES = ("alpha_unet", "tessera_feature_stem", "gate_conv", "xsource_fusion")
+    freeze_epochs = int(getattr(args, "freeze_backbone_epochs", 0))
+    unfreeze_warmup = max(1, int(getattr(args, "unfreeze_warmup_epochs", 3)))
+    _bm = model.module if isinstance(model, torch.nn.DataParallel) else model
+
+    def _set_backbone_frozen(frozen):
+        n = 0
+        for pname, p in _bm.named_parameters():
+            if any(pname.startswith(pre) for pre in _FREEZE_PREFIXES):
+                p.requires_grad = (not frozen)
+                n += 1
+        for mname, m in _bm.named_modules():
+            if isinstance(m, nn.BatchNorm2d) and any(
+                mname.startswith(pre) for pre in _FREEZE_PREFIXES
+            ):
+                m.eval() if frozen else m.train()
+        return n
+
+    if freeze_epochs > 0:
+        _nfz = _set_backbone_frozen(True)
+        print(f"Warm-start freeze: {_nfz} backbone params frozen (BN→eval) for "
+              f"{freeze_epochs} epochs, then {unfreeze_warmup}-epoch LR warmup.")
     resolved_loss_preset = resolve_loss_preset(args)
     loss_lambdas = effective_loss_lambdas(args)
     criterion = ImprovedCompositeLoss(
@@ -1439,9 +1640,15 @@ def main():
         boundary_weight=getattr(args, "boundary_weight", 0.0),
         boundary_sigma_px=getattr(args, "boundary_sigma_px", 2.0),
         boundary_amp=getattr(args, "boundary_amp", 4.0),
+        boundary_weight_vegwater=getattr(args, "boundary_weight_vegwater", 0.0),
         lovasz_weight=getattr(args, "lovasz_weight", 0.0),
+        lovasz_vegwater_weight=getattr(args, "lovasz_vegwater_weight", 0.0),
         argmax_presence_target=getattr(args, "argmax_presence_target", False),
         argmax_bce_only=getattr(args, "argmax_bce_only", False),
+        argmax_include_bg=getattr(args, "argmax_include_bg", False),
+        building_presence_thr=getattr(args, "building_presence_thr", 0.0),
+        presence_coverage_thr=getattr(args, "presence_coverage_thr", 0.0),
+        water_argmax_bg=getattr(args, "water_argmax_bg", False),
     ).to(device)
     print(
         "Using loss: "
@@ -1472,26 +1679,54 @@ def main():
         f"task={args.task}"
     )
 
+    swa_model = None
+    swa_start = args.epochs
+    if getattr(args, "swa", False):
+        from torch.optim.swa_utils import AveragedModel
+        swa_model = AveragedModel(model)
+        swa_start = int(args.swa_start_frac * args.epochs)
+        print(f"SWA enabled: averaging weights from epoch {swa_start + 1}/{args.epochs} "
+              f"at constant lr={args.swa_lr}.")
+
     print(f"Starting training on {device}...")
     train_losses, val_losses = [], []
     best_val_loss = float("inf")
 
     for epoch in range(args.epochs):
+        # Warm-start: unfreeze the backbone once the freeze window ends, then
+        # ramp LR over `unfreeze_warmup` epochs (multiplier applied on top of the
+        # scheduler's LR; LambdaLR recomputes from base_lrs so this never compounds).
+        if freeze_epochs > 0 and epoch == freeze_epochs:
+            _set_backbone_frozen(False)
+            print(f"   >> Unfroze backbone at epoch {epoch + 1} "
+                  f"(LR warmup over {unfreeze_warmup} epochs).")
+        if freeze_epochs > 0 and freeze_epochs <= epoch < freeze_epochs + unfreeze_warmup:
+            _ramp = float(epoch - freeze_epochs + 1) / float(unfreeze_warmup)
+            for pg in optimizer.param_groups:
+                pg["lr"] = pg["lr"] * _ramp
         tr_loss, tr_comp = run_epoch(
             model, train_loader, criterion, optimizer, scaler, device,
             train=True, grad_accum_steps=grad_accum_steps, use_amp=use_amp,
             desc=f"Epoch {epoch + 1}/{args.epochs} [train]",
             distill_weight=getattr(args, "distill_weight", 0.0),
             distill_height_weight=getattr(args, "distill_height_weight", 1.0),
+            amp_dtype=amp_dtype,
         )
         val_loss, val_comp = run_epoch(
             model, val_loader, criterion, optimizer, scaler, device,
             train=False, use_amp=use_amp,
             desc=f"Epoch {epoch + 1}/{args.epochs} [val]",
+            amp_dtype=amp_dtype,
         )
         train_losses.append(tr_loss)
         val_losses.append(val_loss)
-        if use_plateau:
+        if swa_model is not None and epoch >= swa_start:
+            for pg in optimizer.param_groups:
+                pg["lr"] = args.swa_lr
+            swa_model.update_parameters(model)
+            print(f"   >> SWA: averaged epoch {epoch + 1} (n_averaged="
+                  f"{int(swa_model.n_averaged.item())}).")
+        elif use_plateau:
             scheduler.step(val_loss)
         else:
             scheduler.step()
@@ -1504,10 +1739,19 @@ def main():
             "lr": optimizer.param_groups[0]["lr"],
         })
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if args.select_on == "height":
+            select_metric = (
+                float(val_comp.get("weighted_height_boost", 0.0))
+                + float(val_comp.get("weighted_aux_height", 0.0))
+                + float(val_comp.get("weighted_height_bin_ce", 0.0))
+            )
+        else:
+            select_metric = val_loss
+        if select_metric < best_val_loss:
+            best_val_loss = select_metric
             torch.save(state_dict_for_save(model), best_model_path)
-            print(f"   >> New best val loss {best_val_loss:.4f} — saved.")
+            _label = "height val loss" if args.select_on == "height" else "val loss"
+            print(f"   >> New best {_label} {best_val_loss:.4f} — saved.")
 
         print(f"Epoch {epoch + 1}/{args.epochs} | Train: {tr_loss:.4f} | Val: {val_loss:.4f}")
         print(f"   >> Train raw: {format_components(tr_comp, RAW_COMPONENTS)}")
@@ -1517,6 +1761,15 @@ def main():
 
     print("--- 3. Saving ---")
     torch.save(state_dict_for_save(model), last_model_path)
+    if swa_model is not None and int(swa_model.n_averaged.item()) > 0:
+        from torch.optim.swa_utils import update_bn
+        print(f"--- SWA: recomputing BN statistics over training data "
+              f"(n_averaged={int(swa_model.n_averaged.item())}) ---")
+        update_bn(train_loader, swa_model, device=device)
+        torch.save(state_dict_for_save(swa_model.module), best_model_path)
+        torch.save(state_dict_for_save(swa_model.module),
+                   os.path.join(exp_dir, "model_swa.pth"))
+        print("SWA weights saved as model_best.pth (and model_swa.pth).")
     plot_loss_curve(train_losses, val_losses, loss_curve_path, args.experiment_name)
 
 

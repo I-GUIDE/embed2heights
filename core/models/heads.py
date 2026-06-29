@@ -7,6 +7,48 @@ import torch.nn.functional as F
 from .blocks import HEIGHT_NORM_CONSTANT, ConvGNAct, _group_count
 
 
+class QueryShapeRefiner(nn.Module):
+    """Semantic mask-classification refiner (MaskFormer-lite, shape priors).
+
+    N learned object queries attend (transformer decoder) to a pooled feature map,
+    predict per-query masks via (query-embed . per-pixel-embed), and a learned
+    [N->3] linear combine produces a 3-class LOGIT correction map. The combine is
+    ZERO-INITIALIZED, so at start the correction is exactly 0 (model == proven base)
+    and training can only ADD object-shape corrections to the presence logits.
+    This injects object-level shape priors that per-pixel convs can't model, while
+    protecting the proven baseline (same safe pattern as the TM-S2 token residual).
+    """
+
+    def __init__(self, in_ch, d=128, n_queries=32, depth=2, n_heads=4, pool=32):
+        super().__init__()
+        self.d = int(d)
+        self.pool = int(pool)
+        self.pixel_proj = nn.Conv2d(in_ch, self.d, 1)
+        self.kv_proj = nn.Conv2d(in_ch, self.d, 1)
+        self.queries = nn.Parameter(torch.randn(int(n_queries), self.d) * 0.02)
+        layer = nn.TransformerDecoderLayer(
+            self.d, n_heads, dim_feedforward=self.d * 2, dropout=0.0,
+            batch_first=True, activation="gelu",
+        )
+        self.decoder = nn.TransformerDecoder(layer, num_layers=int(depth))
+        self.mask_mlp = nn.Sequential(nn.Linear(self.d, self.d), nn.GELU(),
+                                      nn.Linear(self.d, self.d))
+        self.to_class = nn.Linear(int(n_queries), 3, bias=False)
+        nn.init.zeros_(self.to_class.weight)  # zero-init -> 0 correction at start
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        pix = self.pixel_proj(x)                                   # [B,d,H,W]
+        kv = self.kv_proj(F.adaptive_avg_pool2d(x, self.pool))     # [B,d,p,p]
+        kv = kv.flatten(2).transpose(1, 2)                         # [B,p*p,d]
+        q = self.queries.unsqueeze(0).expand(B, -1, -1)            # [B,N,d]
+        q = self.decoder(q, kv)                                    # [B,N,d]
+        q = self.mask_mlp(q)                                       # [B,N,d]
+        masks = torch.einsum("bnd,bdhw->bnhw", q, pix)             # [B,N,H,W] logits
+        seg = torch.einsum("bnhw,nc->bchw", masks, self.to_class.weight.t())  # [B,3,H,W]
+        return seg
+
+
 class MultiTaskPredictionHead(nn.Module):
     """Metric-aware multi-head predictor (v2).
 
@@ -47,7 +89,9 @@ class MultiTaskPredictionHead(nn.Module):
                  height_bin_max_m=80.0, presence_head_kind="shared",
                  presence_head_depth=1, presence_branch_ch=None,
                  bidirectional_ctask=False, height_blend_mode="presence_gated",
-                 dual_presence=False, disable_head_film=False):
+                 dual_presence=False, disable_head_film=False,
+                 height_dropout=0.0,
+                 use_shape_queries=False, shape_n_queries=32, shape_depth=2):
         super().__init__()
         # When True: skip the FiLM modulation on intermediate height features.
         # Labmate's finding (and our own pattern of veg-height regression when
@@ -87,6 +131,32 @@ class MultiTaskPredictionHead(nn.Module):
         self.bidirectional_ctask = bool(bidirectional_ctask)
         self.height_blend_mode = height_blend_mode
         self.dual_presence = bool(dual_presence)
+        # Two-stage "purify" gradient cut. s=1.0 → fully coupled (default; the
+        # forward stays byte-identical to the pre-existing path). s<1.0 scales the
+        # gradient that segmentation/presence losses send back to the shared
+        # backbone features: at s=0 the presence pathway sees x.detach(), so only
+        # the height pathway re-tunes the backbone (Stage 2 of the two-stage
+        # recipe). Set at runtime via model.set_presence_grad_scale().
+        self.presence_grad_scale = 1.0
+        # Symmetric knob for the Stage-3 "seg-purify": s<1.0 scales the gradient
+        # the HEIGHT/FiLM/fraction path sends to the backbone; at s=0 the height
+        # path sees x.detach() so only segmentation re-tunes the backbone (mirror
+        # of presence_grad_scale). 1.0 = no-op. (labmate's seg-purify = +5th place)
+        self.height_grad_scale = 1.0
+        # Height-path-only dropout: regularizes the height trunk so it can't
+        # memorize local (train-region) height distributions → better test/LB
+        # height generalization (heights are the biggest local→public leak).
+        # Applied to the FiLM'd features feeding the height trunk only; the
+        # presence path is untouched. 0.0 = off (no behavior change).
+        self.height_dropout = (
+            nn.Dropout2d(float(height_dropout)) if float(height_dropout) > 0
+            else nn.Identity()
+        )
+        # Shape-query refiner (zero-init residual on presence logits)
+        self.shape_refiner = (
+            QueryShapeRefiner(hidden_ch, n_queries=int(shape_n_queries), depth=int(shape_depth))
+            if bool(use_shape_queries) else None
+        )
 
         # --- Deeper shared trunk: 2 layers + residual ---
         self.shared = nn.Sequential(
@@ -294,27 +364,44 @@ class MultiTaskPredictionHead(nn.Module):
         x = self.shared(x)
         x = self.shared_act(x + self.shared_res(x))
 
+        # Stage-2 "purify" gradient cut: optionally detach the backbone from
+        # seg/presence-loss gradients (see self.presence_grad_scale). The height
+        # pathway keeps using full-gradient `x`, so only height re-tunes the
+        # backbone. Identity when s == 1.0 (default).
+        s_pg = self.presence_grad_scale
+        x_seg = x if s_pg == 1.0 else (s_pg * x + (1.0 - s_pg) * x.detach())
+        # Seg-purify mirror: cut the height path's gradient to the backbone.
+        s_hg = self.height_grad_scale
+        x_hgt = x if s_hg == 1.0 else (s_hg * x + (1.0 - s_hg) * x.detach())
+
         # Optional water-only bypass: run the same shared trunk weights on a
         # parallel feature that did not see the TerraMind cross-level adapter,
         # then route only the water presence branch through it. Building, tree,
         # height, fraction, FiLM, and Tessera-residual paths stay on `x`.
         bypass_h = None
         if water_bypass_x is not None and self.presence_head_kind == "split_all":
-            bypass_h = self.shared(water_bypass_x)
+            wb = (water_bypass_x if s_pg == 1.0
+                  else s_pg * water_bypass_x + (1.0 - s_pg) * water_bypass_x.detach())
+            bypass_h = self.shared(wb)
             bypass_h = self.shared_act(bypass_h + self.shared_res(bypass_h))
 
-        # Auxiliary soft fraction (for height gating + regression losses)
-        fraction_logits = self.fraction_head(x)
+        # Auxiliary soft fraction (for height gating + regression losses).
+        # Routed through x_hgt so the height/fraction path can be grad-cut from
+        # the backbone in the seg-purify stage.
+        fraction_logits = self.fraction_head(x_hgt)
         fractions = torch.sigmoid(fraction_logits)
 
         # FiLM conditioning uses soft fractions (fine-grained coverage signal).
         # Optionally bypass to test if heights improve without modulation.
         if self.disable_head_film:
-            h = x
+            h = x_hgt
         else:
             scale = self.film_scale(fractions)
             shift = self.film_shift(fractions)
-            h = x * (1.0 + scale) + shift
+            h = x_hgt * (1.0 + scale) + shift
+
+        # Height-path regularization (off by default): see self.height_dropout.
+        h = self.height_dropout(h)
 
         if self.height_independent_branches:
             h_base = self.height_base_trunk(h)
@@ -329,9 +416,11 @@ class MultiTaskPredictionHead(nn.Module):
 
         # Bidirectional cross-task: height trunk features gate presence input
         # F_presence ← x * (0.5 + σ(Conv1×1(h_height))), zero-init → identity at start
-        x_pres = x
+        x_pres = x_seg
         if self.height_to_pres_gate is not None:
-            x_pres = x * (0.5 + torch.sigmoid(self.height_to_pres_gate(h_shared)))
+            gate_src = (h_shared if s_pg == 1.0
+                        else s_pg * h_shared + (1.0 - s_pg) * h_shared.detach())
+            x_pres = x_seg * (0.5 + torch.sigmoid(self.height_to_pres_gate(gate_src)))
 
         # Main presence classifier (submission channels 0-2).
         if bypass_h is not None:
@@ -350,13 +439,16 @@ class MultiTaskPredictionHead(nn.Module):
         else:
             presence_delta_logits = None
             presence_logits = alpha_presence_logits
+        # Shape-query refiner: zero-init residual injecting object-shape priors.
+        if self.shape_refiner is not None:
+            presence_logits = presence_logits + self.shape_refiner(x_pres)
         presence_prob = torch.sigmoid(presence_logits)
 
         # Auxiliary parallel presence branch (consistency-regularized; T-SwinUNet idea).
         # Runs on the bare shared trunk features `x` (no FiLM, no bidir gate, no
         # Tessera residual) so it gives a maximally diverse view of the same scene.
         presence_logits_aux = (
-            self.presence_head_aux(x) if self.presence_head_aux is not None else None
+            self.presence_head_aux(x_seg) if self.presence_head_aux is not None else None
         )
 
         base_logits = self.height_base_proj(h_base)

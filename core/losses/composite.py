@@ -38,9 +38,15 @@ class ImprovedCompositeLoss(nn.Module):
                  boundary_weight=0.0,
                  boundary_sigma_px=2.0,
                  boundary_amp=4.0,
+                 boundary_weight_vegwater=0.0,
                  lovasz_weight=0.0,
+                 lovasz_vegwater_weight=0.0,
                  argmax_presence_target=False,
-                 argmax_bce_only=False):
+                 argmax_bce_only=False,
+                 argmax_include_bg=False,
+                 building_presence_thr=0.0,
+                 presence_coverage_thr=0.0,
+                 water_argmax_bg=False):
         super().__init__()
         if loss_preset != "presence_centered":
             raise ValueError("loss_preset must be presence_centered")
@@ -84,8 +90,12 @@ class ImprovedCompositeLoss(nn.Module):
         self.boundary_weight = float(boundary_weight)
         self.boundary_sigma_px = float(boundary_sigma_px)
         self.boundary_amp = float(boundary_amp)
+        # Same boundary upweighting applied to veg (ch1) and water (ch2).
+        self.boundary_weight_vw = float(boundary_weight_vegwater)
         # Lovász-hinge for binary building: mix BCE + lovasz_weight * Lovász.
         self.lovasz_weight = float(lovasz_weight)
+        # Lovász-hinge (IoU surrogate) for veg + water channels.
+        self.lovasz_vegwater_weight = float(lovasz_vegwater_weight)
         # If True, presence target uses argmax across class channels (only
         # the dominant class is positive per pixel). Fixes the labeling bug
         # where overlap-trained models predict all classes at multi-class
@@ -95,6 +105,22 @@ class ImprovedCompositeLoss(nn.Module):
         # ONLY for the BCE component; Tversky + height masks keep the
         # fraction>0 convention. Narrower fix matching the original tip.
         self.argmax_bce_only = bool(argmax_bce_only)
+        # Include background in the argmax presence target (labmate's bkg fix).
+        self.argmax_include_bg = bool(argmax_include_bg)
+        # Per-class building presence threshold: building is positive only if its
+        # fraction > thr (veg/water stay frac>0). Default 0.0 == frac>0 (no-op).
+        # Justified by label-noise audit (2026-06-24): building's frac>0 label is
+        # 71% noise (tiny fractions on mostly-bg pixels). This is the gentle,
+        # tunable per-class fix (vs the all-or-nothing argmax-include-bg, which
+        # kills 71% of building positives). Only active when argmax targets off.
+        self.building_presence_thr = float(building_presence_thr)
+        # Coverage threshold for the presence TARGET (BCE/Tversky), aligned to the
+        # official metric's GT binarization (coverage > 0.10). 0.0 = legacy frac>0.
+        self.presence_coverage_thr = float(presence_coverage_thr)
+        # Per-class WATER label: argmax-include-bg for water only (water positive
+        # only if it beats {building, veg, bg}). Tests the labmate's "argmax helps
+        # water" finding per-class, without the global argmax-bg that guts building.
+        self.water_argmax_bg = bool(water_argmax_bg)
 
         self.task = "both"
         self.train_presence = True
@@ -180,11 +206,23 @@ class ImprovedCompositeLoss(nn.Module):
         # which (per external tip) credits the dominant class per pixel.
         if self.argmax_presence_target:
             _cls_frac = targets[:, :3, :, :]
-            _any_present = (_cls_frac > 0).any(dim=1, keepdim=True)
-            _argmax_idx = _cls_frac.argmax(dim=1, keepdim=True)
-            _argmax_presence = torch.zeros_like(_cls_frac)
-            _argmax_presence.scatter_(1, _argmax_idx, 1.0)
-            _argmax_presence = _argmax_presence * _any_present.float()
+            if self.argmax_include_bg:
+                # Include BACKGROUND in the argmax (labmate's fix): a pixel is
+                # positive for class c ONLY if c beats {other classes AND
+                # background=1-sum(frac)}. Kills the "building=0.1 but 85% bg ->
+                # labeled building" noise that floods building↔background FPs.
+                _bg = (1.0 - _cls_frac.sum(dim=1, keepdim=True)).clamp(min=0.0)
+                _stack = torch.cat([_cls_frac, _bg], dim=1)        # [B,4,H,W]
+                _win = _stack.argmax(dim=1, keepdim=True)          # 0..3 (3=bg)
+                _oh = torch.zeros_like(_stack)
+                _oh.scatter_(1, _win, 1.0)
+                _argmax_presence = _oh[:, :3, :, :]                # bg-win -> all-zero
+            else:
+                _any_present = (_cls_frac > 0).any(dim=1, keepdim=True)
+                _argmax_idx = _cls_frac.argmax(dim=1, keepdim=True)
+                _argmax_presence = torch.zeros_like(_cls_frac)
+                _argmax_presence.scatter_(1, _argmax_idx, 1.0)
+                _argmax_presence = _argmax_presence * _any_present.float()
         else:
             _argmax_presence = None
 
@@ -280,7 +318,26 @@ class ImprovedCompositeLoss(nn.Module):
             # --argmax-bce-only is off. In bce-only mode, presence_target
             # (used by Tversky and dual-aux) stays fraction>0, while a separate
             # bce_target uses argmax labels.
-            fraction_presence = (targets[:, :3, :, :] > 0).float()
+            # Per-class presence label (the labmate's per-class label fix):
+            #  - building: frac > building_presence_thr (gentle; default 0 == frac>0)
+            #  - veg:      frac > 0 (clean, dominant class)
+            #  - water:    argmax-include-bg if water_argmax_bg (water positive only
+            #    if it beats {building, veg, background}) — "argmax helps water"
+            #    (19% frac>0 noise); else frac>0.
+            # Coverage-aligned presence target: positive where class coverage
+            # exceeds the official threshold (presence_coverage_thr, e.g. 0.10).
+            # Building can override with its own (gentler) building_presence_thr.
+            _pct = self.presence_coverage_thr
+            _b_thr = self.building_presence_thr if self.building_presence_thr > 0 else _pct
+            _fp_b = (targets[:, 0:1, :, :] > _b_thr).float()
+            _fp_v = (targets[:, 1:2, :, :] > _pct).float()
+            if self.water_argmax_bg:
+                _bg = (1.0 - targets[:, :3, :, :].sum(dim=1, keepdim=True)).clamp(min=0.0)
+                _stack = torch.cat([targets[:, :3, :, :], _bg], dim=1)   # [B,4,H,W]
+                _fp_w = (_stack.argmax(dim=1, keepdim=True) == 2).float()
+            else:
+                _fp_w = (targets[:, 2:3, :, :] > _pct).float()
+            fraction_presence = torch.cat([_fp_b, _fp_v, _fp_w], dim=1)
             if self.argmax_presence_target and not self.argmax_bce_only:
                 presence_target = _argmax_presence
             else:
@@ -291,26 +348,31 @@ class ImprovedCompositeLoss(nn.Module):
             else:
                 bce_target = fraction_presence
 
-            # Boundary weight map for building (channel 0): higher weight near
-            # ground-truth building boundary, computed on-the-fly via a Sobel-style
+            # Per-class boundary weight multiplier [B, 3, H, W]: higher weight
+            # near each class's GT boundary, computed on-the-fly via a Sobel-style
             # 3x3 maxpool difference (cheap, no scipy distance transform on GPU).
-            boundary_weight_map = None
-            if self.boundary_weight > 0:
+            # Building (ch0) controlled by boundary_weight; veg (ch1) + water (ch2)
+            # by boundary_weight_vw. Channels left at 1.0 are unaffected.
+            boundary_mult = None
+            if self.boundary_weight > 0 or self.boundary_weight_vw > 0:
                 with torch.no_grad():
-                    bld_gt = presence_target[:, 0:1, :, :]  # [B, 1, H, W]
-                    # Boundary pixels = those where 3x3 dilation differs from erosion
-                    # Approximate distance-to-boundary via repeated maxpool diffs
-                    dilated = F.max_pool2d(bld_gt, 3, stride=1, padding=1)
-                    eroded = -F.max_pool2d(-bld_gt, 3, stride=1, padding=1)
-                    boundary_mask = (dilated - eroded).clamp(0, 1)
-                    # Multi-ring soft: dilate boundary_mask itself once or twice
-                    # to capture a 1-2 pixel halo
-                    sigma = max(1.0, self.boundary_sigma_px)
-                    soft_band = boundary_mask
-                    for _ in range(max(1, int(round(sigma)))):
-                        soft_band = F.max_pool2d(soft_band, 3, stride=1, padding=1)
-                    # weight = 1 + amp * soft_band  (soft_band in {0,1})
-                    boundary_weight_map = 1.0 + self.boundary_amp * soft_band
+                    def _soft_band(gt1):
+                        dilated = F.max_pool2d(gt1, 3, stride=1, padding=1)
+                        eroded = -F.max_pool2d(-gt1, 3, stride=1, padding=1)
+                        band = (dilated - eroded).clamp(0, 1)
+                        sigma = max(1.0, self.boundary_sigma_px)
+                        for _ in range(max(1, int(round(sigma)))):
+                            band = F.max_pool2d(band, 3, stride=1, padding=1)
+                        return band
+                    boundary_mult = torch.ones_like(presence_target)  # [B,3,H,W]
+                    if self.boundary_weight > 0:
+                        boundary_mult[:, 0:1] = 1.0 + self.boundary_amp * _soft_band(
+                            presence_target[:, 0:1, :, :])
+                    if self.boundary_weight_vw > 0:
+                        boundary_mult[:, 1:2] = 1.0 + self.boundary_amp * _soft_band(
+                            presence_target[:, 1:2, :, :])
+                        boundary_mult[:, 2:3] = 1.0 + self.boundary_amp * _soft_band(
+                            presence_target[:, 2:3, :, :])
 
             def masked_presence_bce(logits):
                 safe_logits = torch.where(
@@ -333,11 +395,9 @@ class ImprovedCompositeLoss(nn.Module):
                     dtype=loss.dtype,
                 ).view(1, 3, 1, 1)
                 weighted_loss = loss * lc_mask * ch_weights
-                # Apply boundary-aware weighting on the building channel only
-                if self.boundary_weight > 0 and boundary_weight_map is not None:
-                    # Boost only the building channel near boundaries
-                    bld_boost = boundary_weight_map  # [B, 1, H, W]
-                    weighted_loss[:, 0:1] = weighted_loss[:, 0:1] * bld_boost
+                # Apply per-class boundary-aware weighting (building/veg/water).
+                if boundary_mult is not None:
+                    weighted_loss = weighted_loss * boundary_mult
                 # Normalize by the unweighted valid count so the per-class
                 # building emphasis raises the overall loss magnitude.
                 return torch.sum(weighted_loss) / (torch.sum(lc_mask) + 1e-6)
@@ -374,6 +434,17 @@ class ImprovedCompositeLoss(nn.Module):
                     lovasz_building_loss = lovasz_hinge_flat(
                         bld_logits, bld_target, valid_mask=lc_bool
                     )
+
+            lovasz_vegwater_loss = zero
+            if self.lovasz_vegwater_weight > 0:
+                with torch.cuda.amp.autocast(enabled=False):
+                    _vw = zero
+                    for _ci in (1, 2):
+                        _lg = aux_outputs["presence_logits"][:, _ci, :, :].float()
+                        _lt = presence_target[:, _ci, :, :].float()
+                        _lb = lc_mask[:, _ci, :, :].bool()
+                        _vw = _vw + lovasz_hinge_flat(_lg, _lt, valid_mask=_lb)
+                    lovasz_vegwater_loss = _vw / 2.0
 
             target_height = targets[:, 3:4, :, :]
             if self.argmax_presence_target and not self.argmax_bce_only:
@@ -414,6 +485,8 @@ class ImprovedCompositeLoss(nn.Module):
 
             if self.lovasz_weight > 0 and self.train_presence:
                 total_loss = total_loss + self.lovasz_weight * lovasz_building_loss
+            if self.lovasz_vegwater_weight > 0 and self.train_presence:
+                total_loss = total_loss + self.lovasz_vegwater_weight * lovasz_vegwater_loss
 
         # ── Dual-presence consistency (T-SwinUNet style) ─────────────────
         # When the head exposes a parallel auxiliary presence branch, supervise

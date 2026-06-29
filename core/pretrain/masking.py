@@ -35,6 +35,23 @@ class BlockMask2d(nn.Module):
         return x_masked, mask
 
 
+def apply_denoise(alpha, tessera, sigma):
+    """Denoising pretext (no masking → no conv-leakage): add per-channel-std-scaled
+    Gaussian noise to BOTH modalities and reconstruct the clean signal over ALL pixels.
+
+    Returns the same 6-tuple shape as ``apply_mask_strategy`` so the training loop is
+    unchanged; the returned "mask" is all-ones so ``masked_reconstruction_loss`` scores
+    every pixel. Noise is scaled by each sample/channel's spatial std so a fixed ``sigma``
+    is meaningful across the 64-d AlphaEarth and 128-d Tessera embeddings alike.
+    """
+    def _noisy(x):
+        std = x.std(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+        return x + sigma * std * torch.randn_like(x)
+    ones_a = torch.ones_like(alpha[:, :1])
+    ones_t = torch.ones_like(tessera[:, :1])
+    return _noisy(alpha), ones_a, _noisy(tessera), ones_t, 1.0, 1.0
+
+
 def apply_mask_strategy(masker, alpha, tessera, strategy, *,
                         modality_dropout=0.0, generator=None):
     """Build masked-input pairs and per-modality loss weights.
