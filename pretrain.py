@@ -28,6 +28,7 @@ from core.pretrain import (
     BlockMask2d,
     PixelFusionPretrainDataset,
     PixelFusionPretrainModel,
+    apply_denoise,
     apply_mask_strategy,
     find_pixel_pretrain_pairs,
     masked_reconstruction_loss,
@@ -47,6 +48,21 @@ def parse_args():
                    help="Optional label-free test AlphaEarth embeddings for transductive pretraining.")
     p.add_argument("--test-tessera-dir", default=None,
                    help="Optional label-free test Tessera embeddings for transductive pretraining.")
+    p.add_argument("--train-token-dir", default=None,
+                   help="Optional combined token dir (e.g. combined_tokens_emb) → "
+                        "6-source SSL: builds GatedTokenPretrainModel whose submodules "
+                        "(alpha_unet/tessera_feature_stem/gate_conv/xsource_fusion) match "
+                        "the supervised gated model for clean transfer, and warms the "
+                        "token branch. Pair with --test-token-dir for transductive coverage.")
+    p.add_argument("--test-token-dir", default=None,
+                   help="Optional label-free test token dir (6-source transductive SSL).")
+    p.add_argument("--encoder-arch", default="unet",
+                   help="alpha_unet backbone for the 6-source pretrain model; MUST match "
+                        "the supervised fine-tune (e.g. unetpp_wave) or alpha_unet won't transfer.")
+    p.add_argument("--token-channels", type=int, default=3072,
+                   help="Total channels in the combined token file (4 sources x 768 = 3072).")
+    p.add_argument("--token-source-ch", type=int, default=768,
+                   help="Channels per token source (xsource fusion splits token-channels by this).")
     p.add_argument("--output-dir", default=os.path.join(REPO_DIR, "runs"))
     p.add_argument("--experiment-name", default="pretrain_ae_tessera")
     p.add_argument("--batch-size", type=int, default=16)
@@ -60,6 +76,14 @@ def parse_args():
     p.add_argument("--prefetch-factor", type=int, default=1)
     p.add_argument("--amp", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--grad-accum-steps", type=int, default=1)
+    p.add_argument("--pretext", default="mae", choices=["mae", "denoise"],
+                   help="'mae' = masked block reconstruction (legacy). 'denoise' = add "
+                        "per-channel Gaussian noise and reconstruct the clean embedding "
+                        "over ALL pixels (no masking → no conv-leakage; targets high-"
+                        "frequency spatial detail). Denoise ignores mask/strategy args.")
+    p.add_argument("--noise-sigma", type=float, default=0.15,
+                   help="Denoise pretext: Gaussian noise std as a fraction of each "
+                        "channel's spatial std. Only used when --pretext denoise.")
     p.add_argument("--mask-ratio", type=float, default=0.55)
     p.add_argument("--block-size", type=int, default=16)
     p.add_argument("--alpha-loss-weight", type=float, default=1.0)
@@ -118,6 +142,8 @@ def make_loaders(args, device):
         args.train_tessera_dir,
         args.test_alpha_dir,
         args.test_tessera_dir,
+        train_token_dir=getattr(args, "train_token_dir", None),
+        test_token_dir=getattr(args, "test_token_dir", None),
     )
     if not pairs:
         raise ValueError("No AlphaEarth/Tessera pretrain pairs found.")
@@ -168,18 +194,33 @@ def run_epoch(model, loader, masker, optimizer, scaler, device, args, *, train):
     with context:
         pbar = tqdm(loader, desc=desc, leave=False)
         for step, batch in enumerate(pbar, start=1):
-            alpha, tessera = move_pair(batch, device)
-            (
-                alpha_in, alpha_mask,
-                tessera_in, tessera_mask,
-                alpha_w_mask, tessera_w_mask,
-            ) = apply_mask_strategy(
-                masker, alpha, tessera, epoch_strategy,
-                modality_dropout=args.modality_dropout if train else 0.0,
-            )
+            token = None
+            if len(batch) == 3:
+                alpha, tessera, token = batch
+                alpha = alpha.to(device, non_blocking=True)
+                tessera = tessera.to(device, non_blocking=True)
+                token = token.to(device, non_blocking=True)
+            else:
+                alpha, tessera = move_pair(batch, device)
+            if args.pretext == "denoise":
+                (
+                    alpha_in, alpha_mask,
+                    tessera_in, tessera_mask,
+                    alpha_w_mask, tessera_w_mask,
+                ) = apply_denoise(alpha, tessera, args.noise_sigma)
+            else:
+                (
+                    alpha_in, alpha_mask,
+                    tessera_in, tessera_mask,
+                    alpha_w_mask, tessera_w_mask,
+                ) = apply_mask_strategy(
+                    masker, alpha, tessera, epoch_strategy,
+                    modality_dropout=args.modality_dropout if train else 0.0,
+                )
 
             with torch.amp.autocast("cuda", enabled=use_amp):
-                out = model(alpha_in, tessera_in)
+                out = (model(alpha_in, tessera_in, token) if token is not None
+                       else model(alpha_in, tessera_in))
                 alpha_loss, alpha_parts = masked_reconstruction_loss(
                     out["alpha"], alpha, alpha_mask, cosine_weight=args.cosine_weight
                 )
@@ -264,16 +305,34 @@ def main():
     print(f"Pretrain pairs: train={len(train_pairs)} val={len(val_pairs)}")
     print(f"Experiment folder: {exp_dir}")
 
-    model = PixelFusionPretrainModel(
-        alpha_channels=64,
-        tessera_channels=128,
-        base_ch=args.lightunet_base_ch,
-        tessera_presence_ch=args.tessera_presence_ch,
-        tessera_hidden_ch=args.tessera_hidden_ch,
-        tessera_hidden_depth=args.tessera_hidden_depth,
-        fusion_ch=args.fusion_ch,
-        norm_kind=args.norm_kind,
-    ).to(device)
+    if getattr(args, "train_token_dir", None):
+        from core.pretrain import GatedTokenPretrainModel
+        model = GatedTokenPretrainModel(
+            alpha_channels=64,
+            tessera_channels=128,
+            token_channels=args.token_channels,
+            token_source_ch=args.token_source_ch,
+            base_ch=args.lightunet_base_ch,
+            tessera_hidden_ch=args.tessera_hidden_ch,
+            tessera_hidden_depth=args.tessera_hidden_depth,
+            encoder_arch=args.encoder_arch,
+            norm_kind=args.norm_kind,
+            use_bottleneck_attn=True,
+            xsource_token_calibration=True,
+        ).to(device)
+        print(f"6-source SSL: GatedTokenPretrainModel "
+              f"(encoder_arch={args.encoder_arch}, token_channels={args.token_channels})")
+    else:
+        model = PixelFusionPretrainModel(
+            alpha_channels=64,
+            tessera_channels=128,
+            base_ch=args.lightunet_base_ch,
+            tessera_presence_ch=args.tessera_presence_ch,
+            tessera_hidden_ch=args.tessera_hidden_ch,
+            tessera_hidden_depth=args.tessera_hidden_depth,
+            fusion_ch=args.fusion_ch,
+            norm_kind=args.norm_kind,
+        ).to(device)
     masker = BlockMask2d(mask_ratio=args.mask_ratio, block_size=args.block_size).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=args.amp and device.type == "cuda")

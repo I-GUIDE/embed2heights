@@ -156,6 +156,10 @@ def model_kwargs_from_run_config(cfg):
         "use_aspp": cfg.get("use_aspp", False),
         "bottleneck_attn_depth": cfg.get("bottleneck_attn_depth", 1),
         "use_modern": cfg.get("use_modern", False),
+        "detail_bypass": cfg.get("detail_bypass", False),
+        "sharp_upsample": cfg.get("sharp_upsample", False),
+        "scene_film": cfg.get("scene_film", False),
+        "encoder_arch": cfg.get("encoder_arch", "unet"),
         "disable_head_film": cfg.get("disable_head_film", False),
         "use_xsource_fusion": cfg.get("use_xsource_fusion", False),
         "token_source_ch": cfg.get("token_source_ch", 768),
@@ -163,6 +167,9 @@ def model_kwargs_from_run_config(cfg):
         "xsource_attn_heads": cfg.get("xsource_attn_heads", 4),
         "xsource_token_calibration": cfg.get("xsource_token_calibration", False),
         "use_spatial_token_film": cfg.get("use_spatial_token_film", False),
+        "use_shape_queries": cfg.get("use_shape_queries", False),
+        "shape_n_queries": cfg.get("shape_n_queries", 32),
+        "shape_depth": cfg.get("shape_depth", 2),
         # MultiBackboneFusion: needed to reconstruct the identical architecture
         # (proj_ch drives the stem in_chans / adapter; input_norm changes the
         # forward; source/freeze are inert at predict but kept for fidelity).
