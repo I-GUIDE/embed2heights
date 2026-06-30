@@ -67,6 +67,7 @@ tools/plot*
 logs/*
 !logs/BEST_RESULT.md
 !logs/GOAL.md
+!logs/RESEARCH_JOURNAL.md
 configs/*
 !configs/*.yml
 !configs/*.md
