@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+data/
+submission/
+# training outputs are regenerated; keep only the delmask masks
+runs/*
+!runs/missing_masks/
+runs/missing_masks/.gitkeep

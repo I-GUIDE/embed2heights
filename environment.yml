@@ -1,0 +1,17 @@
+name: emb2heights
+channels:
+  - conda-forge
+  - pytorch
+  - defaults
+dependencies:
+  - python=3.12
+  - pip
+  - numpy
+  - matplotlib
+  - tqdm
+  - pip:
+    - torch>=2.0
+    - torchvision
+    - rasterio
+    - scikit-learn
+    - eotdl

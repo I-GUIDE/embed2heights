@@ -1,0 +1,80 @@
+data:
+  train_embeddings_dir: ${REPO_DIR}/../data/train/alphaearth_emb
+  secondary_train_embeddings_dir:
+  token_train_embeddings_dir:
+  train_targets_dir: ${REPO_DIR}/../data/train/labels
+  split_file:
+  patch_size: 256
+  val_split: 0.2
+
+model:
+  model_type: auto
+  tessera_presence_ch: 16
+  tessera_hidden_ch: 96
+  tessera_hidden_depth: 2
+  height_specialist_depth: 0
+  height_gate_source: alpha
+  height_hidden_ch:
+  height_trunk_depth: 2
+  height_independent_branches: false
+  height_head_kind: linear
+  height_n_bins: 64
+  height_bin_max_m: 80.0
+  lightunet_base_ch: 48
+  lightunet_norm_kind: bn
+  pixel_backbone_kind: unet
+  gate_mode: rich
+  gate_untied: false
+  gate_init_bias: 4.0
+  modality_dropout: 0.0
+  presence_head_kind: shared
+  presence_head_depth: 1
+  presence_branch_ch:
+  use_fraction_film: true
+  use_fraction_aux: true
+  token_proj_depth: 1
+  token_in_source_attn: false
+  presence_tower_depth: 0
+
+  presence_trunk_grad_scale: 1.0
+  height_trunk_grad_scale: 1.0
+
+training:
+  batch_size: 32
+  epochs: 30
+  lr: 0.0002
+  weight_decay: 0.0001
+  seed: 42
+  grad_accum_steps: 1
+  weight_mae: 1.0
+  weight_presence_tversky: 1.0
+  weight_fraction_mae: 0.1
+  weight_height_boost: 2.0
+  aux_weight: 1.0
+  height_loss_kind: l1
+  huber_delta: 1.0
+  pinball_tau: 0.5
+  build_height_boost: 5.0
+  veg_height_boost: 0.0
+  aux_veg_weight: 1.0
+  height_bin_aux_weight: 0.0
+  height_bin_sigma_bins: 1.5
+  tversky_building_alpha: 0.3
+  tversky_water_alpha: 0.3
+  water_empty_topk: 0
+  weight_water_empty_topk: 0.0
+  deep_supervision_weight: 0.0
+  building_presence_pos_weight: 1.0
+  small_building_presence_weight: 1.0
+  small_building_max_pixels: 0
+  building_boundary_weight: 0.0
+  building_ring_presence_alpha: 0.0
+  building_ring_kernel: 5
+
+runtime:
+  experiment_name: run01
+  output_dir: ${REPO_DIR}/runs
+  amp: true
+  data_parallel: false
+  num_workers: 4
+  prefetch_factor: 1
