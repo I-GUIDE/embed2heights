@@ -6,7 +6,7 @@ import os,sys,glob,re; import numpy as np, rasterio
 from scipy import ndimage
 from sklearn.linear_model import LogisticRegression
 sys.path.insert(0,'.'); from core.metrics import build_label_map
-LAB='/u/dingqi2/workspace/esa/data/train/labels'; AE='/u/dingqi2/workspace/esa/data/train/alphaearth_emb'
+import os as _os; _D=_os.environ.get("DATA_ROOT","./data")+"/train"; LAB=_D+"/labels"; AE=_D+"/alphaearth_emb"
 LM=build_label_map(LAB)
 GT,H_THR,SIG_THR=0.10,3.0,0.60; R,GAP_THR,AREA_MIN,H_GUARD=6,0.25,80,2.0
 st=ndimage.generate_binary_structure(2,2)

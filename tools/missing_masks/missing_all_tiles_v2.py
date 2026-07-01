@@ -5,7 +5,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
 sys.path.insert(0,'.'); from core.metrics import build_label_map
-LAB='/u/dingqi2/workspace/esa/data/train/labels'; AE='/u/dingqi2/workspace/esa/data/train/alphaearth_emb'
+import os as _os; _D=_os.environ.get("DATA_ROOT","./data")+"/train"; LAB=_D+"/labels"; AE=_D+"/alphaearth_emb"
 LM=build_label_map(LAB)
 GT,H_THR,SIG_THR=0.10,3.0,0.60; R,GAP_THR,AREA_MIN=6,0.25,80; H_GUARD=2.0
 st=ndimage.generate_binary_structure(2,2)
