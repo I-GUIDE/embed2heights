@@ -1,7 +1,10 @@
-# Embed2Heights — Final Submission (reproducible)
+# Embed2Heights :Final Submission (reproducible)
 
-**Team: Attention_Plzzz**: Dingqi Ye, Daniel Kiv, Wen Zhou, Wei Hu, Ayush Khot
-CyberGIS Center for Advanced Digital and Spatial Studies, University of Illinois at Urbana-Champaign
+> **Team: Attention_Plzzz**: Dingqi Ye, Daniel Kiv, Wen Zhou, Wei Hu, Ayush Khot
+>
+> CyberGIS Center for Advanced Digital and Spatial Studies
+>
+> University of Illinois at Urbana-Champaign
 
 Reproduction package for our final leaderboard submission.
 
@@ -60,9 +63,9 @@ Final channels (`assemble_final.py`):
 
 ---
 
-## 2. Reproduce — step by step
+## 2. Reproduce: step by step
 
-### Step 1 — Environment
+### Step 1: Environment
 
 ```bash
 conda env create -f environment.yml     # creates env "emb2heights"
@@ -70,7 +73,7 @@ conda activate emb2heights
 ```
 Key deps: PyTorch (CUDA), numpy, rasterio, scipy, tqdm, pyyaml. One GPU per training job.
 
-### Step 2 — Data
+### Step 2: Data
 
 Place the challenge embeddings/labels under `data/`, or point `DATA_ROOT` elsewhere
 (`export DATA_ROOT=/path/to/data`):
@@ -90,7 +93,7 @@ data/
 Filenames share a `<core>` id (e.g. `0041_FQ`) that ties an embedding to its label.
 `tools/download_data.py` documents where each embedding comes from.
 
-### Step 3 — Generate the `delmask` masks *(before training)*
+### Step 3: Generate the `delmask` masks *(before training)*
 
 ![Deleted building footprints — label empty where the nDSM shows buildings](docs/fig_building_holes.png)
 
