@@ -14,22 +14,8 @@ try:
 except ImportError:
     yaml = None
 
-from core.data.datasets import (
-    MultiPixelEmbeddingDataset,
-    PixelEmbeddingDataset,
-    PixelMultiTokenEmbeddingDataset,
-    PixelTokenEmbeddingDataset,
-)
-from core.data.discovery import (
-    find_embedding_files,
-    find_file_pairs,
-    find_multisource_embedding_files,
-    find_multisource_file_pairs,
-    find_multitoken_embedding_files,
-    find_multitoken_file_pairs,
-    find_trisource_embedding_files,
-    find_trisource_file_pairs,
-)
+from core.data.datasets import PixelMultiTokenEmbeddingDataset
+from core.data.discovery import find_source_pairs, find_source_tuples
 from core.models import build_model
 from core.engine import move_to_device, select_device
 from core.inference import (
@@ -38,14 +24,12 @@ from core.inference import (
     predict_batch,
     prediction_output_id,
     prediction_to_numpy,
-    tta_views,
     write_prediction_config,
 )
 from core.config import DEFAULTS as TRAIN_DEFAULTS
 from core.config import MODEL_CHOICES
 
 
-TTA_CHOICES = ("none", "flip", "d4")
 CONFIG_SECTIONS = ("data", "model", "training", "runtime")
 
 
@@ -79,19 +63,10 @@ def parse_args():
     parser.add_argument("--thresholds", type=float, nargs=3, default=None,
                         metavar=("BLD", "VEG", "WAT"),
                         help="Optional per-class thresholds baked into channels 0-2.")
-    parser.add_argument("--tta", default="none", choices=TTA_CHOICES,
-                        help="Test-time augmentation mode. 'flip' uses identity + h/v flips; "
-                             "'d4' uses rotations plus mirrored rotations.")
-    parser.add_argument("--token-normalization-stats-path", default=None,
-                        help="Override token z-score stats npz (default: <exp_dir>/token_channel_zscore_stats.npz).")
-    parser.add_argument("--adabn", action="store_true",
-                        help="AdaBN: recompute every BatchNorm's running mean/var on the "
-                             "target inputs (unsupervised, no labels) before predicting, to "
-                             "adapt to test/region distribution shift.")
-    parser.add_argument("--restrict-split-file", default=None,
+    parser.add_argument("--restrict-val-split", default=None,
                         help="Keep only inputs whose core (first two underscore fields, e.g. "
-                             "'0041_FQ') is in this split.json's 'val' list. Used for OOF AdaBN "
-                             "so adaptation sees only the held-out region.")
+                             "'0041_FQ') is in this split.json's 'val' list. Used to write "
+                             "out-of-fold validation predictions for threshold tuning.")
     return parser.parse_args()
 
 
@@ -138,48 +113,26 @@ def load_training_config(exp_dir):
 
 
 def model_kwargs_from_run_config(cfg):
-    model_type = str(cfg.get("model_type", "")).lower()
-    default_base_ch = 32 if model_type in {"lightunet", "ae_only"} else TRAIN_DEFAULTS["lightunet_base_ch"]
+    default_base_ch = TRAIN_DEFAULTS["lightunet_base_ch"]
     return {
-        "tessera_presence_ch": cfg.get("tessera_presence_ch", TRAIN_DEFAULTS["tessera_presence_ch"]),
-        "tessera_hidden_ch": cfg.get("tessera_hidden_ch", TRAIN_DEFAULTS["tessera_hidden_ch"]),
-        "tessera_hidden_depth": cfg.get("tessera_hidden_depth", TRAIN_DEFAULTS["tessera_hidden_depth"]),
         "height_specialist_depth": cfg.get("height_specialist_depth", TRAIN_DEFAULTS["height_specialist_depth"]),
-        "height_gate_source": cfg.get("height_gate_source", TRAIN_DEFAULTS["height_gate_source"]),
         "height_hidden_ch": cfg.get("height_hidden_ch", TRAIN_DEFAULTS["height_hidden_ch"]),
         "height_trunk_depth": cfg.get("height_trunk_depth", TRAIN_DEFAULTS["height_trunk_depth"]),
-        "height_independent_branches": cfg.get(
-            "height_independent_branches", TRAIN_DEFAULTS["height_independent_branches"]
-        ),
         "lightunet_base_ch": cfg.get("lightunet_base_ch", default_base_ch),
         "lightunet_norm_kind": cfg.get("lightunet_norm_kind", TRAIN_DEFAULTS["lightunet_norm_kind"]),
-        "height_head_kind": cfg.get("height_head_kind", TRAIN_DEFAULTS["height_head_kind"]),
         "height_n_bins": cfg.get("height_n_bins", TRAIN_DEFAULTS["height_n_bins"]),
         "height_bin_max_m": cfg.get("height_bin_max_m", TRAIN_DEFAULTS["height_bin_max_m"]),
         "gate_mode": cfg.get("gate_mode", TRAIN_DEFAULTS["gate_mode"]),
         "gate_untied": cfg.get("gate_untied", TRAIN_DEFAULTS["gate_untied"]),
         "gate_init_bias": cfg.get("gate_init_bias", TRAIN_DEFAULTS["gate_init_bias"]),
         "modality_dropout": cfg.get("modality_dropout", TRAIN_DEFAULTS["modality_dropout"]),
-        "presence_head_kind": cfg.get("presence_head_kind", TRAIN_DEFAULTS["presence_head_kind"]),
         "presence_head_depth": cfg.get("presence_head_depth", TRAIN_DEFAULTS["presence_head_depth"]),
         "presence_branch_ch": cfg.get("presence_branch_ch", TRAIN_DEFAULTS["presence_branch_ch"]),
-        "use_fraction_film": cfg.get("use_fraction_film", TRAIN_DEFAULTS["use_fraction_film"]),
         "use_fraction_aux": cfg.get("use_fraction_aux", TRAIN_DEFAULTS["use_fraction_aux"]),
         "attn_heads": cfg.get("attn_heads", 4),
         "token_calibration": cfg.get("token_calibration", False),
         "token_calibration_source_indices": cfg.get("token_calibration_source_indices", None),
-        "pixel_noise_std": cfg.get("pixel_noise_std", 0.0),
-        "n_head_replicas": cfg.get("n_head_replicas", 1),
-        "symmetric_modality_dropout": cfg.get("symmetric_modality_dropout", 0.0),
-        "symmetric_modality_dropout_alpha_share": cfg.get("symmetric_modality_dropout_alpha_share", 0.5),
-        "use_additive": cfg.get("use_additive", True),
         "token_ctx_ch": cfg.get("token_ctx_ch", 96),
-        "token_proj_depth": cfg.get("token_proj_depth", 1) or 1,
-        "token_in_source_attn": cfg.get("token_in_source_attn", False),
-        "token_cross_source_attn": cfg.get("token_cross_source_attn", True),
-        "height_from_pixel": cfg.get("height_from_pixel", False),
-        "feat_aggregation": cfg.get("feat_aggregation", "mean"),
-        "token_input_clamp": cfg.get("token_input_clamp", None),
         "pixel_backbone_kind": cfg.get("pixel_backbone_kind", "unet"),
         "presence_tower_depth": cfg.get("presence_tower_depth", 0),
         "split_trunk": bool(cfg.get("split_trunk", False)),
@@ -201,122 +154,47 @@ def token_test_dirs(args):
 
 
 def resolve_inputs(args):
-    """Return embedding paths, or tuples ending in labels for validation mode."""
+    """Return source tuples: (AE, Tessera, *tokens[, label]) for the fixed
+    2-pixel + N-token config. Includes the label when --test-targets-dir is set
+    (validation mode); otherwise label-free (test mode)."""
     token_dirs = token_test_dirs(args)
-    if token_dirs:
-        if not args.secondary_test_embeddings_dir:
-            raise RuntimeError("--token-test-embeddings-dir requires --secondary-test-embeddings-dir")
-        if args.test_targets_dir:
-            if len(token_dirs) == 1:
-                pairs = find_trisource_file_pairs(
-                    args.test_embeddings_dir,
-                    args.secondary_test_embeddings_dir,
-                    token_dirs[0],
-                    args.test_targets_dir,
-                )
-            else:
-                pairs = find_multitoken_file_pairs(
-                    args.test_embeddings_dir,
-                    args.secondary_test_embeddings_dir,
-                    token_dirs,
-                    args.test_targets_dir,
-                )
-            if not pairs:
-                raise RuntimeError("No matching token-source file pairs found.")
-            return pairs
-        if len(token_dirs) == 1:
-            pairs = find_trisource_embedding_files(
-                args.test_embeddings_dir,
-                args.secondary_test_embeddings_dir,
-                token_dirs[0],
-            )
-        else:
-            pairs = find_multitoken_embedding_files(
-                args.test_embeddings_dir,
-                args.secondary_test_embeddings_dir,
-                token_dirs,
-            )
-        if not pairs:
-            raise RuntimeError("No matching token-source .tif files found.")
-        return pairs
-
-    if args.secondary_test_embeddings_dir:
-        if args.test_targets_dir:
-            pairs = find_multisource_file_pairs(
-                args.test_embeddings_dir,
-                args.secondary_test_embeddings_dir,
-                args.test_targets_dir,
-            )
-            if not pairs:
-                raise RuntimeError("No matching multi-source file pairs found.")
-            return pairs
-        pairs = find_multisource_embedding_files(
-            args.test_embeddings_dir,
-            args.secondary_test_embeddings_dir,
+    if not token_dirs or not args.secondary_test_embeddings_dir:
+        raise RuntimeError(
+            "This pipeline needs --secondary-test-embeddings-dir (Tessera) and "
+            "the token sources (--token-test-embeddings-dir ...)."
         )
-        if not pairs:
-            raise RuntimeError("No matching multi-source .tif files found.")
-        return pairs
-
     if args.test_targets_dir:
-        pairs = find_file_pairs(args.test_embeddings_dir, args.test_targets_dir)
-        if not pairs:
-            raise RuntimeError("No matching file pairs found.")
-        return pairs
-    emb_files = find_embedding_files(args.test_embeddings_dir)
-    if not emb_files:
-        raise RuntimeError(f"No .tif files found in {args.test_embeddings_dir}")
-    return emb_files
+        pairs = find_source_pairs(
+            args.test_embeddings_dir, args.secondary_test_embeddings_dir,
+            token_dirs, args.test_targets_dir,
+        )
+    else:
+        pairs = find_source_tuples(
+            args.test_embeddings_dir, args.secondary_test_embeddings_dir, token_dirs,
+        )
+    if not pairs:
+        raise RuntimeError("No matching source tuples found.")
+    return pairs
 
 
 def infer_channels_and_dataset(args, inputs):
-    sample_emb_path = inputs[0][0] if isinstance(inputs[0], tuple) else inputs[0]
-    with rasterio.open(sample_emb_path) as src:
-        n_channels = src.count
-
-    token_dirs = token_test_dirs(args)
-    if token_dirs:
-        with rasterio.open(inputs[0][1]) as src:
-            pixel_channels = n_channels + src.count
-        sample_tuple = inputs[0]
-        token_slice = (
-            sample_tuple[2:-1] if args.test_targets_dir else sample_tuple[2:]
-        )
-        token_channels = 0
-        for path in token_slice:
-            with rasterio.open(path) as src:
-                token_channels += src.count
-        dataset_cls = (
-            PixelTokenEmbeddingDataset if len(token_dirs) == 1
-            else PixelMultiTokenEmbeddingDataset
-        )
-        return (pixel_channels, token_channels), dataset_cls
-
-    if args.secondary_test_embeddings_dir:
-        with rasterio.open(inputs[0][1]) as src:
-            n_channels += src.count
-        return n_channels, MultiPixelEmbeddingDataset
-
-    return n_channels, PixelEmbeddingDataset
+    """Resolve ((pixel_channels, token_channels), dataset_cls) for the fixed
+    2-pixel + N-token config."""
+    sample_tuple = inputs[0]
+    with rasterio.open(sample_tuple[0]) as src:
+        pixel_channels = src.count
+    with rasterio.open(sample_tuple[1]) as src:
+        pixel_channels += src.count
+    token_slice = sample_tuple[2:-1] if args.test_targets_dir else sample_tuple[2:]
+    token_channels = 0
+    for path in token_slice:
+        with rasterio.open(path) as src:
+            token_channels += src.count
+    return (pixel_channels, token_channels), PixelMultiTokenEmbeddingDataset
 
 
-def load_token_normalization_from_run(exp_dir, override_path=None):
-    """Load token z-score stats saved by training, if present (or from override path)."""
-    stats_path = override_path or os.path.join(exp_dir, "token_channel_zscore_stats.npz")
-    if not os.path.exists(stats_path):
-        return None
-    from core.data.training import _load_token_channel_zscore_stats
-    print(f"Loading token z-score stats for inference: {stats_path}")
-    return _load_token_channel_zscore_stats(stats_path)
-
-
-def build_dataset(dataset_cls, inputs, patch_size, *, token_normalization=None):
-    if dataset_cls.__name__ in ("PixelTokenEmbeddingDataset", "PixelMultiTokenEmbeddingDataset"):
-        return dataset_cls(
-            inputs, patch_size=patch_size, scale_factor=16, is_train=False,
-            token_normalization=token_normalization,
-        )
-    return dataset_cls(inputs, patch_size=patch_size, is_train=False)
+def build_dataset(dataset_cls, inputs, patch_size):
+    return dataset_cls(inputs, patch_size=patch_size, scale_factor=16, is_train=False)
 
 
 def main():
@@ -332,23 +210,17 @@ def main():
     model_type = args.model_type or train_cfg.get("model_type", "auto")
 
     inputs = resolve_inputs(args)
-    if args.restrict_split_file:
-        val = set(json.load(open(args.restrict_split_file))["val"])
+    if args.restrict_val_split:
+        val = set(json.load(open(args.restrict_val_split))["val"])
         label_mode = args.test_targets_dir is not None
         before = len(inputs)
         inputs = [x for x in inputs if _core_of_input(x, label_mode) in val]
-        print(f"restrict-split: kept {len(inputs)}/{before} inputs in val of {args.restrict_split_file}")
+        print(f"restrict-val-split: kept {len(inputs)}/{before} inputs in val of {args.restrict_val_split}")
     if args.max_samples > 0:
         inputs = inputs[:args.max_samples]
 
     n_channels, dataset_cls = infer_channels_and_dataset(args, inputs)
-    token_norm_stats = load_token_normalization_from_run(
-        exp_dir, override_path=args.token_normalization_stats_path,
-    )
-    test_ds = build_dataset(
-        dataset_cls, inputs, args.patch_size,
-        token_normalization=token_norm_stats,
-    )
+    test_ds = build_dataset(dataset_cls, inputs, args.patch_size)
     sample_img, _, _ = test_ds[0]
 
     model, selected_model = build_model(
@@ -368,31 +240,10 @@ def main():
         print(f"INFO: extra keys in checkpoint (unused by current arch): {result.unexpected_keys}")
     model.eval()
 
-    if args.adabn:
-        import torch.nn as nn
-        bns = [m for m in model.modules()
-               if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d))]
-        for m in bns:
-            m.reset_running_stats()
-            m.momentum = None      # cumulative moving average -> exact target-set stats
-            m.train()              # only BN updates; rest of the model stays in eval()
-        print(f"AdaBN: recomputing running stats on {len(test_ds)} target tiles "
-              f"across {len(bns)} BatchNorm layers...")
-        with torch.no_grad():
-            for i in tqdm(range(len(test_ds)), desc="AdaBN adapt"):
-                img_tensor, _, _ = test_ds[i]
-                model(move_to_device(batched(img_tensor), device))
-        for m in bns:
-            m.eval()
-        print("AdaBN: adaptation done; running stats now reflect the target distribution.")
-
     print(f"Loaded model: {selected_model} from {model_path} (input channels={input_channels(sample_img)})")
     if args.thresholds is not None:
         print(f"Baking thresholds into output: bld={args.thresholds[0]}, "
               f"veg={args.thresholds[1]}, wat={args.thresholds[2]}")
-    views = tta_views(args.tta)
-    if args.tta != "none":
-        print(f"TTA enabled: {args.tta} ({len(views)} views)")
     print(f"Training config source: {train_cfg.get('_config_source')}")
 
     print(f"Running inference on {len(test_ds)} samples...")
@@ -403,7 +254,7 @@ def main():
             img_batch = move_to_device(batched(img_tensor), device)
 
             pred = prediction_to_numpy(
-                predict_batch(model, img_batch, views),
+                predict_batch(model, img_batch),
                 thresholds=args.thresholds,
             )
 

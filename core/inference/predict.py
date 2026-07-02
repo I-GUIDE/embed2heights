@@ -1,30 +1,8 @@
-"""Model-forward helpers for inference and TTA."""
-
-import os
+"""Model-forward helpers for inference."""
 
 import numpy as np
-import torch
 
 from core.data.datasets import HEIGHT_NORM_CONSTANT
-
-
-# Ablation toggles (must mirror core/engine/train_loop.py):
-#   ZERO_TOKENS=1  -> replace token tensor with zeros
-#   NOISE_TOKENS=1 -> replace token tensor with torch.randn_like(token)
-# ZERO takes precedence if both are set.
-_ZERO_TOKENS = os.environ.get("ZERO_TOKENS", "0") == "1"
-_NOISE_TOKENS = os.environ.get("NOISE_TOKENS", "0") == "1"
-
-
-def _maybe_zero_tokens(img_batch):
-    if not (_ZERO_TOKENS or _NOISE_TOKENS):
-        return img_batch
-    if isinstance(img_batch, (tuple, list)) and len(img_batch) == 2:
-        pixel, token = img_batch
-        if _ZERO_TOKENS:
-            return (pixel, torch.zeros_like(token))
-        return (pixel, torch.randn_like(token))
-    return img_batch
 
 
 def input_channels(sample_img):
@@ -39,47 +17,8 @@ def batched(img_tensor):
     return img_tensor.unsqueeze(0)
 
 
-def tta_views(mode):
-    if mode == "none":
-        return [(0, False)]
-    if mode == "flip":
-        return [(0, False), (0, True), (2, True)]
-    return [(k, mirror) for k in range(4) for mirror in (False, True)]
-
-
-def transform_tensor(x, rot_k, mirror):
-    if rot_k:
-        x = torch.rot90(x, rot_k, dims=(-2, -1))
-    if mirror:
-        x = torch.flip(x, dims=(-1,))
-    return x
-
-
-def invert_tensor(x, rot_k, mirror):
-    if mirror:
-        x = torch.flip(x, dims=(-1,))
-    if rot_k:
-        x = torch.rot90(x, -rot_k, dims=(-2, -1))
-    return x
-
-
-def transform_input(img_batch, rot_k, mirror):
-    if isinstance(img_batch, (tuple, list)):
-        return tuple(transform_tensor(t, rot_k, mirror) for t in img_batch)
-    return transform_tensor(img_batch, rot_k, mirror)
-
-
-def predict_batch(model, img_batch, views):
-    img_batch = _maybe_zero_tokens(img_batch)
-    if len(views) == 1:
-        return model(img_batch).squeeze(0)
-
-    preds = []
-    for rot_k, mirror in views:
-        aug_input = transform_input(img_batch, rot_k, mirror)
-        aug_pred = model(aug_input)
-        preds.append(invert_tensor(aug_pred, rot_k, mirror).squeeze(0))
-    return torch.stack(preds, dim=0).mean(dim=0)
+def predict_batch(model, img_batch):
+    return model(img_batch).squeeze(0)
 
 
 def prediction_to_numpy(pred_tensor, *, thresholds=None):

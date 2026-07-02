@@ -1,8 +1,10 @@
 __pycache__/
 *.pyc
-data/
-submission/
-# training outputs are regenerated; keep only the delmask masks
+/data/
+/submission/
+# training outputs are regenerated and not tracked
 runs/*
+# keep the missing_masks directory in the tree, but ignore its generated .npy files
 !runs/missing_masks/
-runs/missing_masks/.gitkeep
+runs/missing_masks/*
+!runs/missing_masks/.gitkeep

@@ -2,6 +2,7 @@
 # Predict the 946 TEST tiles for ONE member-fold, for the 3 checkpoints the final
 # submission consumes: _cldice + _segpurify (seg ch0-2) and _purify (height ch3).
 # Writes runs/<exp>_{cldice,segpurify,purify}/test_predictions/*.npy
+# Resumable: a stage whose test_predictions dir is already populated is skipped.
 #
 # Usage:  MEMBER (0-4)  FOLD (0-4)
 #   scripts/predict_test_member_fold.sh 0 0
@@ -12,11 +13,11 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 DATA_ROOT="${DATA_ROOT:-$REPO/data}"; T="$DATA_ROOT/test"
 export REPO_DIR="$REPO"; cd "$REPO"
 
-CFGS=(xfusion_095_p3_2stage_softbin_covgt10_delmask_unetpp \
-      xfusion_095_p3_2stage_softbin_covgt10_delmask_unetpp \
-      xfusion_095_p3_2stage_softbin_covgt10_delmask_unetpp \
-      xfusion_095_p3_2stage_softbin_covgt10_delmask_unet3plus \
-      xfusion_095_p3_2stage_softbin_covgt10_delmask_unetpp_trans)
+CFGS=(xfusion_095_unetpp \
+      xfusion_095_unetpp \
+      xfusion_095_unetpp \
+      xfusion_095_unet3plus \
+      xfusion_095_unetpp_trans)
 SEEDS=(0 1 2 0 0)
 CFG=${CFGS[$MEMBER]}; SEED=${SEEDS[$MEMBER]}
 EXP="${CFG}_s${SEED}_f${FOLD}"
@@ -28,7 +29,9 @@ PARGS="--test-embeddings-dir $T/alphaearth_test_emb --secondary-test-embeddings-
 for STAGE in cldice segpurify purify; do
   E="${EXP}_${STAGE}"
   [ -f "runs/$E/model_best.pth" ] || { echo "skip $E (no ckpt)"; continue; }
+  OUT="$REPO/runs/$E/test_predictions"
+  if ls "$OUT"/*.npy >/dev/null 2>&1; then echo "[skip] $E test_predictions (populated)"; continue; fi
   python predict.py --experiment-name "$E" --base-dir "$REPO/runs" $PARGS \
-    --predictions-dir "$REPO/runs/$E/test_predictions" --patch-size 256 --max-samples 0
+    --predictions-dir "$OUT" --patch-size 256 --max-samples 0
 done
-echo "[predict] done: ${EXP} (cldice/segpurify/purify test_predictions)"
+echo "[predict-test] done: ${EXP} (cldice/segpurify/purify test_predictions)"

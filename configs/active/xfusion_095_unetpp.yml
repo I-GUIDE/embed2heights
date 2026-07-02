@@ -1,0 +1,77 @@
+name: xfusion_095_unetpp
+description: >
+  Ensemble member: U-Net++ pixel backbone (seeds 0/1/2 in the final ensemble).
+  Two-stage soft-bin height regression + coverage>0.10 presence GT, split-trunk
+  head (segmentation and height own separate trunk weights), building boundary
+  head + boundary-ring presence upweighting, and delmask: the presence/seg loss
+  is dropped on ~100 tiles whose building footprints were human-deleted from the
+  GT (missing_building_mask_dir -> runs/missing_masks). Trained through 4 stages
+  (stage-1 coupled, then height / seg / clDice purify) by
+  scripts/train_member_fold.sh.
+
+data:
+  train_embeddings_dir: ${REPO_DIR}/data/train/alphaearth_emb
+  secondary_train_embeddings_dir: ${REPO_DIR}/data/train/tessera_emb
+  token_train_embeddings_dir: ${REPO_DIR}/data/train/terramind_s1_emb
+  secondary_token_train_embeddings_dir: ${REPO_DIR}/data/train/terramind_s2_emb
+  third_token_train_embeddings_dir: ${REPO_DIR}/data/train/thor_s1_emb
+  fourth_token_train_embeddings_dir: ${REPO_DIR}/data/train/thor_s2_emb
+  train_targets_dir: ${REPO_DIR}/data/train/labels
+  missing_building_mask_dir: ${REPO_DIR}/runs/missing_masks
+  split_file: ${REPO_DIR}/splits/group_code_5fold_seed42/fold_0/split.json
+  patch_size: 256
+
+model:
+  model_type: xfusion_unet_hybrid_cross_source
+  lightunet_base_ch: 48
+  lightunet_norm_kind: bn
+  height_specialist_depth: 1
+  height_hidden_ch: 96
+  height_trunk_depth: 2
+  height_n_bins: 64
+  height_bin_max_m: 80.0
+  gate_mode: rich
+  gate_untied: false
+  gate_init_bias: 4.0
+  modality_dropout: 0.0
+  presence_head_depth: 1
+  presence_branch_ch: 48
+  use_fraction_aux: true
+  token_calibration: true
+  token_calibration_source_indices: [0, 1]
+  presence_tower_depth: 2
+  split_trunk: true
+  presence_trunk_grad_scale: 1.0
+  pixel_backbone_kind: unetpp
+
+training:
+  batch_size: 16
+  epochs: 80
+  lr: 0.0002
+  weight_decay: 0.0001
+  seed: 0
+  grad_accum_steps: 1
+  weight_presence_tversky: 1.0
+  weight_fraction_mae: 0.1
+  weight_height_boost: 2.0
+  aux_weight: 1.0
+  build_height_boost: 5.0
+  veg_height_boost: 1.5
+  aux_veg_weight: 1.0
+  height_bin_aux_weight: 0.5
+  height_bin_sigma_bins: 1.5
+  tversky_water_alpha: 0.3
+  water_empty_topk: 512
+  weight_water_empty_topk: 0.03
+  building_boundary_weight: 0.25
+  building_ring_presence_alpha: 2.0
+  building_ring_kernel: 5
+  presence_coverage_threshold: 0.1
+
+runtime:
+  experiment_name: xfusion_095_unetpp
+  output_dir: ${REPO_DIR}/runs
+  amp: false
+  data_parallel: false
+  num_workers: 4
+  prefetch_factor: 1

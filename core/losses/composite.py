@@ -1,84 +1,60 @@
-"""Composite supervised training loss."""
+"""Composite training loss.
+
+A thin orchestrator: every term's math lives in the domain modules
+(``height.py`` for height regression / bin-CE, ``segmentation.py`` for the
+class-fraction / presence / topology losses). This class just builds the
+supervision targets, calls those terms, and weights them into one scalar.
+"""
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from .height import height_bin_ce, height_error
-from .segmentation import TverskyLoss
-from .structure import GradientDifferenceLoss, SSIMLoss
+from .height import height_bin_ce, height_error, masked_height
+from .segmentation import (
+    TverskyLoss,
+    building_boundary_loss,
+    building_ring,
+    cl_dice_loss,
+    empty_water_topk_penalty,
+    masked_presence_bce,
+    split_fg_bg_mae,
+)
 
 
 class ImprovedCompositeLoss(nn.Module):
-    """
-    Combined Recipe:
-    1. Split Foreground/Background MAE (L1).
-    2. SSIM and Gradient Loss on RGB channels.
-    3. Tversky Loss specifically to boost Building recall.
-    4. Structure-Boosted Height MAE.
+    """Presence-centered composite loss.
+
+    Terms: split fg/bg fraction MAE, structure-boosted height regression,
+    presence BCE + Tversky (coverage>thr target) with a building boundary-ring
+    upweight, an empty-water top-k penalty, per-class height-bin cross-entropy, a
+    building-boundary aux head, and an optional clDice topology loss.
     """
 
-    def __init__(self, weight_mae=1.0, weight_presence_tversky=1.0,
+    def __init__(self, weight_presence_tversky=1.0,
                  weight_fraction_mae=0.1, weight_height_boost=2.0,
-                 bg_weight=0.05, aux_weight=0.25, loss_preset="presence_centered",
-                 height_loss_kind="l1", huber_delta=1.0, pinball_tau=0.5,
+                 bg_weight=0.05, aux_weight=0.25,
                  build_height_boost=5.0, veg_height_boost=0.0,
                  aux_veg_weight=1.0, height_bin_aux_weight=0.0,
-                 height_bin_sigma_bins=1.5, tversky_building_alpha=0.3,
-                 tversky_water_alpha=0.3,
+                 height_bin_sigma_bins=1.5, tversky_water_alpha=0.3,
                  water_empty_topk=0, weight_water_empty_topk=0.0,
-                 building_presence_pos_weight=1.0,
-                 small_building_presence_weight=1.0,
-                 small_building_max_pixels=0,
                  building_boundary_weight=0.0,
                  building_ring_presence_alpha=0.0,
                  building_ring_kernel=5,
-                 presence_coverage_threshold=0.0,
-                 unetpp_ds_weight=0.0,
-                 unetpp_ds_height_weight=0.0,
+                 presence_coverage_threshold=0.1,
                  cl_dice_weight=0.0,
                  cl_dice_iters=5):
         super().__init__()
-        # clDice (centerline-Dice) topology loss on the building presence map.
-        # Targets the merged-building failure: rewards skeleton/connectivity
-        # agreement so adjacent buildings stay separated. Soft-skeleton via
-        # iterated soft morphology (min/max pool). 0 => off (baseline).
-        self.cl_dice_weight = float(cl_dice_weight)
-        self.cl_dice_iters = int(cl_dice_iters)
-        if loss_preset != "presence_centered":
-            raise ValueError("loss_preset must be presence_centered")
-        # U-Net++ deep supervision: aux loss on the shallow nested nodes' (3
-        # presence + 1 height) maps. unetpp_ds_weight = overall lambda; height
-        # term within each aux scaled by unetpp_ds_height_weight (0 => seg-only).
-        self.unetpp_ds_weight = float(unetpp_ds_weight)
-        self.unetpp_ds_height_weight = float(unetpp_ds_height_weight)
-        if height_loss_kind not in {"l1", "huber", "mse", "pinball"}:
-            raise ValueError("height_loss_kind must be one of: l1, huber, mse, pinball")
-        self.loss_preset = loss_preset
-        self.ssim = SSIMLoss(window_size=11)
-        self.gdl = GradientDifferenceLoss()
+        # building/veg presence Tversky share alpha=0.3 (recall-leaning); water
+        # takes its own alpha (tversky_water_alpha).
         self.tversky = TverskyLoss(alpha=0.3, beta=0.7)
-        building_alpha = float(tversky_building_alpha)
-        self.tversky_building = TverskyLoss(
-            alpha=building_alpha,
-            beta=1.0 - building_alpha,
-        )
-        water_alpha = float(tversky_water_alpha)
-        self.tversky_water = TverskyLoss(alpha=water_alpha, beta=1.0 - water_alpha)
+        self.tversky_water = TverskyLoss(alpha=tversky_water_alpha,
+                                         beta=1.0 - tversky_water_alpha)
 
-        self.w_mae = weight_mae
-        self.w_ssim = 0.0
-        self.w_grad = 0.0
         self.w_structure = weight_height_boost
-
         self.bg_weight = bg_weight
         self.aux_weight = aux_weight
         self.presence_tversky_weight = weight_presence_tversky
         self.fraction_mae_weight = weight_fraction_mae
-
-        self.height_loss_kind = height_loss_kind
-        self.huber_delta = float(huber_delta)
-        self.pinball_tau = float(pinball_tau)
         self.build_height_boost = float(build_height_boost)
         self.veg_height_boost = float(veg_height_boost)
         self.aux_veg_weight = float(aux_veg_weight)
@@ -86,450 +62,144 @@ class ImprovedCompositeLoss(nn.Module):
         self.height_bin_sigma_bins = float(height_bin_sigma_bins)
         self.water_empty_topk = max(0, int(water_empty_topk))
         self.weight_water_empty_topk = float(weight_water_empty_topk)
-        self.building_presence_pos_weight = float(building_presence_pos_weight)
-        self.small_building_presence_weight = float(small_building_presence_weight)
-        self.small_building_max_pixels = max(0, int(small_building_max_pixels))
         self.building_boundary_weight = float(building_boundary_weight)
         self.building_ring_presence_alpha = float(building_ring_presence_alpha)
         ring_kernel = int(building_ring_kernel)
         if ring_kernel % 2 == 0:
             raise ValueError("building_ring_kernel must be odd")
         self.building_ring_kernel = ring_kernel
-        # >0 aligns presence supervision with the official GT (coverage>thr,
-        # ~0.10 reverse-engineered from the public board). 0.0 keeps the legacy
-        # argmax+any-present target. See _build_presence_target in forward().
+        # Presence target = (coverage > thr), matching the official GT (~0.10).
         self.presence_coverage_threshold = float(presence_coverage_threshold)
-
-        self.mae_weights = torch.tensor([1.0, 1.0, 1.0, 1.0]).float()
-        self.fraction_mae_weights = torch.tensor([1.0, 1.0, 1.0]).float()
-
-    def _height_err(self, pred, target):
-        return height_error(
-            pred,
-            target,
-            kind=self.height_loss_kind,
-            huber_delta=self.huber_delta,
-            pinball_tau=self.pinball_tau,
-        )
-
-    def _height_bin_ce(self, logits, target_norm, mask, log_centers):
-        return height_bin_ce(
-            logits,
-            target_norm,
-            mask,
-            log_centers,
-            sigma_bins=self.height_bin_sigma_bins,
-        )
-
-    @staticmethod
-    def _soft_erode(img):
-        return -F.max_pool2d(-img, kernel_size=3, stride=1, padding=1)
-
-    @staticmethod
-    def _soft_dilate(img):
-        return F.max_pool2d(img, kernel_size=3, stride=1, padding=1)
-
-    def _soft_open(self, img):
-        return self._soft_dilate(self._soft_erode(img))
-
-    def _soft_skel(self, img, iters):
-        """Differentiable morphological skeleton (Shit et al., clDice)."""
-        img1 = self._soft_open(img)
-        skel = F.relu(img - img1)
-        for _ in range(iters):
-            img = self._soft_erode(img)
-            img1 = self._soft_open(img)
-            delta = F.relu(img - img1)
-            skel = skel + F.relu(delta - skel * delta)
-        return skel
-
-    def _cl_dice_loss(self, prob, gt, mask, smooth=1.0):
-        """1 - clDice on the building channel. prob/gt/mask: (B,1,H,W) in [0,1].
-
-        Topology precision = skeleton(pred) covered by gt; sensitivity =
-        skeleton(gt) covered by pred. Penalises merged/broken thin structures
-        (the inter-building bridges) that area losses are blind to."""
-        prob = (prob * mask).clamp(0.0, 1.0)
-        gt = (gt * mask).clamp(0.0, 1.0)
-        sk_p = self._soft_skel(prob, self.cl_dice_iters)
-        sk_t = self._soft_skel(gt, self.cl_dice_iters)
-        tprec = (torch.sum(sk_p * gt) + smooth) / (torch.sum(sk_p) + smooth)
-        tsens = (torch.sum(sk_t * prob) + smooth) / (torch.sum(sk_t) + smooth)
-        cl_dice = 2.0 * tprec * tsens / (tprec + tsens + 1e-8)
-        return 1.0 - cl_dice
-
-    def _building_boundary_loss(self, logits, fractions, mask):
-        """Auxiliary edge supervision on the building boundary ring.
-
-        `fractions` is the (B, 3, H, W) GT coverage for {building, veg, water}.
-        The hard building mask matches the dataset's binarization convention:
-        each pixel is assigned to its single argmax class (and only where some
-        class is present), so a pixel counts as building iff building is the
-        dominant fraction — NOT merely `building_fraction > 0`. This is the
-        same rule used to build `presence_target`.
-
-        The boundary target is then derived on-the-fly: a morphological
-        dilation minus erosion (3x3) of that hard mask yields a ~1px-wide ring.
-        BCE handles per-pixel error; soft Dice counters the extreme class
-        imbalance (boundary pixels are a tiny fraction of the patch). Both
-        terms are restricted to valid (`mask`) pixels.
-        """
-        any_present = (fractions > 0).any(dim=1, keepdim=True).float()
-        argmax_idx = fractions.argmax(dim=1, keepdim=True)
-        # Building is channel 0; dominant-class assignment matches the labels.
-        m = (argmax_idx == 0).float() * any_present
-        dil = F.max_pool2d(m, 3, stride=1, padding=1)                 # dilation
-        ero = 1.0 - F.max_pool2d(1.0 - m, 3, stride=1, padding=1)     # erosion
-        boundary = (dil - ero).clamp(0.0, 1.0)                        # ring = dil - ero
-
-        bce_map = F.binary_cross_entropy_with_logits(
-            logits, boundary, reduction="none"
-        )
-        bce = torch.sum(bce_map * mask) / (torch.sum(mask) + 1e-6)
-
-        pred = torch.sigmoid(logits) * mask
-        tgt = boundary * mask
-        inter = torch.sum(pred * tgt)
-        dice = 1.0 - (2.0 * inter + 1.0) / (torch.sum(pred) + torch.sum(tgt) + 1.0)
-        return bce + dice
+        self.cl_dice_weight = float(cl_dice_weight)
+        self.cl_dice_iters = int(cl_dice_iters)
 
     def forward(self, preds, targets, valid_mask=None):
         """
-        Args:
-            preds:      (B, 4, H, W) model predictions, or a dict with
-                        preds["out"] plus optional auxiliary heads.
-            targets:    (B, 4, H, W) ground truth.
-            valid_mask: (B, 2, H, W), channel 0 = global validity,
-                        channel 1 = height validity.
+        preds:      (B,4,H,W), or a dict with preds["out"] + optional aux heads.
+        targets:    (B,4,H,W) ground truth (ch0-2 coverage, ch3 normalized height).
+        valid_mask: (B,2,H,W): ch0 = global validity, ch1 = height validity.
         """
-        aux_outputs = preds if isinstance(preds, dict) else None
-        if aux_outputs is not None:
-            preds = aux_outputs["out"]
-
+        aux = preds if isinstance(preds, dict) else None
+        if aux is not None:
+            preds = aux["out"]
         device = preds.device
-        mae_weights = self.mae_weights.to(device)
-        fraction_mae_weights = self.fraction_mae_weights.to(device)
 
         if valid_mask is None:
             valid_mask = torch.ones(preds.shape[0], 2, preds.shape[2], preds.shape[3],
                                     device=device)
-
         global_mask = valid_mask[:, 0:1, :, :]
         height_mask = valid_mask[:, 1:2, :, :]
-        ch_mask = torch.cat([global_mask.expand(-1, 3, -1, -1), height_mask], dim=1)
-        global_1ch = global_mask.squeeze(1)
         height_1ch = height_mask.squeeze(1)
-
-        if aux_outputs is not None and "fractions" in aux_outputs:
-            class_pred = aux_outputs["fractions"]
-        else:
-            class_pred = preds[:, :3, :, :]
-        reg_pred = torch.cat([class_pred, preds[:, 3:4, :, :]], dim=1)
-
-        def split_fg_bg_mae(pred, target, mask, weights):
-            abs_err = torch.abs(pred - target)
-            fg_mask = (target > 0).float() * mask
-            bg_mask = (1.0 - (target > 0).float()) * mask
-
-            fg_sum = torch.sum(fg_mask, dim=(0, 2, 3)) + 1e-6
-            bg_sum = torch.sum(bg_mask, dim=(0, 2, 3)) + 1e-6
-
-            mae_fg = torch.sum(abs_err * fg_mask, dim=(0, 2, 3)) / fg_sum
-            mae_bg = torch.sum(abs_err * bg_mask, dim=(0, 2, 3)) / bg_sum
-            mae_per_channel = mae_fg + (self.bg_weight * mae_bg)
-            return torch.sum(mae_per_channel * weights)
-
-        loss_mae = split_fg_bg_mae(reg_pred, targets, ch_mask, mae_weights)
-        loss_fraction_mae = split_fg_bg_mae(
-            class_pred,
-            targets[:, :3, :, :],
-            global_mask.expand(-1, 3, -1, -1),
-            fraction_mae_weights,
-        )
-
+        gm_bool = global_mask.squeeze(1).bool()
         lc_mask = global_mask.expand(-1, 3, -1, -1)
-        lc_pred = class_pred * lc_mask
-        lc_target = targets[:, :3, :, :] * lc_mask
-
         zero = torch.zeros((), device=device, dtype=preds.dtype)
-        loss_ssim = self.ssim(lc_pred, lc_target) if self.w_ssim != 0 else zero
-        loss_grad = self.gdl(lc_pred, lc_target) if self.w_grad != 0 else zero
 
-        gm_bool = global_1ch.bool()
-        if self.loss_preset == "presence_centered":
-            loss_tversky = zero
-        else:
-            t_build = self.tversky(torch.relu(class_pred[:, 0, :, :]),
-                                   targets[:, 0, :, :], valid_mask=gm_bool)
-            t_veg = self.tversky(torch.relu(class_pred[:, 1, :, :]),
-                                 targets[:, 1, :, :], valid_mask=gm_bool)
-            t_water = self.tversky_water(torch.relu(class_pred[:, 2, :, :]),
-                                         targets[:, 2, :, :], valid_mask=gm_bool)
-            loss_tversky = (t_build + t_veg + t_water) / 3.0
+        class_pred = aux["fractions"] if (aux is not None and "fractions" in aux) else preds[:, :3, :, :]
 
-        build_presence_mask = (targets[:, 0, :, :] > 0.1).float() * height_1ch
-        veg_presence_mask = (targets[:, 1, :, :] > 0.1).float() * height_1ch
-        height_err = self._height_err(preds[:, 3, :, :], targets[:, 3, :, :]) * height_1ch
+        # --- fraction MAE (seg) ---
+        loss_fraction_mae = split_fg_bg_mae(class_pred, targets[:, :3, :, :], lc_mask, self.bg_weight)
 
-        height_valid_count = torch.sum(height_1ch) + 1e-6
-        per_pixel_weight = (1.0 + self.build_height_boost * build_presence_mask
-                            + self.veg_height_boost * veg_presence_mask)
-        loss_height_boost = torch.sum(height_err * per_pixel_weight) / height_valid_count
+        # --- structure-boosted height regression ---
+        build_presence = (targets[:, 0, :, :] > 0.1).float() * height_1ch
+        veg_presence = (targets[:, 1, :, :] > 0.1).float() * height_1ch
+        height_err = height_error(preds[:, 3, :, :], targets[:, 3, :, :]) * height_1ch
+        per_pixel_weight = (1.0 + self.build_height_boost * build_presence
+                            + self.veg_height_boost * veg_presence)
+        loss_height_boost = torch.sum(height_err * per_pixel_weight) / (torch.sum(height_1ch) + 1e-6)
 
-        if self.loss_preset == "presence_centered":
-            weighted_mae = self.fraction_mae_weight * loss_fraction_mae
-        else:
-            weighted_mae = self.w_mae * loss_mae
-        weighted_ssim = self.w_ssim * loss_ssim
-        weighted_grad = self.w_grad * loss_grad
-        weighted_tversky = self.w_structure * loss_tversky
+        weighted_mae = self.fraction_mae_weight * loss_fraction_mae
         weighted_height_boost = self.w_structure * loss_height_boost
+        total_loss = weighted_mae + weighted_height_boost
 
-        total_loss = weighted_mae + weighted_ssim + weighted_grad + \
-            weighted_tversky + weighted_height_boost
+        # --- presence terms (BCE + Tversky + empty-water + aux height heads) ---
+        presence_loss = presence_tversky_loss = water_topk_loss = zero
+        aux_height_building_loss = aux_height_vegetation_loss = zero
+        if aux is not None and "presence_logits" in aux:
+            logits = aux["presence_logits"]
+            presence_target = (targets[:, :3, :, :] > self.presence_coverage_threshold).float()
 
-        presence_loss = zero
-        presence_tversky_loss = zero
-        water_empty_topk_loss = zero
-        aux_height_building_loss = zero
-        aux_height_vegetation_loss = zero
-        if aux_outputs is not None and "presence_logits" in aux_outputs:
-            fractions = targets[:, :3, :, :]
-            if self.presence_coverage_threshold > 0.0:
-                # Official GT marks a 10 m pixel positive for a class iff its
-                # coverage exceeds a low threshold (~0.10, reverse-engineered
-                # from the public board); the legacy argmax+any-present rule
-                # below over-counts building ~3x. Per-class (multi-label) is
-                # fine: the 3 coverages sum to <=1, so double-positives are rare.
-                presence_target = (fractions > self.presence_coverage_threshold).float()
-            else:
-                any_present = (fractions > 0).any(dim=1, keepdim=True).float()
-                argmax_idx = fractions.argmax(dim=1, keepdim=True)
-                presence_target = torch.zeros_like(fractions).scatter_(1, argmax_idx, 1.0) * any_present
-
-            # Building boundary ring for presence-BCE upweighting. Same hard
-            # mask convention as `_building_boundary_loss` (argmax building),
-            # but the ring here is wider (default 5x5 -> ~2px each side) to
-            # tolerate GT registration error, and it reweights the MAIN
-            # presence loss instead of supervising a separate aux head: the
-            # extra pressure lands directly on the logits that decide IoU.
-            building_ring = None
+            ring = None
             if self.building_ring_presence_alpha > 0:
-                m = presence_target[:, 0:1, :, :]
-                pad = self.building_ring_kernel // 2
-                dil = F.max_pool2d(m, self.building_ring_kernel, stride=1, padding=pad)
-                ero = 1.0 - F.max_pool2d(1.0 - m, self.building_ring_kernel,
-                                         stride=1, padding=pad)
-                building_ring = (dil - ero).clamp(0.0, 1.0)
+                ring = building_ring(presence_target[:, 0:1, :, :], self.building_ring_kernel)
+            presence_loss = masked_presence_bce(logits, presence_target, lc_mask,
+                                                ring, self.building_ring_presence_alpha)
 
-            def masked_presence_bce(logits):
-                safe_logits = torch.where(
-                    lc_mask.bool(),
-                    logits,
-                    torch.zeros_like(logits),
-                )
-                safe_target = torch.where(
-                    lc_mask.bool(),
-                    presence_target,
-                    torch.zeros_like(presence_target),
-                )
-                loss = F.binary_cross_entropy_with_logits(
-                    safe_logits, safe_target, reduction="none"
-                )
-                bce_weight = lc_mask
-                if (self.building_presence_pos_weight != 1.0
-                        or self.small_building_presence_weight != 1.0):
-                    bce_weight = lc_mask.clone()
-                    b_pos = safe_target[:, 0:1, :, :] > 0
-                    b_weight = torch.ones_like(bce_weight[:, 0:1, :, :])
-                    b_weight = torch.where(
-                        b_pos,
-                        b_weight * self.building_presence_pos_weight,
-                        b_weight,
-                    )
-                    if (self.small_building_max_pixels > 0
-                            and self.small_building_presence_weight != 1.0):
-                        b_area = torch.sum(
-                            safe_target[:, 0:1, :, :] * global_mask,
-                            dim=(1, 2, 3),
-                        )
-                        small = (
-                            (b_area > 0)
-                            & (b_area <= self.small_building_max_pixels)
-                        ).view(-1, 1, 1, 1)
-                        b_weight = torch.where(
-                            small & b_pos,
-                            b_weight * self.small_building_presence_weight,
-                            b_weight,
-                        )
-                    bce_weight[:, 0:1, :, :] = bce_weight[:, 0:1, :, :] * b_weight
-                if building_ring is not None:
-                    if bce_weight is lc_mask:
-                        bce_weight = lc_mask.clone()
-                    bce_weight[:, 0:1, :, :] = bce_weight[:, 0:1, :, :] * (
-                        1.0 + self.building_ring_presence_alpha * building_ring
-                    )
-                return torch.sum(loss * bce_weight) / (torch.sum(bce_weight) + 1e-6)
-
-            presence_loss = masked_presence_bce(aux_outputs["presence_logits"])
-            if self.loss_preset == "presence_centered":
-                presence_prob = torch.sigmoid(aux_outputs["presence_logits"])
-                p_build = self.tversky_building(
-                    presence_prob[:, 0, :, :],
-                    presence_target[:, 0, :, :],
-                    valid_mask=gm_bool,
-                )
-                p_veg = self.tversky(
-                    presence_prob[:, 1, :, :],
-                    presence_target[:, 1, :, :],
-                    valid_mask=gm_bool,
-                )
-                p_water = self.tversky_water(
-                    presence_prob[:, 2, :, :],
-                    presence_target[:, 2, :, :],
-                    valid_mask=gm_bool,
-                )
-                presence_tversky_loss = (p_build + p_veg + p_water) / 3.0
+            prob = torch.sigmoid(logits)
+            p_build = self.tversky(prob[:, 0], presence_target[:, 0], valid_mask=gm_bool)
+            p_veg = self.tversky(prob[:, 1], presence_target[:, 1], valid_mask=gm_bool)
+            p_water = self.tversky_water(prob[:, 2], presence_target[:, 2], valid_mask=gm_bool)
+            presence_tversky_loss = (p_build + p_veg + p_water) / 3.0
 
             if self.water_empty_topk > 0 and self.weight_water_empty_topk > 0:
-                water_target = presence_target[:, 2:3, :, :] * global_mask
-                empty_water = torch.sum(water_target, dim=(1, 2, 3)) <= 0
-                if torch.any(empty_water):
-                    water_prob = torch.sigmoid(
-                        aux_outputs["presence_logits"][:, 2:3, :, :]
-                    ) * global_mask
-                    flat = water_prob[empty_water].flatten(1)
-                    if flat.numel() > 0:
-                        k = min(self.water_empty_topk, flat.shape[1])
-                        water_empty_topk_loss = torch.topk(flat, k, dim=1).values.mean()
+                water_topk_loss = empty_water_topk_penalty(
+                    logits[:, 2:3, :, :], presence_target[:, 2:3, :, :],
+                    global_mask, self.water_empty_topk)
 
             target_height = targets[:, 3:4, :, :]
-            bld_height_mask = (targets[:, 0:1, :, :] > 0).float() * height_mask
-            veg_height_mask = (targets[:, 1:2, :, :] > 0).float() * height_mask
-
-            def masked_height(pred, target, mask):
-                err = self._height_err(pred, target)
-                return torch.sum(err * mask) / (torch.sum(mask) + 1e-6)
-
-            if "height_building" in aux_outputs:
-                aux_height_building_loss = masked_height(
-                    aux_outputs["height_building"], target_height, bld_height_mask
-                )
-            if "height_vegetation" in aux_outputs:
-                aux_height_vegetation_loss = masked_height(
-                    aux_outputs["height_vegetation"], target_height, veg_height_mask
-                )
+            bld_hmask = (targets[:, 0:1, :, :] > 0).float() * height_mask
+            veg_hmask = (targets[:, 1:2, :, :] > 0).float() * height_mask
+            if "height_building" in aux:
+                aux_height_building_loss = masked_height(aux["height_building"], target_height, bld_hmask)
+            if "height_vegetation" in aux:
+                aux_height_vegetation_loss = masked_height(aux["height_vegetation"], target_height, veg_hmask)
 
             total_loss = total_loss + self.aux_weight * (
                 presence_loss + aux_height_building_loss
                 + self.aux_veg_weight * aux_height_vegetation_loss
             ) + self.presence_tversky_weight * presence_tversky_loss
-            total_loss = total_loss + self.weight_water_empty_topk * water_empty_topk_loss
+            total_loss = total_loss + self.weight_water_empty_topk * water_topk_loss
 
-            # U-Net++ DEEP SUPERVISION: aux (3 presence + 1 height) maps on the
-            # shallow nested nodes X^0_1, X^0_2. presence = BCE+Tversky vs the
-            # same presence_target; height = L1 on bld/veg pixels (only when
-            # unetpp_ds_height_weight>0). Training-only regularizer.
-            if (self.unetpp_ds_weight > 0
-                    and aux_outputs.get("ds_outputs")):
-                gmb = global_mask.squeeze(1).bool()
-                ds_h_mask = torch.clamp(bld_height_mask + veg_height_mask, 0.0, 1.0)
-                ds_terms = []
-                for ds in aux_outputs["ds_outputs"]:
-                    pl = ds[:, :3, :, :]
-                    bce = torch.sum(
-                        F.binary_cross_entropy_with_logits(pl, presence_target, reduction="none")
-                        * global_mask
-                    ) / (torch.sum(global_mask) * 3 + 1e-6)
-                    prob = torch.sigmoid(pl)
-                    tv = (self.tversky_building(prob[:, 0], presence_target[:, 0], valid_mask=gmb)
-                          + self.tversky(prob[:, 1], presence_target[:, 1], valid_mask=gmb)
-                          + self.tversky_water(prob[:, 2], presence_target[:, 2], valid_mask=gmb)) / 3.0
-                    term = bce + tv
-                    if self.unetpp_ds_height_weight > 0:
-                        term = term + self.unetpp_ds_height_weight * masked_height(
-                            ds[:, 3:4, :, :], target_height, ds_h_mask)
-                    ds_terms.append(term)
-                deep_sup_loss = sum(ds_terms) / len(ds_terms)
-                total_loss = total_loss + self.unetpp_ds_weight * deep_sup_loss
-
+        # --- per-class height-bin cross-entropy (height) ---
         height_bin_ce_loss = zero
-        if (aux_outputs is not None
-                and self.height_bin_aux_weight > 0
-                and "height_log_bin_centers" in aux_outputs):
-            log_centers = aux_outputs["height_log_bin_centers"]
-            target_height = targets[:, 3:4, :, :]
-            bld_height_mask = (targets[:, 0:1, :, :] > 0).float() * height_mask
-            veg_height_mask = (targets[:, 1:2, :, :] > 0).float() * height_mask
-            ce_base = self._height_bin_ce(
-                aux_outputs.get("height_base_logits"),
-                target_height, height_mask, log_centers,
-            )
-            ce_bld = self._height_bin_ce(
-                aux_outputs.get("height_building_logits"),
-                target_height, bld_height_mask, log_centers,
-            )
-            ce_veg = self._height_bin_ce(
-                aux_outputs.get("height_vegetation_logits"),
-                target_height, veg_height_mask, log_centers,
-            )
+        if (aux is not None and self.height_bin_aux_weight > 0
+                and "height_log_bin_centers" in aux):
+            centers = aux["height_log_bin_centers"]
+            th = targets[:, 3:4, :, :]
+            bld_hmask = (targets[:, 0:1, :, :] > 0).float() * height_mask
+            veg_hmask = (targets[:, 1:2, :, :] > 0).float() * height_mask
+            sig = self.height_bin_sigma_bins
+            ce_base = height_bin_ce(aux.get("height_base_logits"), th, height_mask, centers, sigma_bins=sig)
+            ce_bld = height_bin_ce(aux.get("height_building_logits"), th, bld_hmask, centers, sigma_bins=sig)
+            ce_veg = height_bin_ce(aux.get("height_vegetation_logits"), th, veg_hmask, centers, sigma_bins=sig)
             height_bin_ce_loss = ce_base + ce_bld + self.aux_veg_weight * ce_veg
             total_loss = total_loss + self.height_bin_aux_weight * height_bin_ce_loss
 
-        building_boundary_loss = zero
-        if (aux_outputs is not None
-                and self.building_boundary_weight > 0
-                and "building_boundary_logits" in aux_outputs):
-            building_boundary_loss = self._building_boundary_loss(
-                aux_outputs["building_boundary_logits"],
-                targets[:, :3, :, :],   # land-cover fractions -> argmax building mask
-                global_mask,
-            )
-            total_loss = total_loss + self.building_boundary_weight * building_boundary_loss
+        # --- building-boundary aux head (seg) ---
+        boundary_loss = zero
+        if (aux is not None and self.building_boundary_weight > 0
+                and "building_boundary_logits" in aux):
+            boundary_loss = building_boundary_loss(
+                aux["building_boundary_logits"], targets[:, :3, :, :], global_mask)
+            total_loss = total_loss + self.building_boundary_weight * boundary_loss
 
-        cl_dice_loss = zero
+        # --- clDice topology loss on building presence (seg) ---
+        cl_dice = zero
         if self.cl_dice_weight > 0:
-            bld_prob = class_pred[:, 0:1, :, :]
-            bld_gt = (targets[:, 0:1, :, :] > 0.1).to(bld_prob.dtype)
-            cl_dice_loss = self._cl_dice_loss(bld_prob, bld_gt, global_mask)
-            total_loss = total_loss + self.cl_dice_weight * cl_dice_loss
+            bld_gt = (targets[:, 0:1, :, :] > 0.1).to(class_pred.dtype)
+            cl_dice = cl_dice_loss(class_pred[:, 0:1, :, :], bld_gt, global_mask, self.cl_dice_iters)
+            total_loss = total_loss + self.cl_dice_weight * cl_dice
 
-        aux_height_loss = (aux_height_building_loss
-                           + self.aux_veg_weight * aux_height_vegetation_loss)
-        w_pres = self.aux_weight
-        w_ptv = self.presence_tversky_weight
-        w_axh = self.aux_weight
-        w_bince = self.height_bin_aux_weight
-        w_wetopk = self.weight_water_empty_topk
-        w_bbnd = self.building_boundary_weight
-
+        aux_height_loss = aux_height_building_loss + self.aux_veg_weight * aux_height_vegetation_loss
         components = {
-            "mae": loss_mae,
             "fraction_mae": loss_fraction_mae,
-            "ssim": loss_ssim,
-            "grad": loss_grad,
-            "tversky": loss_tversky,
             "height_boost": loss_height_boost,
             "presence_bce": presence_loss,
             "presence_tversky": presence_tversky_loss,
-            "water_empty_topk": water_empty_topk_loss,
+            "water_empty_topk": water_topk_loss,
             "aux_height_building": aux_height_building_loss,
             "aux_height_vegetation": aux_height_vegetation_loss,
             "aux_height": aux_height_loss,
             "height_bin_ce": height_bin_ce_loss,
-            "building_boundary": building_boundary_loss,
-            "cl_dice": cl_dice_loss,
-            "weighted_cl_dice": self.cl_dice_weight * cl_dice_loss,
+            "building_boundary": boundary_loss,
+            "cl_dice": cl_dice,
+            "weighted_cl_dice": self.cl_dice_weight * cl_dice,
             "weighted_mae": weighted_mae,
-            "weighted_ssim": weighted_ssim,
-            "weighted_grad": weighted_grad,
-            "weighted_tversky": weighted_tversky,
             "weighted_height_boost": weighted_height_boost,
-            "weighted_presence_bce": w_pres * presence_loss,
-            "weighted_presence_tversky": w_ptv * presence_tversky_loss,
-            "weighted_water_empty_topk": w_wetopk * water_empty_topk_loss,
-            "weighted_aux_height": w_axh * aux_height_loss,
-            "weighted_height_bin_ce": w_bince * height_bin_ce_loss,
-            "weighted_building_boundary": w_bbnd * building_boundary_loss,
+            "weighted_presence_bce": self.aux_weight * presence_loss,
+            "weighted_presence_tversky": self.presence_tversky_weight * presence_tversky_loss,
+            "weighted_water_empty_topk": self.weight_water_empty_topk * water_topk_loss,
+            "weighted_aux_height": self.aux_weight * aux_height_loss,
+            "weighted_height_bin_ce": self.height_bin_aux_weight * height_bin_ce_loss,
+            "weighted_building_boundary": self.building_boundary_weight * boundary_loss,
         }
         return total_loss, components

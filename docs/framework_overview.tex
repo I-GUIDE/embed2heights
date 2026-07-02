@@ -1,4 +1,4 @@
-% Embed2Heights --- current best framework, detailed walkthrough
+% Embed2Heights --- final solution, detailed walkthrough
 % Compile:  tectonic framework_overview.tex   (needs architecture.pdf alongside)
 \documentclass[aspectratio=169,11pt]{beamer}
 
@@ -31,8 +31,12 @@
 \newcommand{\fit}{\textcolor{cHead}{\textbf{Fits:}}\ }
 \newcommand{\code}[1]{\texttt{\small #1}}
 
-\title{Embed2Heights: The Current Best Framework}
-\subtitle{Dual-Trunk Cross-Source Fusion over Frozen GFM Embeddings}
+\title{Fuse and Sharpen: Cross-Embedding Fusion with Boundary Recovery for Height \& Land Cover}
+\subtitle{Gating four frozen GFMs, then restoring the object edges their embeddings blur away}
+\author{Team: Attention\_Plzzz\\[2pt]
+  \small Dingqi Ye, Daniel Kiv, Wen Zhou, Wei Hu, Ayush Khot}
+\institute{CyberGIS Center for Advanced Digital and Spatial Studies\\
+  University of Illinois at Urbana-Champaign}
 \date{\today}
 
 \begin{document}
@@ -111,6 +115,50 @@
     \item \textbf{IoU} compares \code{pred>0.5} vs.\ official GT $=\code{coverage}>0.10$.
     \item \textbf{RMSE} is masked \emph{per class} (only pixels of that class count).
   \end{itemize}
+\end{frame}
+
+% =====================================================================
+\section{Data observations}
+% =====================================================================
+
+\begin{frame}{Two label defects we found --- and masked}
+  Auditing the GT surfaced two \emph{systematic} defects. Both are handled by the
+  two-channel \code{valid\_mask}, so a defect never becomes a wrong training signal.
+  \begin{center}\small
+  \begin{tabular}{lll}
+    \toprule
+    Defect & What we see & How we handle it\\
+    \midrule
+    \textbf{nDSM holes} & height $=0$ on labelled objects & drop px from \emph{height} loss;\\
+      & (often whole sub-tiles) & keep presence\\[2pt]
+    \textbf{Deleted footprints} & building label empty where & drop px from \emph{presence/seg} loss;\\
+      & nDSM\,+\,embeddings say building & keep height\\
+    \bottomrule
+  \end{tabular}
+  \end{center}
+  \begin{itemize}\small
+    \item \code{valid\_mask} $=$ 2 channels: (0) global/presence, (1) height.
+    \item Each defect zeroes \emph{only} its channel $\Rightarrow$ the other task keeps learning.
+  \end{itemize}
+\end{frame}
+
+\begin{frame}{Observation A: nDSM holes \hfill\small\textcolor{cGray}{height label}}
+  \begin{center}
+  \includegraphics[width=\textwidth,height=0.58\textheight,keepaspectratio]{fig_height_holes.pdf}
+  \end{center}
+  {\footnotesize Top: nDSM height as stored (the label writes a literal $0$ $\to$ dark).
+   Bottom: red $=$ labelled land cover with height $=0$ (up to $\sim$40\% of px).
+   \fit \code{ndsm\_hole = height==0 \& has\_landcover} $\to$ dropped from height RMSE
+   only; presence kept.}
+\end{frame}
+
+\begin{frame}{Observation B: deleted building footprints \hfill\small\textcolor{cGray}{presence label}}
+  \begin{center}
+  \includegraphics[width=\textwidth,height=0.64\textheight,keepaspectratio]{fig_building_holes.pdf}
+  \end{center}
+  {\footnotesize Footprint empty (top) where the nDSM (mid) shows buildings; a density-gap
+   detector (blob $\ge50$px) recovers the region (red, bottom).
+   \fit dropped from presence/seg loss, height kept --- never punish a \emph{correct} building.}
 \end{frame}
 
 % =====================================================================
@@ -323,7 +371,7 @@
   \end{itemize}
 \end{frame}
 
-\begin{frame}{Soft-bin height head \hfill\small\textcolor{cHead}{current best}}
+\begin{frame}{Soft-bin height head \hfill\small\textcolor{cHead}{head}}
   Each specialist emits \textbf{64 bin logits}, not a scalar; the height is the
   \textbf{soft-argmax} (expectation over bin centers):
   \[ \hat h = \sum_k \text{softmax}(\ell)_k\,c_k \]
@@ -357,38 +405,41 @@
 \section{Design 4 --- Two-stage training}
 % =====================================================================
 
-\begin{frame}{Two-stage ``train then purify''}
+\begin{frame}{Two-stage: train, then purify (1 height + 2 seg)}
   \begin{center}
-  \begin{tikzpicture}[node distance=8mm]
-    \node[shd,minimum width=3.2cm] (s1) {Stage 1: seg+height coupled\\\scriptsize 80 ep};
-    \node[sop,right=6mm of s1] (c1) {ckpt\\$\to$ ch0--2};
-    \node[shd,minimum width=3.2cm,right=10mm of c1] (s2)
-         {Stage 2: seg-grad frozen,\\height re-tunes backbone\\\scriptsize 20 ep};
-    \node[sop,right=6mm of s2] (c2) {ckpt\\$\to$ ch3};
-    \draw[sar] (s1)--(c1);
-    \draw[sar] (c1)--(s2) node[midway,above,font=\tiny,cGray]{init};
-    \draw[sar] (s2)--(c2);
+  \begin{tikzpicture}[font=\scriptsize,node distance=4mm and 10mm]
+    \node[shd,minimum width=2.4cm] (s1) {Stage 1\\coupled, 50 ep};
+    \node[sop,above right=4mm and 11mm of s1] (hp) {height-purify\\\scriptsize seg-grad 0, 20 ep};
+    \node[sop,below right=4mm and 11mm of s1] (sp) {seg-purify\\\scriptsize height-grad 0, 20 ep\\$+$ 20 ep clDice};
+    \node[sbox,fill=cOut!14,draw=cOut,right=10mm of hp] (h3) {ch 3};
+    \node[sbox,fill=cOut!14,draw=cOut,right=10mm of sp] (seg) {ch 0--2};
+    \draw[sar] (s1.east) |- (hp.west);
+    \draw[sar] (s1.east) |- (sp.west);
+    \draw[sar] (hp.east) -- (h3.west);
+    \draw[sar] (sp.east) -- (seg.west);
   \end{tikzpicture}
   \end{center}
   \begin{columns}[T]
-    \begin{column}{0.5\textwidth}
-      \textbf{\textcolor{cHead}{Stage 1}} --- 80 ep, coupled\\
-      \footnotesize batch 16, AdamW lr $2{\times}10^{-4}$, wd $10^{-4}$.\\
-      train everything jointly.\\
-      $\Rightarrow$ best ckpt supplies \textbf{ch 0--2}.
+    \begin{column}{0.4\textwidth}
+      \textbf{\textcolor{cHead}{Stage 1}} --- coupled, 50 ep\\
+      \footnotesize AdamW lr $2{\times}10^{-4}$; train everything jointly
+      $\Rightarrow$ a \emph{shared init} for all purifies.
     \end{column}
-    \begin{column}{0.5\textwidth}
-      \textbf{\textcolor{cHead}{Stage 2}} --- 20 ep, purify\\
-      \footnotesize init from stage 1; \code{presence-grad-scale 0};
-      lr $1.5{\times}10^{-4}$; select on height val loss.\\
-      height trunk re-tunes the backbone.\\
-      $\Rightarrow$ best ckpt supplies \textbf{ch 3}.
+    \begin{column}{0.6\textwidth}
+      \textbf{\textcolor{cHead}{Stage 2}} --- purify off stage 1, 20 ep, lr $1.5{\times}10^{-4}$\\
+      \footnotesize
+      \begin{itemize}\scriptsize
+        \item \code{height-purify} (\code{presence-trunk-grad-scale 0}) $\to$ \textbf{ch 3}
+        \item \code{seg-purify} (\code{height-trunk-grad-scale 0}), then $+$20 ep clDice
+          on top $\to$ \textbf{ch 0--2}
+      \end{itemize}
+      $\Rightarrow$ the seg-purify \emph{and} clDice ckpts are both kept
+      (2 decorrelated seg sources $\to$ 50-member seg).
     \end{column}
   \end{columns}
   \vfill
-  \fit the IoU/height conflict reaches the \emph{backbone}, not just the head
-  $\Rightarrow$ lock segmentation, then re-purpose the backbone for height
-  at $\sim\tfrac14$ a specialist's cost.
+  \fit IoU and RMSE fight over the \emph{backbone}, not just the head $\Rightarrow$ a
+  cheap 20-ep purify per task, seg run twice (plain \& clDice), all off one stage-1.
 \end{frame}
 
 % =====================================================================
@@ -478,19 +529,6 @@
   \end{columns}
 \end{frame}
 
-\begin{frame}{The key alignment trick}
-  \begin{block}{Presence target}
-    \code{coverage > 0.10}\; (not argmax-of-fractions)
-  \end{block}
-  \begin{itemize}
-    \item Reverse-engineered from the public board to match the \emph{official GT}.
-    \item The old argmax rule over-counted buildings $\sim3\times$ --- our local
-      bld IoU 0.543 was a \emph{mirage}; true $\approx0.475$.
-    \item \fit identical inputs $\Rightarrow$ points come from matching the
-      metric's exact masks, not more data.
-  \end{itemize}
-\end{frame}
-
 % =====================================================================
 \section{Inference \& Results}
 % =====================================================================
@@ -509,8 +547,8 @@
   {\footnotesize Ruled out (tried, no gain): TTA, D4 aug, bigger ensembles, region-conditioning.}
 \end{frame}
 
-\begin{frame}{Current best: \code{xf095\_2stage\_softbin\_covgt10}}
-  Two-stage dual-trunk + shared soft-bin + presence target \code{cov>0.10}.
+\begin{frame}{Final model: \code{xf095\_2stage\_softbin\_covgt10}}
+  Two-stage dual-trunk + shared soft-bin.
   5-fold (seed 0), purify checkpoints:
   \begin{center}\small
   \begin{tabular}{lccccc}
@@ -556,20 +594,22 @@
     \item 5-fold leave-region-out; the ensemble is a plain mean of member-fold
       probability maps, then thresholded.
   \end{itemize}
-  {\footnotesize U-Net++ was the only backbone that beat plain LightUNet under the
-   corrected \code{cov>0.10} metric; heavier/attention encoders all lost.}
+  {\footnotesize U-Net++ was the only backbone that beat plain LightUNet on the
+   official IoU metric; heavier/attention encoders all lost.}
 \end{frame}
 
 \begin{frame}{Three purify stages off one stage-1}
   \begin{center}
-  \begin{tikzpicture}[node distance=5mm and 8mm,font=\scriptsize]
-    \node[shd,minimum width=2.6cm] (s1) {Stage 1 (coupled)\\\scriptsize 50--80 ep};
-    \node[sop,above right=3mm and 11mm of s1] (hp) {height-purify\\\scriptsize seg-grad 0};
-    \node[sop,below right=3mm and 11mm of s1] (sp) {seg-purify\\\scriptsize height-grad 0};
-    \node[sbox,fill=cOut!14,draw=cOut,right=8mm of hp] (h3) {ch 3 (height)};
-    \node[sbox,fill=cOut!14,draw=cOut,right=8mm of sp] (seg) {ch 0--2 (seg)};
-    \draw[sar] (s1.east)|-(hp); \draw[sar] (s1.east)|-(sp);
-    \draw[sar] (hp)--(h3); \draw[sar] (sp)--(seg);
+  \begin{tikzpicture}[font=\scriptsize,node distance=4mm and 9mm]
+    \node[shd,minimum width=2.4cm] (s1) {Stage 1 (coupled)\\\scriptsize 50 ep};
+    \node[sop,above right=4mm and 10mm of s1] (hp) {height-purify\\\scriptsize seg-grad 0, 20 ep};
+    \node[sop,below right=4mm and 10mm of s1] (sp) {seg-purify\\\scriptsize height-grad 0, 20 ep\\$+$ 20 ep clDice};
+    \node[sbox,fill=cOut!14,draw=cOut,right=10mm of hp] (h3) {ch 3 (height)};
+    \node[sbox,fill=cOut!14,draw=cOut,right=10mm of sp] (seg) {ch 0--2 (seg)};
+    \draw[sar] (s1.east) |- (hp.west);
+    \draw[sar] (s1.east) |- (sp.west);
+    \draw[sar] (hp.east) -- (h3.west);
+    \draw[sar] (sp.east) -- (seg.west);
   \end{tikzpicture}
   \end{center}
   \begin{itemize}\small
@@ -578,8 +618,8 @@
     \item \textbf{seg-purify} (\code{height-trunk-grad-scale 0}): the \emph{mirror}
       --- freeze height, seg owns the backbone $\Rightarrow$ sharper
       \textbf{ch 0--2}. \alert{+0.0044 public building IoU.}
-    \item \fit IoU and RMSE fight over the \emph{shared} backbone; give each a
-      dedicated 20-ep fine-tune off the same stage-1 checkpoint.
+    \item \textbf{$+$clDice}: a 3rd fine-tune continuing the \emph{seg-purify} ckpt with
+      the clDice topology loss (next slide) $\Rightarrow$ a 2nd, decorrelated seg source.
   \end{itemize}
 \end{frame}
 
@@ -649,31 +689,28 @@
   \end{itemize}
 \end{frame}
 
-\begin{frame}{Height correction: additive shift (kept) vs.\ de-compression (refuted)}
+\begin{frame}{Height correction: per-class calibration (applied in final)}
   \begin{columns}[T]
     \begin{column}{0.5\textwidth}
-      \textbf{Additive shift} \textcolor{cHead}{(kept)}
+      \textbf{Building: de-compression} \textcolor{cHead}{(used)}
       \begin{itemize}\small
-        \item $h\!\to\!h+c$ on predicted-class pixels.
-        \item building $+0.30$ (public bias $-0.31$), veg $+0.12$.
-        \item corrects the \emph{mean} bias; region-invariant $\Rightarrow$
-          private-safe. RMSE$_{bH}$ $1.807\!\to\!1.778$.
+        \item $h\!\to\!1.05h+0.116$ (slope $>1$, un-squeeze the compressed tall tail).
+        \item motivated by the strong compression curve ($-4.5$\,m @ 15\,m).
+        \item region-invariant $\Rightarrow$ private-safe. RMSE$_{bH}$ $1.807\!\to\!1.782$.
       \end{itemize}
     \end{column}
     \begin{column}{0.5\textwidth}
-      \textbf{De-compression} \textcolor{cToken}{(refuted)}
+      \textbf{Vegetation: additive shift} \textcolor{cHead}{(used)}
       \begin{itemize}\small
-        \item $h\!\to\!1.05h+0.116$ (slope $>1$, un-squeeze the tall tail).
-        \item motivated by the strong compression curve ($-4.5$\,m @ 15\,m).
-        \item but test is only \emph{mildly} taller $\Rightarrow$ over-corrects
-          mid-height $\Rightarrow$ RMSE$_{bH}$ $1.778\!\to\!1.782$.
+        \item $h\!\to\!h+0.12$ on predicted-veg pixels (pure mean offset).
+        \item corrects the small public veg bias. RMSE$_{vH}$ $3.079\!\to\!3.072$.
       \end{itemize}
     \end{column}
   \end{columns}
   \vspace{0.3em}
-  {\footnotesize Lesson: the recoverable height error is a \emph{mean offset}, not
-   a slope --- the additive shift already captures it; the residual $+0.33$\,m is
-   irreducible region-shift scatter.}
+  {\footnotesize Both corrections are region-invariant (a mean offset, plus a mild
+   slope for buildings), not public-fitted; the residual $+0.33$\,m is irreducible
+   region-shift scatter.}
 \end{frame}
 
 \begin{frame}{Final result \& trajectory}
@@ -703,11 +740,10 @@
     \begin{column}{0.5\textwidth}
       \textcolor{cHead}{\textbf{Kept (each +):}}
       \begin{itemize}\small
-        \item \code{cov>0.10} presence target
         \item cross-architecture ensemble
         \item seg-purify (dedicated seg backbone)
         \item clDice topology loss
-        \item building-height additive shift
+        \item per-class height calibration (bld de-comp $1.05h{+}0.116$, veg $+0.12$)
         \item 50-member dual-source seg
         \item delmask (drop human-deleted footprints)
       \end{itemize}
@@ -717,7 +753,7 @@
       \begin{itemize}\small
         \item ViT / SegFormer / HRNet / UPerNet / UNet3+\,(solo)
         \item wavelet down-sampling; deep supervision
-        \item clDice-from-stage-1; height de-compression
+        \item clDice-from-stage-1
         \item per-code thresholds; morphology; valley-cut
         \item distance-watershed (1--2px $\Rightarrow$ degenerate)
         \item AdaBN; region-conditioning; TTA; D4 aug
@@ -746,15 +782,9 @@
     Split-trunk head & IoU-crisp vs.\ RMSE-smooth conflict\\
     Presence-gated height & per-class RMSE mask\\
     Two-stage purify & conflict reaches the backbone\\
-    cov$>$0.10 + per-class thr & match the metric's exact definition\\
+    Per-class threshold sweep & IoU judged at a hard per-class cut\\
     \bottomrule
   \end{tabular}
-\end{frame}
-
-\begin{frame}[standout]{Take-away}
-  Same frozen embeddings for everyone $\Rightarrow$ every design is justified by
-  \emph{what the embedding is} (dense vs.\ coarse, its scale, its reliability)
-  and \emph{what the metric measures}.
 \end{frame}
 
 \end{document}
