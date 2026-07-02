@@ -1,6 +1,6 @@
 # Embed2Heights — Final Submission (reproducible)
 
-**Team: Attention_Plzzz** — Dingqi Ye, Daniel Kiv, Wen Zhou, Wei Hu, Ayush Khot
+**Team: Attention_Plzzz**: Dingqi Ye, Daniel Kiv, Wen Zhou, Wei Hu, Ayush Khot
 CyberGIS Center for Advanced Digital and Spatial Studies, University of Illinois at Urbana-Champaign
 
 Reproduction package for our final leaderboard submission.
