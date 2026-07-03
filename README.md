@@ -1,4 +1,4 @@
-# Embed2Heights :Final Submission (reproducible)
+# Embed2Heights: Final Submission
 
 > **Team: Attention_Plzzz**: Dingqi Ye, Daniel Kiv, Wen Zhou, Wei Hu, Ayush Khot
 
