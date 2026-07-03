@@ -1,19 +1,10 @@
 # Embed2Heights :Final Submission (reproducible)
 
 > **Team: Attention_Plzzz**: Dingqi Ye, Daniel Kiv, Wen Zhou, Wei Hu, Ayush Khot
->
-> CyberGIS Center for Advanced Digital and Spatial Studies
->
-> University of Illinois at Urbana-Champaign
 
 Reproduction package for our final leaderboard submission.
 
-**Public score 0.5067** — `IoU_build 0.5032 / IoU_veg 0.8211 / IoU_water 0.5270 / RMSE_H_build 1.782 m / RMSE_H_veg 3.072 m`.
-
-Per `256×256` tile we predict a `[building, vegetation, water, height(m)]` tensor from
-the frozen challenge embeddings. Everyone gets the *same* embeddings — no raw imagery,
-no external data — so the whole design is about matching the metric and squeezing
-robust signal. Full method write-up: **`docs/framework_overview.pdf`**.
+Full method write-up: **`docs/framework_overview.pdf`**.
 
 ---
 
