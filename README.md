@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🏔️ Embed2Heights: Final Submission
+# 🏔️ Embed2Heights: Reaching new heights with GeoFM
 
 ### Multi-Embedding Fusion for Presence Segmentation & Height Regression
 
@@ -11,15 +11,14 @@
 ![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-EE4C2C?logo=pytorch&logoColor=white)
 ![CUDA](https://img.shields.io/badge/CUDA-GPU-76B900?logo=nvidia&logoColor=white)
-
-
-<br/>
-
-*Reproduction package for our final leaderboard submission.*
-
-📄 **Full method write-up:** [`docs/framework_overview.pdf`](docs/framework_overview.pdf)
+[![Solution Deck](https://img.shields.io/badge/Solution_Deck-PDF-B31B1B?logo=latex&logoColor=white)](docs/framework_overview.pdf)
 
 </div>
+
+---
+
+> 📑 **Start with the [Solution Deck](docs/framework_overview.pdf)** — the full method in slides.
+> This README focuses on **reproducing** the submission.
 
 ---
 
@@ -196,25 +195,6 @@ Score any checkpoint on its held-out fold under the official GT (presence = cove
 python evaluate.py xfusion_095_unetpp_s0_f0_segpurify 0    # seg IoU  (per-class thr sweep)
 python evaluate.py xfusion_095_unetpp_s0_f0_purify    0    # height RMSE
 ```
-
----
-
-## 🖥️ Cluster Notes (SLURM)
-
-Each `(member, fold)` is a self-contained job. Example array (25 tasks):
-
-```bash
-# in a submit script:  M=$((SLURM_ARRAY_TASK_ID/5)); F=$((SLURM_ARRAY_TASK_ID%5))
-#   scripts/train_member_fold.sh $M $F \
-#     && scripts/predict_val_member_fold.sh $M $F \
-#     && scripts/predict_test_member_fold.sh $M $F
-sbatch --array=0-24 <your_wrapper>.sbatch
-# then once, after the array finishes:  python assemble_final.py
-```
-
-> ⚠️ Cap array concurrency (e.g. `--array=0-24%2`) — running many data-heavy jobs at once
-> contends on the shared filesystem and starves the GPU. Staging embeddings to node-local
-> disk helps.
 
 ---
 
