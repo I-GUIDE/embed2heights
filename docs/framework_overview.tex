@@ -311,14 +311,15 @@
     \draw[sar,cHead] (f)--(sp);
     \draw[sar,cHead] (sp)|-(s); \draw[sar,cHead] (sp)|-(h);
     \draw[sar,cHead] (s)--(p);  \draw[sar,cHead] (h)--(hh);
-    \node[font=\tiny,cToken] at (sp) {\,$\times$\,};
-    \node[font=\tiny,cToken,below=0pt of sp] {grad-cut};
   \end{tikzpicture}
   \end{center}
   \begin{itemize}
     \item Two trunks off $F_{\text{out}}$, sharing \emph{no} head weights.
     \item \fit IoU wants crisp masks, RMSE wants smooth regression --- a shared
       trunk makes their gradients fight; splitting lets each shape its features.
+    \item Forward is always the full split; what \emph{changes} is how much each
+      trunk's gradient reaches the shared backbone --- a per-stage knob (coupled in
+      stage-1, one side cut to 0 in the stage-2 purify).
     \item Presence head \emph{is} the metric (BCE on coverage @ 0.5), not a
       reparam of fractions.
   \end{itemize}
@@ -338,9 +339,11 @@
     \begin{column}{0.5\textwidth}
       \textbf{Soft gradient decouple}
       \begin{itemize}\small
-        \item forward identity:\\ $s\,t+(1{-}s)\,t.\text{detach}()$.
-        \item $s\,{=}\,1$ coupled, $s\,{=}\,0$ hard cut.
-        \item this is the knob the two-stage recipe flips.
+        \item forward identity:\\ $s\,t+(1{-}s)\,t.\text{detach}()$ --- output
+          unchanged; only the backward gradient is scaled.
+        \item $s\,{=}\,1$ coupled (stage-1); $s\,{=}\,0$ hard cut (stage-2 purify).
+        \item so the ``grad-cut'' is a \emph{stage-2} action, not always on --- it
+          is the knob the two-stage recipe flips.
       \end{itemize}
     \end{column}
   \end{columns}
@@ -444,6 +447,57 @@
   \vspace{0.2em}
   {\footnotesize \fit $\sim$50 ep already reproduces the 80-ep result within noise
    (Stage 1 keeps its \emph{best-val} checkpoint).}
+\end{frame}
+
+\begin{frame}{Stage-2 purify $=$ a one-sided grad-cut \hfill\small\textcolor{cHead}{two-stage}}
+  \begin{columns}[T]
+    \begin{column}{0.5\textwidth}
+      \centering
+      \textbf{\textcolor{cHead}{height-purify}}\\
+      {\footnotesize\code{presence-trunk-grad-scale 0}}\\[4pt]
+      \begin{tikzpicture}[node distance=2.5mm and 8mm,font=\scriptsize]
+        \node[sop] (f) {$F_{\text{out}}$};
+        \node[shd,above right=2mm and 9mm of f] (s) {Seg trunk};
+        \node[shd,below right=2mm and 9mm of f] (h) {Height trunk};
+        \node[sbox,fill=cOut!14,draw=cOut,right=7mm of s] (p) {ch 0--2};
+        \node[sbox,fill=cOut!14,draw=cOut,right=7mm of h] (hh) {ch 3};
+        \coordinate (sp) at ($(f.east)+(3mm,0)$);
+        \draw[sar,cHead] (f)--(sp);
+        \draw[sar,cGray,dashed] (sp)|-(s);
+        \draw[sar,cHead] (sp)|-(h);
+        \draw[sar,cGray,dashed] (s)--(p);
+        \draw[sar,cHead] (h)--(hh);
+        \node[cToken,font=\normalsize\bfseries,fill=white,inner sep=0.4pt]
+          at ([xshift=-2mm]s.west) {$\times$};
+      \end{tikzpicture}\\[3pt]
+      {\footnotesize seg gradient cut $\Rightarrow$ height re-tunes the backbone.}
+    \end{column}
+    \begin{column}{0.5\textwidth}
+      \centering
+      \textbf{\textcolor{cHead}{seg-purify}} (mirror)\\
+      {\footnotesize\code{height-trunk-grad-scale 0}}\\[4pt]
+      \begin{tikzpicture}[node distance=2.5mm and 8mm,font=\scriptsize]
+        \node[sop] (f) {$F_{\text{out}}$};
+        \node[shd,above right=2mm and 9mm of f] (s) {Seg trunk};
+        \node[shd,below right=2mm and 9mm of f] (h) {Height trunk};
+        \node[sbox,fill=cOut!14,draw=cOut,right=7mm of s] (p) {ch 0--2};
+        \node[sbox,fill=cOut!14,draw=cOut,right=7mm of h] (hh) {ch 3};
+        \coordinate (sp) at ($(f.east)+(3mm,0)$);
+        \draw[sar,cHead] (f)--(sp);
+        \draw[sar,cHead] (sp)|-(s);
+        \draw[sar,cGray,dashed] (sp)|-(h);
+        \draw[sar,cHead] (s)--(p);
+        \draw[sar,cGray,dashed] (h)--(hh);
+        \node[cToken,font=\normalsize\bfseries,fill=white,inner sep=0.4pt]
+          at ([xshift=-2mm]h.west) {$\times$};
+      \end{tikzpicture}\\[3pt]
+      {\footnotesize height gradient cut $\Rightarrow$ seg owns the backbone.}
+    \end{column}
+  \end{columns}
+  \vspace{0.5em}
+  {\footnotesize \fit forward is unchanged (identity) --- the \textcolor{cToken}{$\times$}
+   blocks only that trunk's \emph{gradient} into the shared backbone, so each purify hands
+   the backbone to one task. (\code{grad-scale} $1{=}$coupled, $0{=}$cut.)}
 \end{frame}
 
 % =====================================================================
