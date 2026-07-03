@@ -35,8 +35,8 @@
   % ---------- PIXEL BAND (top) ----------
   \node[pix] (ae)   at (0,3.0)  {\textbf{AlphaEarth}\\\footnotesize $64{\times}256^2$};
   \node[pix] (tes)  at (0,1.5)  {\textbf{Tessera}\\\footnotesize $128{\times}256^2$};
-  \node[pix] (aenc) at (3.6,3.0){LightUNet$_\alpha$};
-  \node[pix] (tenc) at (3.6,1.5){calib $\to$ LightUNet$_t$};
+  \node[pix] (aenc) at (3.6,3.0){UNet++$_\alpha$};
+  \node[pix] (tenc) at (3.6,1.5){calib $\to$ UNet++$_t$};
   \node[pix,minimum height=1.9cm] (gate) at (7.4,2.25)
         {\textbf{Spatial gate}\\\footnotesize $g F_\alpha{+}(1{-}g)F_t$};
   \node[fp,minimum height=1.9cm] (fp) at (11.9,2.25)

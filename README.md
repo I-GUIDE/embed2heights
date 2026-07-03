@@ -24,7 +24,8 @@ robust signal. Full method write-up: **`docs/framework_overview.pdf`**.
 Three blocks (vector version in `docs/architecture.pdf`):
 
 1. **Dense pixel backbone** — AlphaEarth (`64×256²`) and Tessera (`128×256²`) each go
-   through a LightUNet; a learned **spatial gate** fuses them into `F_pixel`.
+   through a **U-Net++** (the primary backbone; the ensemble also swaps in UNet 3+ /
+   TransUNet variants); a learned **spatial gate** fuses them into `F_pixel`.
 2. **Coarse token conditioning** — the 4 token sources (TerraMind / Thor, S1/S2, each
    `768×16²`) cross-attend, then modulate `F_pixel` via zero-init FiLM + additive + gate → `F_out`.
 3. **Split-trunk multi-task head** — separate seg / height trunks feed the presence
