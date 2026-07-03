@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Train ONE ensemble member on ONE fold, through all 4 stages.
-#   stage 1       : coupled seg+height (50 ep)                       -> <exp>/model_best.pth
+#   stage 1       : coupled seg+height (80 ep)                       -> <exp>/model_best.pth
 #   height-purify : freeze seg side, height owns backbone (20 ep)    -> <exp>_purify     (ch 3)
 #   seg-purify    : freeze height side, seg owns backbone (20 ep)    -> <exp>_segpurify  (ch 0-2)
 #   cldice-purify : seg-purify + clDice topology loss (20 ep)        -> <exp>_cldice     (ch 0-2)
@@ -45,7 +45,7 @@ train_stage () {
 }
 
 echo "[train] member $MEMBER ($CFG seed $SEED) fold $FOLD"
-train_stage "$EXP"            --epochs 50
+train_stage "$EXP"            --epochs 80
 train_stage "${EXP}_purify"    --init-checkpoint "runs/${EXP}/model_best.pth" \
   --presence-trunk-grad-scale 0.0 --epochs 20 --lr 0.00015
 train_stage "${EXP}_segpurify" --init-checkpoint "runs/${EXP}/model_best.pth" \

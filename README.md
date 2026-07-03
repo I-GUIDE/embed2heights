@@ -40,11 +40,16 @@ An ensemble of **5 model variants × 5 leave-region-out folds**, each trained th
 Per member-fold, four checkpoints are produced off one stage-1 model:
 
 ```
-stage 1        coupled seg+height, 50 ep                                 -> <exp>
+stage 1        coupled seg+height, 80 ep                                 -> <exp>
   ├─ height-purify  20 ep, freeze seg    (presence-trunk-grad-scale 0)   -> <exp>_purify              (ch 3)
   └─ seg-purify     20 ep, freeze height (height-trunk-grad-scale 0)
                     + 20 ep clDice on top                                -> <exp>_segpurify, _cldice  (ch 0-2)
 ```
+
+> **Note:** stage 1 runs 80 ep to match the final submission, but it keeps its
+> *best-val* checkpoint and converges by ~50 ep — running `--epochs 50` reproduces the
+> result within noise at half the stage-1 cost (verified: 5-fold seed-0 at 50 ep matched
+> the 80-ep submission to ΔScore −0.0006).
 
 Final channels (`assemble_final.py`):
 - **seg (ch 0-2)** = mean of **50** test predictions (25 `_cldice` + 25 `_segpurify`),

@@ -181,15 +181,15 @@
 \section{Design 1 --- Dense pixel backbone}
 % =====================================================================
 
-\begin{frame}{Dual LightUNet + learned gate \hfill\small\textcolor{cAlpha}{dense path}}
+\begin{frame}{Dual U-Net++ + learned gate \hfill\small\textcolor{cAlpha}{dense path}}
   \begin{center}
   \begin{tikzpicture}[node distance=4mm and 7mm]
     \node[spix] (ae) {AlphaEarth};
     \node[spix,below=of ae] (te) {Tessera};
-    \node[spix,right=of ae] (au) {UNet$_\alpha$};
-    \node[spix,right=of te] (tu) {calib+UNet$_t$};
+    \node[spix,right=of ae] (au) {UNet++$_\alpha$};
+    \node[spix,right=of te] (tu) {calib+UNet++$_t$};
     \node[sbox,fill=cAlpha!22,draw=cAlpha,minimum height=1.25cm,
-          right=10mm of $(au)!0.5!(tu)$] (g) {gate $\sigma$};
+          right=18mm of $(au)!0.5!(tu)$] (g) {gate $\sigma$};
     \node[sop,right=7mm of g] (f) {$F_{\text{pixel}}$};
     \draw[sar] (ae)--(au); \draw[sar] (te)--(tu);
     \draw[sar] (au.east) -- (au.east -| g.west);
@@ -199,7 +199,7 @@
   \end{tikzpicture}
   \end{center}
   \begin{itemize}
-    \item \fit both are dense $256^2$ $\to$ a UNet yields sharp, IoU-friendly masks.
+    \item \fit both are dense $256^2$ $\to$ a U-Net++ yields sharp, IoU-friendly masks.
     \item \fit they differ in reliability $\to$ the gate trusts each per pixel;
       bias init $+4$ $\Rightarrow$ starts AlphaEarth-dominant.
   \end{itemize}
@@ -209,10 +209,10 @@
 \begin{frame}{Backbone internals}
   \begin{columns}[T]
     \begin{column}{0.54\textwidth}
-      \textbf{LightUNet} (\code{base\_ch=48})
+      \textbf{U-Net++} (\code{base\_ch=48}, LightUNet base)
       \begin{itemize}\small
         \item 4 levels: $48\to96\to192\to384$.
-        \item 3$\times$ MaxPool down ($256\to32$), bilinear up + skips.
+        \item 3$\times$ MaxPool down ($256\to32$), bilinear up + \emph{nested} dense skips.
         \item DoubleConv blocks, BatchNorm.
         \item \code{forward\_features} $\to$ 48-ch map at full res.
       \end{itemize}
@@ -406,24 +406,30 @@
 % =====================================================================
 
 \begin{frame}{Two-stage: train, then purify (1 height + 2 seg)}
+  \vspace{-0.3em}
   \begin{center}
   \begin{tikzpicture}[font=\scriptsize,node distance=4mm and 10mm]
-    \node[shd,minimum width=2.4cm] (s1) {Stage 1\\coupled, 50 ep};
-    \node[sop,above right=4mm and 11mm of s1] (hp) {height-purify\\\scriptsize seg-grad 0, 20 ep};
-    \node[sop,below right=4mm and 11mm of s1] (sp) {seg-purify\\\scriptsize height-grad 0, 20 ep\\$+$ 20 ep clDice};
+    \node[shd,minimum width=2.4cm] (s1) {Stage 1\\coupled, 80 ep};
+    \node[sop,above right=3mm and 13mm of s1] (hp) {height-purify\\\scriptsize seg-grad 0, 20 ep};
+    \node[sop,below right=3mm and 13mm of s1] (sp) {seg-purify\\\scriptsize height-grad 0, 20 ep\\$+$ 20 ep clDice};
     \node[sbox,fill=cOut!14,draw=cOut,right=10mm of hp] (h3) {ch 3};
     \node[sbox,fill=cOut!14,draw=cOut,right=10mm of sp] (seg) {ch 0--2};
-    \draw[sar] (s1.east) |- (hp.west);
-    \draw[sar] (s1.east) |- (sp.west);
+    \coordinate (br) at ($(s1.east)+(6mm,0)$);
+    \draw[semithick,cGray] (s1.east) -- (br);   % stub from the box, then branch
+    \draw[sar] (br) |- (hp.west);
+    \draw[sar] (br) |- (sp.west);
     \draw[sar] (hp.east) -- (h3.west);
     \draw[sar] (sp.east) -- (seg.west);
   \end{tikzpicture}
   \end{center}
+  \vspace{-0.9em}
   \begin{columns}[T]
     \begin{column}{0.4\textwidth}
-      \textbf{\textcolor{cHead}{Stage 1}} --- coupled, 50 ep\\
+      \textbf{\textcolor{cHead}{Stage 1}} --- coupled, 80 ep\\
       \footnotesize AdamW lr $2{\times}10^{-4}$; train everything jointly
-      $\Rightarrow$ a \emph{shared init} for all purifies.
+      $\Rightarrow$ a \emph{shared init}.\\[3pt]
+      Seg (crisp, IoU) and height (smooth, RMSE) fight over the shared backbone, so
+      each purify freezes one task's gradient and lets the other own it (a \emph{mirror}).
     \end{column}
     \begin{column}{0.6\textwidth}
       \textbf{\textcolor{cHead}{Stage 2}} --- purify off stage 1, 20 ep, lr $1.5{\times}10^{-4}$\\
@@ -433,13 +439,11 @@
         \item \code{seg-purify} (\code{height-trunk-grad-scale 0}), then $+$20 ep clDice
           on top $\to$ \textbf{ch 0--2}
       \end{itemize}
-      $\Rightarrow$ the seg-purify \emph{and} clDice ckpts are both kept
-      (2 decorrelated seg sources $\to$ 50-member seg).
     \end{column}
   \end{columns}
-  \vfill
-  \fit IoU and RMSE fight over the \emph{backbone}, not just the head $\Rightarrow$ a
-  cheap 20-ep purify per task, seg run twice (plain \& clDice), all off one stage-1.
+  \vspace{0.2em}
+  {\footnotesize \fit $\sim$50 ep already reproduces the 80-ep result within noise
+   (Stage 1 keeps its \emph{best-val} checkpoint).}
 \end{frame}
 
 % =====================================================================
@@ -529,6 +533,35 @@
   \end{columns}
 \end{frame}
 
+\begin{frame}{clDice --- a topology loss for merged buildings}
+  \begin{columns}[T]
+    \begin{column}{0.52\textwidth}
+      \textbf{The failure it targets}
+      \begin{itemize}\small
+        \item Buildings are 1--2\,px wide; the model \emph{merges} adjacent ones
+          (predicts 67 components/tile vs.\ GT's 104).
+        \item \textbf{51\% of building FP} is inter-building ``bridges'';
+          oracle un-merge $\to$ IoU $0.504\!\to\!0.587$.
+      \end{itemize}
+    \end{column}
+    \begin{column}{0.48\textwidth}
+      \textbf{clDice} (\code{cl-dice-weight})
+      \begin{itemize}\small
+        \item \code{soft\_skeleton}: a differentiable skeleton via iterated
+          min/max-pool (no parameters), then centerline Dice on the building
+          presence map.
+        \item rewards \emph{connectivity}, penalises merges --- orthogonal to the
+          area (Tversky) losses.
+        \item applied only as a late 20-ep purify (not in stage-1).
+      \end{itemize}
+    \end{column}
+  \end{columns}
+  \vspace{0.3em}
+  {\footnotesize \textcolor{cToken}{Not in stage-1:} baking clDice into stage-1 pulled
+   the backbone toward topology and \emph{degraded height} (RMSE$_{bH}$ +0.006); the
+   late-purify placement keeps height untouched.}
+\end{frame}
+
 % =====================================================================
 \section{Inference \& Results}
 % =====================================================================
@@ -596,60 +629,6 @@
   \end{itemize}
   {\footnotesize U-Net++ was the only backbone that beat plain LightUNet on the
    official IoU metric; heavier/attention encoders all lost.}
-\end{frame}
-
-\begin{frame}{Three purify stages off one stage-1}
-  \begin{center}
-  \begin{tikzpicture}[font=\scriptsize,node distance=4mm and 9mm]
-    \node[shd,minimum width=2.4cm] (s1) {Stage 1 (coupled)\\\scriptsize 50 ep};
-    \node[sop,above right=4mm and 10mm of s1] (hp) {height-purify\\\scriptsize seg-grad 0, 20 ep};
-    \node[sop,below right=4mm and 10mm of s1] (sp) {seg-purify\\\scriptsize height-grad 0, 20 ep\\$+$ 20 ep clDice};
-    \node[sbox,fill=cOut!14,draw=cOut,right=10mm of hp] (h3) {ch 3 (height)};
-    \node[sbox,fill=cOut!14,draw=cOut,right=10mm of sp] (seg) {ch 0--2 (seg)};
-    \draw[sar] (s1.east) |- (hp.west);
-    \draw[sar] (s1.east) |- (sp.west);
-    \draw[sar] (hp.east) -- (h3.west);
-    \draw[sar] (sp.east) -- (seg.west);
-  \end{tikzpicture}
-  \end{center}
-  \begin{itemize}\small
-    \item \textbf{height-purify} (\code{presence-trunk-grad-scale 0}): freeze the
-      seg side, height re-tunes the backbone $\Rightarrow$ best \textbf{ch 3}.
-    \item \textbf{seg-purify} (\code{height-trunk-grad-scale 0}): the \emph{mirror}
-      --- freeze height, seg owns the backbone $\Rightarrow$ sharper
-      \textbf{ch 0--2}. \alert{+0.0044 public building IoU.}
-    \item \textbf{$+$clDice}: a 3rd fine-tune continuing the \emph{seg-purify} ckpt with
-      the clDice topology loss (next slide) $\Rightarrow$ a 2nd, decorrelated seg source.
-  \end{itemize}
-\end{frame}
-
-\begin{frame}{clDice --- a topology loss for merged buildings}
-  \begin{columns}[T]
-    \begin{column}{0.52\textwidth}
-      \textbf{The failure it targets}
-      \begin{itemize}\small
-        \item Buildings are 1--2\,px wide; the model \emph{merges} adjacent ones
-          (predicts 67 components/tile vs.\ GT's 104).
-        \item \textbf{51\% of building FP} is inter-building ``bridges'';
-          oracle un-merge $\to$ IoU $0.504\!\to\!0.587$.
-      \end{itemize}
-    \end{column}
-    \begin{column}{0.48\textwidth}
-      \textbf{clDice} (\code{cl-dice-weight})
-      \begin{itemize}\small
-        \item soft-skeleton via iterated min/max-pool; centerline Dice on the
-          building presence map.
-        \item rewards \emph{connectivity}, penalises merges --- orthogonal to the
-          area (Tversky) losses.
-        \item added as a 20-ep purify on top of seg-purify.
-      \end{itemize}
-    \end{column}
-  \end{columns}
-  \vspace{0.3em}
-  {\footnotesize Ensemble building IoU $0.5039\!\to\!0.5072$ OOF.
-   \textcolor{cToken}{Refuted:} clDice baked into \emph{stage-1} --- it pulled the
-   backbone toward topology and \emph{degraded height} (RMSE$_{bH}$ +0.006).
-   Late-purify clDice keeps height untouched.}
 \end{frame}
 
 \begin{frame}{Seg from two decorrelated sources (50-member)}
@@ -776,7 +755,7 @@
     \toprule
     \textbf{Design} & \textbf{Driven by\dots}\\
     \midrule
-    Dual LightUNet + gate & dense $256^2$, differing reliability\\
+    Dual U-Net++ + gate & dense $256^2$, differing reliability\\
     Cross-source token FiLM & coarse $16^2$ context (modulate, not pixels)\\
     Selective calib + zero-init & wild scales (Thor); optional correction\\
     Split-trunk head & IoU-crisp vs.\ RMSE-smooth conflict\\
