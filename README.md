@@ -71,18 +71,24 @@ Training is **two-stage** (coupled → *dual purify*, the dashed box in the figu
 ## 🎯 What the Final Submission Is
 
 An ensemble of **5 model variants × 5 leave-region-out folds**, each trained through
-**4 stages**, combined into the 4-channel prediction:
+the **two stages** (coupled → *dual purify*), combined into the 4-channel prediction:
 
-| Ensemble member | `pixel_backbone_kind` | Seeds |
-|---|---|:---:|
-| 🥇 U-Net++ (nested decoder) | `unetpp` | 0, 1, 2 |
-| 🥈 UNet 3+ (full-scale skip) | `unet3plus` | 0 |
-| 🥉 TransUNet (attn bottleneck) | `unetpp_trans` | 0 |
+| `MEMBER` | Ensemble variant | `pixel_backbone_kind` | Seed |
+|:---:|---|---|:---:|
+| **0, 1, 2** | 🥇 U-Net++ (nested decoder) | `unetpp` | 0, 1, 2 |
+| **3** | 🥈 UNet 3+ (full-scale skip) | `unet3plus` | 0 |
+| **4** | 🥉 TransUNet (attn bottleneck) | `unetpp_trans` | 0 |
 
-Per member-fold, four checkpoints are produced off one stage-1 model:
+The `MEMBER 0-4` argument to the scripts below indexes exactly these five rows
+`(config, seed)` — three U-Net++ seeds plus one UNet 3+ and one TransUNet. `FOLD 0-4`
+selects the leave-region-out split. So the 25 member-folds = 5 `MEMBER` × 5 `FOLD`.
+
+Per member-fold, the two stages produce four checkpoints off one stage-1 model
+(stage 2 = *dual purify*, i.e. the two frozen-trunk purify branches):
 
 ```
-stage 1        coupled seg+height, 80 ep                                 -> <exp>
+stage 1  coupled     coupled seg+height, 80 ep                           -> <exp>
+stage 2  dual purify
   ├─ height-purify  20 ep, freeze seg    (presence-trunk-grad-scale 0)   -> <exp>_purify              (ch 3)
   └─ seg-purify     20 ep, freeze height (height-trunk-grad-scale 0)
                     + 20 ep clDice on top                                -> <exp>_segpurify, _cldice  (ch 0-2)
@@ -139,7 +145,7 @@ Filenames share a `<core>` id (e.g. `0041_FQ`) that ties an embedding to its lab
 
 ![Deleted building footprints — label empty where the nDSM shows buildings](docs/fig_building_holes.png)
 
-~100 training tiles have building footprints that were **human-deleted from the GT**:
+~100 training tiles have building footprints that were **missing from the GT**:
 the label is empty where the nDSM + embeddings clearly show buildings (red = our
 detector's recovered region above). Training drops the **presence/seg** loss on those
 pixels (height is kept), so the model is never punished for correctly predicting a
@@ -154,7 +160,7 @@ config reads them via `missing_building_mask_dir: ${REPO_DIR}/runs/missing_masks
 
 ### 4️⃣ Train + Predict + Assemble
 
-**One command runs everything** — trains all 25 member-folds (4 stages each), predicts
+**One command runs everything** — trains all 25 member-folds (two stages each), predicts
 out-of-fold val + the 946 test tiles, and assembles the submission zip:
 
 ```bash
@@ -175,7 +181,7 @@ MEMBERS="0" FOLDS="0" scripts/run_all.sh
 Per `(member, fold)`, `run_all.sh` calls three self-contained steps plus the final assembly:
 
 ```bash
-scripts/train_member_fold.sh        <MEMBER 0-4> <FOLD 0-4>   # 4 training stages
+scripts/train_member_fold.sh        <MEMBER 0-4> <FOLD 0-4>   # two-stage training (coupled -> dual purify)
 scripts/predict_val_member_fold.sh  <MEMBER 0-4> <FOLD 0-4>   # OOF val predictions
 scripts/predict_test_member_fold.sh <MEMBER 0-4> <FOLD 0-4>   # 946 test tiles
 python assemble_final.py                                       # tune thr + ensemble -> zip
