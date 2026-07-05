@@ -33,7 +33,6 @@
   - [3️⃣ Generate the delmask masks](#3️⃣-generate-the-delmask-masks-before-training)
   - [4️⃣ Train + Predict + Assemble](#4️⃣-train--predict--assemble)
   - [5️⃣ Evaluate the OOF folds](#5️⃣-evaluate-the-oof-folds-optional)
-- [🖥️ Cluster Notes (SLURM)](#️-cluster-notes-slurm)
 - [🗂️ Repository Layout](#️-repository-layout)
 
 ---
@@ -56,15 +55,16 @@ scripts/run_all.sh                                                  # 4. everyth
 
 ![Architecture](docs/architecture.png)
 
-Three blocks (vector version in [`docs/architecture.pdf`](docs/architecture.pdf)):
+Four blocks (vector version in [`docs/architecture.pdf`](docs/architecture.pdf)):
 
 | | Block | What it does |
 |---|---|---|
 | 🧱 | **Dense pixel backbone** | AlphaEarth (`64×256²`) and Tessera (`128×256²`) each go through a **U-Net++** (the primary backbone; the ensemble also swaps in UNet 3+ / TransUNet variants); a learned **spatial gate** fuses them into `F_pixel`. |
-| 🎛️ | **Coarse token conditioning** | The 4 token sources (TerraMind / Thor, S1/S2, each `768×16²`) cross-attend, then modulate `F_pixel` via zero-init FiLM + additive + gate → `F_out`. |
-| 🔱 | **Split-trunk multi-task head** | Separate seg / height trunks feed the presence heads (ch 0–2) and the height specialists (ch 3). |
+| 🎛️ | **Coarse token conditioning** | The 4 token sources (TerraMind / Thor, S1/S2, each `768×16²`) are projected to ctx 96 and exchange information via zero-init **cross-source self-attention**. |
+| 🔀 | **Fusion** | Each conditioned token source modulates `F_pixel` via zero-init **FiLM + additive + gate** (×4, one per source, upsampled `16²→256²`): `F_out = F_pixel + Σ δᵢ` — tokens *condition* the pixel body, never replace it. |
+| 🔱 | **Split-trunk multi-task head** | Separate seg / height trunks feed the presence heads (ch 0–2) and the presence-gated height head (ch 3). |
 
-Training is **two-stage** (coupled → *dual purify*); details below.
+Training is **two-stage** (coupled → *dual purify*, the dashed box in the figure); details below.
 
 ---
 
@@ -211,5 +211,5 @@ scripts/             train / predict / run_all drivers
 assemble_final.py    OOF threshold tuning + 50-seg ensemble + height calib -> zip
 runs/missing_masks/  delmask masks (git-ignored; generate in Step 3)
 tools/               data download, fold generation, missing-mask generation
-docs/                framework_overview.pdf (+ .tex), architecture.pdf (+ .tex, .png)
+docs/                framework_overview.pdf (+ .tex), architecture.pdf (+ .png)
 ```

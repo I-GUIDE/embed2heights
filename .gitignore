@@ -9,4 +9,4 @@ runs/*
 runs/missing_masks/*
 !runs/missing_masks/.gitkeep
 
-
+docs/submission*
