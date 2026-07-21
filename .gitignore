@@ -10,3 +10,6 @@ runs/missing_masks/*
 !runs/missing_masks/.gitkeep
 
 docs/submission*
+analysis/*
+# demo bundle for the walkthrough notebook (regenerable; hosted on HF)
+notebook_assets/*
